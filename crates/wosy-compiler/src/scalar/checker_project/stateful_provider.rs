@@ -357,7 +357,7 @@ pub(super) struct PendingExternalCall {
     pub(super) verified_prefix: VerifiedRequirePrefix,
 }
 
-#[derive(Debug, Default, PartialEq)]
+#[derive(Debug, Default, Eq, PartialEq, Hash)]
 pub(super) struct VerifiedRequirePrefix {
     owners: BTreeMap<usize, SourceIdentity>,
     // Repeated evaluations are distinct events; do not deduplicate them.
@@ -1010,7 +1010,11 @@ pub(super) fn run<'a>(
     let trace=if let Some(mut traces)=traces {
         let root=traces.pop()?;
         if !traces.is_empty() { return None; }
-        Some(ObservedTrace::new(root,segments,&mut work)?)
+        let mut trace=ObservedTrace::new(root,segments,&mut work)?;
+        if !verified_prefix.is_empty() {
+            trace.attach_requirements(VerifiedRequirePrefix::seal(project,verified_prefix)?);
+        }
+        Some(trace)
     } else { None };
     let value=match values.pop()? { ResultValue::Scalar(v)=>Some(v),ResultValue::Unit=>None };
     *caller_storage=next_storage;

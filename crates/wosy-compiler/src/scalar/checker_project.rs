@@ -350,7 +350,7 @@ enum ProjectCheck {
     MissingRootOccurrences,
     Unsupported,
     #[cfg(feature = "internal-checker")]
-    ProviderStopped(Box<stateful_provider::ProviderStop>),
+    ProviderStopped(Box<stateful_provider::ProviderStop>,Vec<std::rc::Rc<stateful_provider::VerifiedRequirePrefix>>),
     #[cfg(feature = "internal-checker")]
     StartupAuthoredLimitReached,
     #[cfg(test)]
@@ -2519,6 +2519,8 @@ fn try_observed_projected_storage_call(
     let provider_dispatch = RefCell::new(stateful_provider::Dispatch::default());
     let selected_requirement=std::cell::Cell::new(false);
     let provider_stop = RefCell::new(None);
+    let has_verified_returns=std::cell::Cell::new(false);
+    let private_progress_only=std::cell::Cell::new(false);
     let reached_requirement=std::cell::Cell::new(false);
     let collect=RefCell::new(failures);
     let provider_call = |body:&FunctionCallSites, site, args, storage:&mut super::checker_flow::ProjectedStorage,
@@ -2544,14 +2546,35 @@ fn try_observed_projected_storage_call(
             // Do not turn an authored pre-host prefix into a completed call,
             // even if its last requirement was proved. Nothing crosses the
             // external boundary without a sound effect/continuation model.
-            provider_stop.replace(Some(stop));
+            // Read the current row's history, never a global list of every
+            // provider evaluated. Repeated completed activations are kept in
+            // order, sharing their verified receipt rather than re-running it.
+            let mut prior=Vec::new();
+            if has_verified_returns.get() {
+                let traces=math_traces.borrow();
+                for step in history?()? {
+                    if let super::checker_flow::CallableHistoryStep::ObservedFloatTrace(id)=step {
+                        if let Some(receipt)=&traces.get(id)?.verified_requirements {
+                            prior.push(Rc::clone(receipt));
+                        }
+                    }
+                }
+            }
+            provider_stop.replace(Some((stop,prior)));
             return None;
         }
-        // At a larger remaining quota an activation with no reachable
-        // requirement may return normally. Record its ordinary return; do
-        // not promote a completed *obligation-bearing* row to exhaustion.
-        if call_reached.get() && authored_units.contains(&child) && !permits_capped_requirement() {return None;}
         let (value,result,cost,failure) = outcome?;
+        if failure.is_none() {
+            if result.as_ref().is_some_and(|trace|trace.verified_requirements.is_some()) {
+                has_verified_returns.set(true);
+            }
+            if call_reached.get() && authored_units.contains(&child) && !permits_capped_requirement() {
+                // This extends only the private pre-stop path, not admission
+                // to normal whole-root exhaustion or final storage writeback.
+                result.as_ref()?.verified_requirements.as_ref()?;
+                private_progress_only.set(true);
+            }
+        }
 
         if let Some(failure)=failure {
             use failure_search::{Admission,PathStep};
@@ -2609,6 +2632,7 @@ fn try_observed_projected_storage_call(
     };
     let mut record_return = |history:Vec<super::checker_flow::CallableHistoryStep>| {
         use failure_search::PathStep;
+        if private_progress_only.get() { return Some(()); }
         let Some(trace)=&trace else { return Some(()); };
         let mut search=trace.borrow_mut();
         append_observed_history(&mut search,history)?;
@@ -2617,14 +2641,16 @@ fn try_observed_projected_storage_call(
     let scalar_getter = |body: &FunctionCallSites, site, storage: &super::checker_flow::ProjectedStorage| {
         getters.get(&(body as *const FunctionCallSites,site))?.evaluate(storage)
     };
-    let mut current = Rc::new(std::mem::take(storage));
+    // Retain the original until success. A pending, refuted or private-only
+    // route may have made tentative writes but publishes none of them.
+    let mut current = Rc::new(storage.clone());
     let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field), Some(&read_array), Some(&math_call), Some(&scalar_getter), Some(&provider_call), Some(&provider_units), Some(&frontiers),
         body_of, |parent, _, site, _| admitted.get(&(parent, site)).copied(), |_, _, _| None);
     if selected_requirement.get() { return Err(ProjectCheck::StartupAuthoredLimitReached); }
-    if let Some(stop) = provider_stop.into_inner() {
-        return Err(ProjectCheck::ProviderStopped(Box::new(stop)));
+    if let Some((stop,prior)) = provider_stop.into_inner() {
+        return Err(ProjectCheck::ProviderStopped(Box::new(stop),prior));
     }
-    if !matches!(result, Some(super::checker_flow::CallableHistoryCompletion::Exhausted(false))) {
+    if private_progress_only.get() || !matches!(result, Some(super::checker_flow::CallableHistoryCompletion::Exhausted(false))) {
         return Err(ProjectCheck::Unsupported);
     }
     *storage = Rc::unwrap_or_clone(current);
@@ -26390,7 +26416,7 @@ unit(u8) parent = fn(a) {
             assert_eq!(failure.stderr(),b"Orbital indexed actuator span");
             assert!(trace.call_paths().iter().flatten().any(|site| site==&upload_call));
             assert!(!trace.contains_return(&upload_call));
-            let Err(ProjectCheck::ProviderStopped(stop)) = prepare(&passing).search_startup_authored_path(NonZeroUsize::MIN)
+            let Err(ProjectCheck::ProviderStopped(stop,_)) = prepare(&passing).search_startup_authored_path(NonZeroUsize::MIN)
                 else { panic!("typed prepared indexed call must be pending, not executed"); };
             let stateful_provider::ProviderStop::External(pending)=*stop else { panic!("expected indexed boundary"); };
             assert_eq!(outcomes(),[(authored.clone(),true)]);
@@ -26416,7 +26442,7 @@ unit(u8) parent = fn(a) {
             // further arguments may be presented as evaluated in this row.
             let unknown=packing.replacen("unsafe unit(","unsafe i32() sample; unsafe unit(",1)
                 .replacen("n_vert*8,","bridge.sample(),",1);
-            let Err(ProjectCheck::ProviderStopped(stop))=prepare_with(&passing,&unknown).search_startup_authored_path(NonZeroUsize::MIN)
+            let Err(ProjectCheck::ProviderStopped(stop,_))=prepare_with(&passing,&unknown).search_startup_authored_path(NonZeroUsize::MIN)
                 else {panic!("expected a host operand frontier");};
             let stateful_provider::ProviderStop::External(partial)=*stop else {panic!("expected pending external");};
             assert_eq!(partial.argument_sites.len(),7);
@@ -26425,18 +26451,44 @@ unit(u8) parent = fn(a) {
             assert!(pending.verified_prefix.spans().eq([authored.clone()]));
             assert!(pending.invocation.iter().any(|site| site.source == app
                 && passing[site.range.start as usize..site.range.end as usize].starts_with("packing.transmit(")));
-            let Err(ProjectCheck::ProviderStopped(stop))=prepare(&text).search_startup_authored_path(NonZeroUsize::new(2).unwrap())
+            let Err(ProjectCheck::ProviderStopped(stop,_))=prepare(&text).search_startup_authored_path(NonZeroUsize::new(2).unwrap())
                 else { panic!("uncapped-by-one row must retain the false pre-host requirement"); };
             let stateful_provider::ProviderStop::RefutedRow { directive, verified_prefix, .. }=*stop
                 else { panic!("no indexed host is reached on this row"); };
             assert_eq!(directive,authored);
             assert_eq!(verified_prefix.spans().count(),0);
+            // A controlled provider that returns *once* without invoking the
+            // foreign API. Engine code and subsequent host body stay original.
+            let closed=packing.replacen("unit(i32,i32,i32,i32,i32) transmit", "bool quiet=true; unit(i32,i32,i32,i32,i32) transmit",1)
+                .replacen("first_element,n_element){", "first_element,n_element){if(quiet){quiet=false;}else{",1)
+                .replacen("};\n%%end", "};};\n%%end",1);
+            outcomes();
+            // A positive local receipt is never a completed whole-root result.
+            assert!(matches!(prepare_with(&passing,&closed).search_startup_authored_path(NonZeroUsize::new(2).unwrap()),
+                Err(ProjectCheck::Unsupported)));
+            assert_eq!(outcomes(),[(authored.clone(),true)]);
+            assert!(matches!(prepare_with(&passing,&closed).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            for second in [0,1] {
+                let chain=passing.replace("upload_actuators(1,0);",&format!("upload_actuators(1,0); upload_actuators(1,{second});"));
+                outcomes();
+                let Err(ProjectCheck::ProviderStopped(stop,completed))=
+                    prepare_with(&chain,&closed).search_startup_authored_path(NonZeroUsize::new(2).unwrap())
+                    else {panic!("expected the second original actuator outcome");};
+                let [prior]=completed.as_slice() else {panic!("one actually completed obligation-bearing activation");};
+                assert!(prior.spans().eq([authored.clone()]));
+                assert_eq!(outcomes(),[(authored.clone(),true),(authored.clone(),second==0)]);
+                match (*stop,second) {
+                    (stateful_provider::ProviderStop::External(host),0)=>assert!(host.verified_prefix.spans().eq([authored.clone()])),
+                    (stateful_provider::ProviderStop::RefutedRow {directive,..},1)=>assert_eq!(directive,authored),
+                    _=>panic!("a previous success cannot hide a later false obligation or foreign effects"),
+                }
+            }
             // The provider's own error branch is also a real reached import.
             // An earlier invalid partition sets failed without modifying the
             // independently valid authored actuator bounds.
             let failed=passing.replace("upload_actuators(1,0);","packing.partition(-1,7); upload_actuators(1,0);");
             outcomes();
-            let Err(ProjectCheck::ProviderStopped(stop))=prepare(&failed).search_startup_authored_path(NonZeroUsize::new(2).unwrap())
+            let Err(ProjectCheck::ProviderStopped(stop,_))=prepare(&failed).search_startup_authored_path(NonZeroUsize::new(2).unwrap())
                 else {panic!("expected original provider error branch");};
             let stateful_provider::ProviderStop::External(host)=*stop else {panic!("expected sentinel import");};
             assert!(host.verified_prefix.spans().eq([authored.clone()]));
@@ -26452,7 +26504,7 @@ unit(u8) parent = fn(a) {
                 let chain=input.replace("upload_actuators(1,0);",
                     "upload_actuators(0,0); upload_actuators(1,5); upload_actuators(1,0);");
                 outcomes();
-                let Err(ProjectCheck::ProviderStopped(stop))=prepare(&chain).search_startup_authored_path(NonZeroUsize::new(2).unwrap())
+                let Err(ProjectCheck::ProviderStopped(stop,_))=prepare(&chain).search_startup_authored_path(NonZeroUsize::new(2).unwrap())
                     else {panic!("two guard returns must reach the original live call");};
                 assert_eq!(outcomes(),[(authored.clone(),passes)]);
                 match (*stop,passes) {

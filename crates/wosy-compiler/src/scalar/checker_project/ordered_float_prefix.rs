@@ -647,9 +647,18 @@ pub(in super::super) struct ObservedTrace {
     pub(super) segments: Vec<Vec<ObservedStep>>,
     pub(super) physical_cost: usize,
     fingerprint: u64,
+    pub(super) verified_requirements: Option<Rc<super::stateful_provider::VerifiedRequirePrefix>>,
 }
 
 impl ObservedTrace {
+    pub(super) fn attach_requirements(&mut self, receipt: super::stateful_provider::VerifiedRequirePrefix) {
+        use std::hash::{Hash,Hasher,DefaultHasher};
+        let mut digest=DefaultHasher::new();
+        self.fingerprint.hash(&mut digest);
+        receipt.hash(&mut digest);
+        self.fingerprint=digest.finish();
+        self.verified_requirements=Some(Rc::new(receipt));
+    }
     pub(super) fn new(root: Vec<ObservedStep>, segments: Vec<Vec<ObservedStep>>, work: &mut usize) -> Option<Self> {
         use std::hash::{DefaultHasher, Hash, Hasher};
         let physical_cost = segments.iter().fold(root.len().saturating_add(1), |cost, child|
@@ -658,7 +667,7 @@ impl ObservedTrace {
         let mut digest = DefaultHasher::new();
         root.hash(&mut digest);
         segments.hash(&mut digest);
-        Some(Self { root, segments, physical_cost, fingerprint: digest.finish() })
+        Some(Self { root, segments, physical_cost, fingerprint: digest.finish(), verified_requirements: None })
     }
 }
 
