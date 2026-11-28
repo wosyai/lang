@@ -6,7 +6,7 @@ use rusqlite::TransactionBehavior;
 use std::{collections::BTreeMap, path::Path};
 use wosy_compiler::PairStartupCallGraphEvidence;
 #[cfg(target_os = "linux")]
-use {crate::comptime_fragment::{PendingPairWasip1Readback, StagedPendingPairWasip1}, std::process::ExitStatus,
+use {crate::comptime_fragment::{PendingPairWasip1Readback, StagedPendingPairWasip1}, std::{process::ExitStatus, time::{Duration, Instant}},
     wosy_compiler::BoundedPairStartupWasip1Output};
 use wosy_project::{packages::{observe_local_comptime_inputs, ComptimeWatchLimits, LocalComptimeInputScope},
     ObservedClosedComptimeProfile};
@@ -48,6 +48,20 @@ impl PendingPairComptimeInputObservation {
     pub fn configuration_inputs(&self) -> NodeId { self.configuration_inputs }
     pub fn declarations(&self) -> &ObservedClosedComptimeProfile { &self.declarations }
     pub fn watches(&self) -> &PreparedComptimeWatches { &self.watches }
+}
+
+/// One actual local invocation of the exact selected pair. This receipt
+/// does not prove hidden tool/environment inputs or publish compiler values.
+#[cfg(target_os = "linux")]
+pub struct ExecutedPendingPairWasip1<'stage> {
+    readback: PendingPairWasip1Readback<'stage>,
+    modules: Vec<blake3::Hash>,
+}
+
+#[cfg(target_os = "linux")]
+impl<'stage> ExecutedPendingPairWasip1<'stage> {
+    pub fn readback(&self) -> &PendingPairWasip1Readback<'stage> { &self.readback }
+    pub fn modules(&self) -> &[blake3::Hash] { &self.modules }
 }
 
 impl SqliteSourceState {
@@ -100,6 +114,34 @@ impl SqliteSourceState {
             }
             Ok(staging.read_stdout(terminals)?)
         })
+    }
+
+    /// Execute the already-selected ordinary comptime commands exactly as
+    /// configured, without a shell or caller-supplied terminal. The active
+    /// source and declared watches must still match at both observations.
+    #[cfg(target_os = "linux")]
+    pub fn execute_staged_pending_pair_wasip1<'stage>(
+        &mut self, staging: &'stage StagedPendingPairWasip1<'_>,
+        watch_limits: ComptimeWatchLimits, max_module_bytes: u64, tool_timeout: Duration,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Option<ExecutedPendingPairWasip1<'stage>>> {
+        let original = staging.observation();
+        let binding = original.binding();
+        let profile = original.declarations().tools().profile();
+        let current = self.observe_pending_pair_comptime_inputs(binding, profile, watch_limits, || Some(
+            TrustedPreparedPairComptime { binding, authored_cst: original.authored_cst(),
+                profile, graph: staging.plan().evidence() },
+        ))?;
+        let Some(current) = current else { return Ok(None); };
+        if current.watches() != original.watches() {
+            return Err("local comptime inputs changed before selected tools ran".into());
+        }
+        let deadline = Instant::now().checked_add(tool_timeout).ok_or("comptime tool deadline overflow")?;
+        let owned = staging.invoke_selected(max_module_bytes, deadline, &cancelled)?;
+        let terminals = owned.terminals.iter().map(|(status, bytes)| (*status, bytes.as_slice())).collect::<Vec<_>>();
+        let readback = self.observe_staged_pending_pair_wasip1(staging, watch_limits, &terminals)?;
+        if cancelled() { return Ok(None); }
+        Ok(readback.map(|readback| ExecutedPendingPairWasip1 { readback, modules: owned.modules }))
     }
 
     /// Check the attempt before borrowing trusted facts, and again after

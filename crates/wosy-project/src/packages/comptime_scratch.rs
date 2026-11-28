@@ -68,14 +68,30 @@ impl ComptimeScratch {
             .custom_flags(libc::O_NOFOLLOW).open(self.descriptor.join(name))
     }
 
+    pub fn open_ir(&self) -> io::Result<File> {
+        self.open_stage_file(IR).map(|(file, _)| file)
+    }
+
+    pub fn open_manifest(&self) -> io::Result<File> {
+        self.open_stage_file(MANIFEST).map(|(file, _)| file)
+    }
+
     pub fn open_module(&self) -> io::Result<(File, fs::Metadata)> {
-        let module = self.dir.open(Path::new(MODULE)).map_err(io::Error::other)?
-            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "expected evaluator module is absent"))?;
-        let metadata = module.metadata()?;
-        if !metadata.is_file() || metadata.uid() != owner() || metadata.nlink() != 1 {
-            return Err(io::Error::other("expected an evaluator module owned only by this scratch directory"));
+        self.open_stage_file(MODULE)
+    }
+
+    fn open_stage_file(&self, name: &str) -> io::Result<(File, fs::Metadata)> {
+        let current = GitDirectory::new(GitDirectory::open_absolute(&self.path)?).map_err(io::Error::other)?;
+        if current != self.dir {
+            return Err(io::Error::other("staged evaluator path no longer denotes its held directory"));
         }
-        Ok((module, metadata))
+        let file = self.dir.open(Path::new(name)).map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "expected staged evaluator file is absent"))?;
+        let metadata = file.metadata()?;
+        if !metadata.is_file() || metadata.uid() != owner() || metadata.nlink() != 1 {
+            return Err(io::Error::other("expected a file owned only by this evaluator scratch directory"));
+        }
+        Ok((file, metadata))
     }
 }
 

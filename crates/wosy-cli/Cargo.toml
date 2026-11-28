@@ -30,6 +30,9 @@ wosy-syntax.workspace = true
 name = "wosy"
 path = "src/main.rs"
 
+[target.'cfg(target_os = "linux")'.dependencies]
+libc = "0.2"
+
 [dev-dependencies]
 tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "time"] }
 toml_edit.workspace = true

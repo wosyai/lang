@@ -97,7 +97,7 @@ pub use source_proposal::{
     AuthoredComptimeCoverage, BaseCstAdmission, BaseCstAdmissionLimits, PendingEntryComptimeProjection,
     PendingFirstComptimeProjection, PendingPairCallGraphComptimeProjection,
     PreparedBaseIdentity, PreparedBaseDeclarations, PreparedPendingFirstComptime,
-    PreparedPendingPairCallGraphComptime, PreparedSourcePublication,
+    PreparedPendingPairCallGraphComptime, PreparedPairEvaluatorShape, PreparedPairResultShape, PreparedSourcePublication,
 };
 pub use source_reconciliation::SourceReconciliation;
 pub use storage_worker::{RetentionRead, RetentionReadJob, SourceStorageWorker, StorageAdmissionError};

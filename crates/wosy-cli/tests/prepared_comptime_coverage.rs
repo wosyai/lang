@@ -912,6 +912,18 @@ main_artifact = "main"
 #[cfg(target_os = "linux")]
 #[test]
 fn stage_exact_pending_wasip1_evaluators_once_per_tuple_without_launch() {
+    exercise_pending_pair(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires ordinary clang, wasm-ld, python3 and wasmtime on PATH"]
+fn executes_selected_ordinary_comptime_tools_for_each_distinct_evaluator() {
+    exercise_pending_pair(true);
+}
+
+#[cfg(target_os = "linux")]
+fn exercise_pending_pair(run_tools: bool) {
     use std::{os::unix::{fs::DirBuilderExt, process::ExitStatusExt}, path::Path, process::ExitStatus};
     use wosy_cli::{comptime_fragment::{ComptimeReadbackError, PendingPairWasip1Occurrence, PendingPairWasip1ReadbackError},
         source_state::TrustedPreparedPairWasip1};
@@ -944,7 +956,7 @@ u32 different = solve(7, 13);
 %%end
 "#;
     let source = SOURCE.replace("%%end", &format!("# WHY: {}\n%%end", "a".repeat(1 << 16)));
-    let manifest = MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\"")
+    let mut manifest = MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\"")
         .replace("[targets.app.profiles.dev]", "[targets.app.profiles.dev]\ncomptime_builder = \"nominal\"\ncomptime_runner = \"nominal\"\nbuild_permissions = []\nbuild_mounts = []")
         + "\n[comptime.prepare]\nwatch = [\"watch.txt\"]\n";
     let fixture = Scratch::new();
@@ -952,6 +964,11 @@ u32 different = solve(7, 13);
     let private = fixture.0.join("private");
     fs::create_dir(&project).unwrap();
     fs::DirBuilder::new().mode(0o700).create(&private).unwrap();
+    if run_tools {
+        manifest = manifest.replace(r#""fixture-must-not-build""#, r#""python3", "ordinary_wasip1_pair.py", "build""#)
+            .replace(r#""fixture-must-not-run""#, r#""python3", "ordinary_wasip1_pair.py", "run""#);
+        fs::write(project.join("ordinary_wasip1_pair.py"), include_str!("fixtures/ordinary_wasip1_pair.py")).unwrap();
+    }
     fs::write(project.join("wosy.toml"), manifest).unwrap();
     fs::write(project.join("watch.txt"), b"watched input").unwrap();
     let entry = project.join("main.w");
@@ -986,6 +1003,15 @@ u32 different = solve(7, 13);
         let [first, distinct] = held.output.evaluators() else { panic!("one module per typed tuple"); };
         assert_eq!(held.output.evidence().calls().map(|(call, _)| call.evaluator_index()).collect::<Vec<_>>(), [0, 0, 1]);
         assert_ne!(first.bytes(), distinct.bytes());
+        let shape = owner.result_shape().expect("complete owned distinct evaluator set");
+        assert_eq!(shape.binding(), &binding);
+        assert_eq!(shape.prepared(), owner.base().identity());
+        assert_eq!(shape.authored_cst(), held.authored_cst);
+        assert_eq!(shape.profile(), "dev");
+        assert_eq!(shape.evaluators().len(), 2);
+        for (planned, emitted) in shape.evaluators().iter().zip(held.output.evaluators()) {
+            assert_eq!(planned.fragment_ir.0, *blake3::hash(emitted.bytes()).as_bytes());
+        }
         let total = first.bytes().len() + distinct.bytes().len();
 
         // The staging cut uses the captured CST, not re-authored input.
@@ -1038,10 +1064,21 @@ u32 different = solve(7, 13);
             let run = stage.runner();
             assert_eq!(build.working_directory, project);
             assert_eq!(run.working_directory, project);
-            assert_eq!(build.executable, "fixture-must-not-build");
-            assert_eq!(run.executable, "fixture-must-not-run");
-            let [ir, output, manifest] = build.arguments.as_slice() else { panic!("three builder paths"); };
-            assert_eq!(run.arguments.as_slice(), &[*manifest]);
+            let (builder_paths, runner_paths) = if run_tools {
+                assert_eq!(build.executable, "python3");
+                assert_eq!(run.executable, "python3");
+                assert_eq!(build.arguments[0], "ordinary_wasip1_pair.py");
+                assert_eq!(build.arguments[1], "build");
+                assert_eq!(run.arguments[0], "ordinary_wasip1_pair.py");
+                assert_eq!(run.arguments[1], "run");
+                (&build.arguments[2..], &run.arguments[2..])
+            } else {
+                assert_eq!(build.executable, "fixture-must-not-build");
+                assert_eq!(run.executable, "fixture-must-not-run");
+                (build.arguments.as_slice(), run.arguments.as_slice())
+            };
+            let [ir, output, manifest] = builder_paths else { panic!("three builder paths"); };
+            assert_eq!(runner_paths, &[*manifest]);
             assert_eq!(Path::new(output), stage.expected_module_path().parent().unwrap());
             let actual = fs::read(ir).unwrap();
             assert_eq!(actual, exact.bytes());
@@ -1075,6 +1112,11 @@ u32 different = solve(7, 13);
 
         let terminals: [(ExitStatus, &[u8]); 2] = [(ok, b"34\n"), (ok, b"10\n")];
         let accepted = client.observe_staged_pending_pair_wasip1(&staging, limits, &terminals).unwrap().unwrap();
+        assert_eq!(accepted.observation().binding(), &binding);
+        use wosy_protocol::ComptimeScalarValue::Unsigned;
+        assert_eq!(accepted.scalar_results(), Some(vec![
+            Unsigned { width: 32, value: 34 }, Unsigned { width: 32, value: 10 },
+        ]));
         let exact = held.output.ordinary_continuation();
         let projected = accepted.initializers().collect::<Vec<_>>();
         assert_eq!(projected.len(), initializers.len());
@@ -1101,6 +1143,17 @@ u32 different = solve(7, 13);
         assert!(std::ptr::eq(*one, *again));
         assert!(!std::ptr::eq(*one, *other));
 
+        if run_tools {
+            fs::write(&entry, &source).unwrap();
+            let executed = client.execute_staged_pending_pair_wasip1(
+                &staging, limits, 1 << 20, Duration::from_secs(10), || false,
+            ).unwrap().expect("same exact pending attempt");
+            assert_eq!(executed.readback().observation().binding(), &binding);
+            assert_eq!(executed.readback().scalar_results(), accepted.scalar_results());
+            assert_eq!(executed.modules().len(), 2);
+            assert_ne!(executed.modules()[0], executed.modules()[1]);
+        }
+
         let watch = project.join("watch.txt");
         fs::write(&watch, b"changed input").unwrap();
         assert!(client.observe_staged_pending_pair_wasip1(&staging, limits, &terminals)
@@ -1109,7 +1162,7 @@ u32 different = solve(7, 13);
         let manifest_file = project.join("wosy.toml");
         let original_manifest = fs::read(&manifest_file).unwrap();
         let changed_manifest = String::from_utf8(original_manifest.clone()).unwrap()
-            .replace("fixture-must-not-run", "other-configured-runner");
+            .replace(if run_tools { "ordinary_wasip1_pair.py" } else { "fixture-must-not-run" }, "other-configured-runner");
         fs::write(&manifest_file, changed_manifest).unwrap();
         assert!(client.observe_staged_pending_pair_wasip1(&staging, limits, &terminals)
             .err().unwrap().to_string().contains("configuration changed"));

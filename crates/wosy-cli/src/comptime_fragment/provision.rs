@@ -126,9 +126,22 @@ impl EvaluatorFiles {
         ClosedComptimePaths { evaluator_ir: &self.ir_path, output_dir: self.scratch.output_dir(), manifest: &self.manifest_path }
     }
 
+    pub(super) fn verify_inputs(&self, manifest: &[u8]) -> io::Result<()> {
+        let ir = self.scratch.open_ir()?;
+        let mut bytes = Vec::new();
+        ir.take(self.ir.bytes as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes.len() != self.ir.bytes || blake3::hash(&bytes) != self.ir.blake3 {
+            return Err(io::Error::other("staged evaluator LLVM changed"));
+        }
+        bytes.clear();
+        self.scratch.open_manifest()?.take(manifest.len() as u64 + 1).read_to_end(&mut bytes)?;
+        if bytes != manifest { return Err(io::Error::other("staged evaluator manifest changed")); }
+        Ok(())
+    }
+
     /// Bind bounded module bytes in the predeclared slot to this exact
     /// provision, not to a path, type or digest claimed by a producer.
-    fn observe_module(&self, max_bytes: u64) -> io::Result<ObservedModule> {
+    pub(super) fn observe_module(&self, max_bytes: u64) -> io::Result<ObservedModule> {
         let (mut module, metadata) = self.scratch.open_module()?;
         let limit = max_bytes.min(MAX_MODULE_BYTES);
         let expected = metadata.len();
@@ -158,9 +171,9 @@ impl EvaluatorFiles {
     }
 }
 
-struct ObservedModule {
+pub(super) struct ObservedModule {
     bytes: u64,
-    digest: blake3::Hash,
+    pub(super) digest: blake3::Hash,
 }
 
 /// Module bytes read from one exact owned output slot. This is file

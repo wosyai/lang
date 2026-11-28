@@ -467,6 +467,13 @@ pub struct ObservedPairStartupWasip1<'plan> {
 impl ObservedPairStartupWasip1<'_> {
     pub fn plan(&self) -> &BoundedPairStartupWasip1Output { self.plan }
 
+    /// Exactly one decoded value per emitted evaluator, in plan order.
+    /// The observations do not prove execution provenance.
+    pub fn evaluator_values(&self) -> impl ExactSizeIterator<Item = (&ScalarType, &ScalarExpression)> {
+        self.plan.evaluators().iter().zip(&self.values)
+            .map(|(evaluator, value)| (evaluator.result_type(), value))
+    }
+
     pub fn occurrences(&self) -> impl ExactSizeIterator<Item = (PairStartupOccurrence<'_>, Option<&ScalarExpression>)> {
         self.plan.evidence.occurrences().map(|case| { let value = self.value(&case); (case, value) })
     }

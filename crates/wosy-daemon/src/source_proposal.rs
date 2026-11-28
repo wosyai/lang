@@ -144,9 +144,83 @@ pub struct PreparedPendingPairCallGraphComptime {
     projection: PendingPairCallGraphComptimeProjection,
 }
 
+/// Compiler-owned specialization shape for an exact live pending source.
+/// It contains no terminal values, tool authority or final snapshot.
+pub struct PreparedPairResultShape {
+    prepared: PreparedBaseIdentity,
+    binding: BaseCstProposalBinding,
+    authored_cst: NodeId,
+    compiler_image: NodeId,
+    target: String,
+    profile: String,
+    site: String,
+    evaluators: Vec<PreparedPairEvaluatorShape>,
+}
+
+pub struct PreparedPairEvaluatorShape {
+    pub fragment_ir: NodeId,
+    pub concrete_values: [wosy_protocol::ComptimeScalarValue; 2],
+    pub result_type: wosy_compiler::ScalarType,
+}
+
+impl PreparedPairResultShape {
+    pub fn prepared(&self) -> PreparedBaseIdentity { self.prepared }
+    pub fn binding(&self) -> &BaseCstProposalBinding { &self.binding }
+    pub fn authored_cst(&self) -> NodeId { self.authored_cst }
+    pub fn compiler_image(&self) -> NodeId { self.compiler_image }
+    pub fn target(&self) -> &str { &self.target }
+    pub fn profile(&self) -> &str { &self.profile }
+    pub fn site(&self) -> &str { &self.site }
+    pub fn evaluators(&self) -> &[PreparedPairEvaluatorShape] { &self.evaluators }
+}
+
+fn scalar_argument(value: wosy_compiler::DirectComptimeArgument) -> wosy_protocol::ComptimeScalarValue {
+    use wosy_compiler::DirectComptimeArgument as Argument;
+    use wosy_protocol::ComptimeScalarValue as Value;
+    match value {
+        Argument::I32(value) => Value::Signed { width: 32, value: value.into() },
+        Argument::U32(value) => Value::Unsigned { width: 32, value: value.into() },
+        Argument::Bool(value) => Value::Bool(value),
+    }
+}
+
 impl PreparedPendingPairCallGraphComptime {
     pub fn base(&self) -> &PreparedBaseDeclarations { &self.base }
     pub fn binding(&self) -> &BaseCstProposalBinding { &self.binding }
+
+    /// Resolve all required distinct evaluator ordinals from the exact
+    /// owning compiler plan. Bypass occurrences have no result member.
+    pub fn result_shape(&self) -> Option<PreparedPairResultShape> {
+        self.base.lease.finish_current(|| {
+            let PendingEntryComptimeProjection::Candidate(RootedPairCallGraphComptimeProjection::Emitted(plan))
+                = &self.projection else { return None; };
+            if plan.source_root() != self.binding.proposed || plan.target() != self.binding.selected.target {
+                return None;
+            }
+            let output = plan.wasip1_output()?;
+            let mut by_ordinal = vec![None; output.evaluators().len()];
+            for (call, _) in output.evidence().calls() {
+                let index = call.evaluator_index();
+                let values = std::array::from_fn(|index| scalar_argument(call.facts().inputs()[index].value()));
+                let selected = by_ordinal.get_mut(index)?;
+                if selected.as_ref().is_some_and(|prior| prior != &values) { return None; }
+                *selected = Some(values);
+            }
+            let evaluators = output.evaluators().iter().zip(by_ordinal).map(|(evaluator, values)| {
+                Some(PreparedPairEvaluatorShape {
+                    fragment_ir: NodeId(*blake3::hash(evaluator.bytes()).as_bytes()),
+                    concrete_values: values?,
+                    result_type: evaluator.result_type().clone(),
+                })
+            }).collect::<Option<Vec<_>>>()?;
+            Some(PreparedPairResultShape {
+                prepared: self.base.identity(), binding: self.binding.clone(),
+                authored_cst: plan.authored_cst(), compiler_image: plan.compiler_image(),
+                target: plan.target().to_owned(), profile: plan.profile().to_owned(),
+                site: plan.id().to_owned(), evaluators,
+            })
+        }).flatten()
+    }
 
     pub fn projection(&self) -> Option<&PendingPairCallGraphComptimeProjection> {
         self.base.lease.finish_current(|| &self.projection)

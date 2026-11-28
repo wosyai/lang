@@ -4,6 +4,9 @@ use std::collections::BTreeMap;
 use wosy_project::packages::{LockedInputId, PatchStackId};
 use wosy_project::{ArtifactProfile, ByteSpan, PackageRelativePath, SourceIdentity};
 
+mod comptime_result;
+pub use comptime_result::{ComptimeIdentityError, ComptimeInputs, ComptimeKey, ComptimeResult, ComptimeResultRoot, ComptimeScalarValue, ComptimeValue, ComptimeWatchIdentity};
+
 mod source_delta;
 pub use source_delta::{
     partition_cst_files, BaseCstProposal, BaseCstProposalBinding, CstAddition, CstDelta,
