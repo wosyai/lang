@@ -2971,9 +2971,10 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
             actual.exact_startup_callable_forwarder(topology, occurrence, declaration, signature, &initialized_argument)
         {
             let ordered = collection.map(|(_, ordered)| OrderedCallCollection {
-                startup_forwarded_call: Some((&declaration.source, forwarded_call)), ..ordered
+                startup_forwarded_call: Some(forwarded_call), ..ordered
             });
-            if !actual.active.contains(&wrapper) && !actual.active.contains(&callback)
+            if collection.is_none_or(|(source, _)| source == &declaration.source)
+                && !actual.active.contains(&wrapper) && !actual.active.contains(&callback)
             {
                 actual.note_reached(wrapper);
                 actual.note_reached(callback);
@@ -3604,7 +3605,7 @@ struct OrderedCallCollection<'a, 'visits> {
     #[cfg(feature = "internal-checker")]
     startup_site_source: Option<&'a SourceIdentity>,
     #[cfg(feature = "internal-checker")]
-    startup_forwarded_call: Option<(&'a SourceIdentity, ByteSpan)>,
+    startup_forwarded_call: Option<ByteSpan>,
     #[cfg(feature = "internal-checker")]
     plain_unit_root: bool,
 }
@@ -4558,7 +4559,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let trace = ordered.failures.borrow().startup_search.clone().ok_or(ProjectCheck::Unsupported)?;
             trace.borrow_mut().append(failure_search::PathStep::Call(at.clone())).ok_or(ProjectCheck::Unsupported)?;
             let forwarded = ordered.startup_forwarded_call
-                .map(|(owner, span)| wosy_syntax::SourceSpan::new(owner.clone(), span));
+                .map(|span| wosy_syntax::SourceSpan::new(source.clone(), span));
             if let Some(inner) = &forwarded {
                 trace.borrow_mut().append(failure_search::PathStep::Call(inner.clone())).ok_or(ProjectCheck::Unsupported)?;
             }
