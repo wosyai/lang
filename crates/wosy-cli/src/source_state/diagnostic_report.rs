@@ -144,6 +144,23 @@ pub struct SelectedPairOrdinaryInputs {
     inputs: PendingBuilderInputs,
     partition: Vec<u8>,
     runtime: &'static str,
+    compiler_partition_receipt: SelectedComptimePartitionReceipt,
+}
+
+#[cfg(target_os = "linux")]
+pub struct SelectedComptimePartitionReceipt {
+    key: Option<blake3::Hash>,
+    reused: bool,
+    tool_elapsed: Duration,
+    llvm_elapsed: Duration,
+}
+
+#[cfg(target_os = "linux")]
+impl SelectedComptimePartitionReceipt {
+    pub fn key(&self) -> Option<blake3::Hash> { self.key }
+    pub fn reused(&self) -> bool { self.reused }
+    pub fn tools_elapsed(&self) -> Duration { self.tool_elapsed }
+    pub fn llvm_elapsed(&self) -> Duration { self.llvm_elapsed }
 }
 
 #[cfg(target_os = "linux")]
@@ -153,8 +170,10 @@ impl SelectedPairOrdinaryInputs {
     pub fn inputs(&self) -> &PendingBuilderInputs { &self.inputs }
     pub fn partition(&self) -> &[u8] { &self.partition }
     pub fn runtime(&self) -> &'static str { self.runtime }
-    pub fn into_builder_inputs(self) -> (AcknowledgedSourceGeneration, PendingBuilderInputs, Vec<u8>, &'static str) {
-        (self.source, self.inputs, self.partition, self.runtime)
+    pub fn into_builder_inputs(self) -> (
+        AcknowledgedSourceGeneration, PendingBuilderInputs, Vec<u8>, &'static str, SelectedComptimePartitionReceipt,
+    ) {
+        (self.source, self.inputs, self.partition, self.runtime, self.compiler_partition_receipt)
     }
 }
 
@@ -682,22 +701,84 @@ fn bind_builder_inputs(
 #[cfg(target_os = "linux")]
 fn prepare_comptime_builder_inputs(
     source: AcknowledgedSourceGeneration, observed: Option<ObservedBuilderBasis>, target: &str, profile: &str,
-    output: &Path, observation: wosy_project::ArtifactComptimeObservation, emitted: wosy_daemon::SelectedPairComptimeEmission,
-    deadline: Instant,
+    output: &Path, observation: wosy_project::ArtifactComptimeObservation,
+    ready: wosy_daemon::SelectedComptimeContinuation<'_>, deadline: Instant, tool_elapsed: Duration,
 ) -> Result<Option<SelectedPairOrdinaryInputs>> {
     require_diagnostic_time(deadline)?;
     let observed = observed.ok_or("selected comptime artifact has no live builder inputs")?;
     let (_, artifact, profile_config, _) = observed.configuration.artifact_profile(target, profile)?;
     let runtime = wosy_compiler::core_runtime(&profile_config.backend, &profile_config.output)?;
-    let mut partition = Vec::new();
-    emitted.partition.write_text(&mut partition)?;
     let mut inputs = pending_builder_inputs(
         &observed.configuration, observed.configuration_identity, target, profile, artifact, profile_config,
-        observed.source, blake3::hash(&partition).to_hex().to_string(), output,
+        observed.source, String::new(), output,
     )?;
     inputs.manifest.identity.compiler_identity = expected_artifact_compiler_identity(Some(&observation));
     inputs.manifest.comptime = Some(observation);
-    Ok(Some(SelectedPairOrdinaryInputs { source, result_root: emitted.result_root, inputs, partition, runtime }))
+
+    // Only the fully verified explicit export continuation has a closed
+    // byte-affecting input set independent of other manifest partitions.
+    // The current root/result with whole configuration are still required
+    // to validate the live build and are stored in the new generation.
+    let llvm_started = Instant::now();
+    let result_root = ready.result_root();
+    let independent = ready.independent_export_inputs();
+    let key = if let Some(projected) = independent {
+        let mut identity = inputs.manifest.identity.clone();
+        identity.configuration_identity.clear();
+        let comptime = inputs.manifest.comptime.as_ref().expect("selected comptime observation");
+        serde_json::to_vec(&(
+            source.selection().project.as_str(), target, profile, ready.compiler_image().0,
+            projected, &identity, profile_config, &inputs.manifest.source_observations,
+            blake3::hash(runtime.as_bytes()).as_bytes(),
+            &comptime.site, &comptime.watches, &comptime.additional_sites,
+        )).ok().map(|material| {
+            blake3::Hash::from(blake3::derive_key("Wosy independent typed export compiler partition v1", &material))
+        })
+    } else {
+        serde_json::to_vec(&(
+            source.selection().project.as_str(), source.selection().target.as_str(), source.selection().root.0,
+            ready.compiler_image().0, &inputs.manifest.identity, &inputs.manifest.comptime,
+        )).ok().map(|material| {
+            blake3::Hash::from(blake3::derive_key("Wosy ordinary compiler with freshly executed comptime v1", &material))
+        })
+    };
+
+    let retained = key.and_then(|key| {
+        let selected = wosy_project::SelectedArtifactGeneration::open(&output.join("incremental")).ok().flatten()?;
+        let manifest = selected.manifest();
+        if manifest.source_observations != inputs.manifest.source_observations { return None; }
+        let mut previous = manifest.identity.clone();
+        let mut expected = inputs.manifest.identity.clone();
+        let (prior, current) = (manifest.comptime.as_ref()?, inputs.manifest.comptime.as_ref()?);
+        if independent.is_some() {
+            if prior.site != current.site || prior.watches != current.watches || prior.additional_sites != current.additional_sites {
+                return None;
+            }
+            previous.configuration_identity.clear();
+            expected.configuration_identity.clear();
+        } else if prior != current {
+            return None;
+        }
+        expected.llvm_input_identity.clone_from(&previous.llvm_input_identity);
+        if previous != expected { return None; }
+        let bytes = selected.retained_compiler_partition(&key).ok().flatten()?;
+        Some((bytes, expected.llvm_input_identity))
+    });
+    if !ready.is_live() { return Ok(None); }
+    let reused = retained.is_some();
+    let (partition, digest) = if let Some(retained) = retained {
+        retained
+    } else {
+        let Some(emitted) = ready.emit()? else { return Ok(None); };
+        let mut bytes = Vec::new();
+        emitted.partition.write_text(&mut bytes)?;
+        let digest = blake3::hash(&bytes).to_hex().to_string();
+        (bytes, digest)
+    };
+    require_diagnostic_time(deadline)?;
+    inputs.manifest.identity.llvm_input_identity = digest;
+    Ok(Some(SelectedPairOrdinaryInputs { source, result_root, inputs, partition, runtime,
+        compiler_partition_receipt: SelectedComptimePartitionReceipt { key, reused, tool_elapsed, llvm_elapsed: llvm_started.elapsed() } }))
 }
 
 #[cfg(target_os = "linux")]
@@ -726,6 +807,7 @@ impl SqliteSourceState {
         let watch_scope = || LocalComptimeInputScope {
             target: plan.target(), profile: plan.profile(), site: plan.id(), watch_limits: budget.watch_limits,
         };
+        let tool_started = Instant::now();
         let execution = crate::comptime_fragment::execute_selected_pair_wasip1(
             evaluators, &self.project, watch_scope(), owner.configuration_inputs().0,
             ComptimeExecutionAttempt {
@@ -733,11 +815,12 @@ impl SqliteSourceState {
                 generation: source.generation(), authored_cst: plan.authored_cst().0,
             }, private_parent, budget.evaluator_ir_bytes, budget.evaluator_module_bytes, deadline.into_std(), &cancelled,
         )?;
-        let Some(emitted) = owner.emit_owned_result(source.generation(), &execution)? else { return Ok(None); };
+        let tool_elapsed = tool_started.elapsed();
+        let Some(ready) = owner.prepare_owned_result(source.generation(), &execution)? else { return Ok(None); };
         let Ok(current) = self.capture_live(plan.target(), plan.profile(), deadline, usize::MAX, true)? else { return Ok(None); };
         if current.captured.selection() != source.selection()
             || current.captured.source.generation() != source.generation()
-            || cancelled() || emitted.source_root != source.selection().root
+            || cancelled() || ready.source_root() != source.selection().root
         {
             return Ok(None);
         }
@@ -747,25 +830,12 @@ impl SqliteSourceState {
         {
             return Ok(None);
         }
-        require_diagnostic_time(deadline)?;
-        let observed = current.builder.ok_or("selected comptime artifact has no live builder inputs")?;
-        let (_, artifact, profile, _) = observed.configuration.artifact_profile(plan.target(), plan.profile())?;
-        let runtime = wosy_compiler::core_runtime(&profile.backend, &profile.output)?;
-        let mut partition = Vec::new();
-        emitted.partition.write_text(&mut partition)?;
-        let mut inputs = pending_builder_inputs(
-            &observed.configuration, observed.configuration_identity, plan.target(), plan.profile(),
-            artifact, profile, observed.source, blake3::hash(&partition).to_hex().to_string(), output,
-        )?;
-        inputs.manifest.comptime = Some(wosy_project::ArtifactComptimeObservation {
-            source_root: source.selection().root.0,
-            result_root: emitted.result_root.identity().0,
-            configuration_inputs: owner.configuration_inputs().0,
-            site: plan.id().to_owned(),
-            watches: watches.watches().to_vec(),
-            additional_sites: Vec::new(),
-        });
-        Ok(Some(SelectedPairOrdinaryInputs { source, result_root: emitted.result_root, inputs, partition, runtime }))
+        let observation = wosy_project::ArtifactComptimeObservation {
+            source_root: ready.source_root().0, result_root: ready.result_root().identity().0,
+            configuration_inputs: owner.configuration_inputs().0, site: plan.id().to_owned(),
+            watches: watches.watches().to_vec(), additional_sites: Vec::new(),
+        };
+        prepare_comptime_builder_inputs(source, current.builder, plan.target(), plan.profile(), output, observation, ready, deadline, tool_elapsed)
     }
 
     /// Execute only the distinct concrete tuples in the verified explicit
@@ -786,6 +856,7 @@ impl SqliteSourceState {
             return Ok(None);
         }
         let configuration_inputs = owner.configuration_inputs().0;
+        let tool_started = Instant::now();
         let execution = crate::comptime_fragment::execute_selected_concrete_wasip1(
             plan.evaluators(), &self.project, LocalComptimeInputScope {
                 target: plan.target(), profile: plan.profile(), site: plan.id(), watch_limits: budget.watch_limits,
@@ -795,16 +866,17 @@ impl SqliteSourceState {
             }, private_parent, budget.evaluator_ir_bytes, budget.evaluator_module_bytes,
             wosy_compiler::OrderedClosedWasip1::MAX_STDOUT, deadline.into_std(), &cancelled,
         )?;
-        let Some(emitted) = owner.emit_owned_results(source.generation(), &execution)? else { return Ok(None); };
+        let tool_elapsed = tool_started.elapsed();
+        let Some(ready) = owner.prepare_owned_results(source.generation(), &execution)? else { return Ok(None); };
         let Ok(current) = self.capture_live(plan.target(), plan.profile(), deadline, usize::MAX, true)? else { return Ok(None); };
         if current.captured.selection() != source.selection()
             || current.captured.source.generation() != source.generation()
-            || emitted.source_root != source.selection().root || cancelled()
+            || ready.source_root() != source.selection().root || cancelled()
         {
             return Ok(None);
         }
         let observation = ArtifactComptimeObservation {
-            source_root: emitted.source_root.0, result_root: emitted.result_root.identity().0, configuration_inputs,
+            source_root: ready.source_root().0, result_root: ready.result_root().identity().0, configuration_inputs,
             site: plan.id().to_owned(), watches: execution.observed().watches().to_vec(), additional_sites: Vec::new(),
         };
         if !observation.matches_current(&self.project, plan.target(), plan.profile())
@@ -812,7 +884,7 @@ impl SqliteSourceState {
         {
             return Ok(None);
         }
-        prepare_comptime_builder_inputs(source, current.builder, plan.target(), plan.profile(), output, observation, emitted, deadline)
+        prepare_comptime_builder_inputs(source, current.builder, plan.target(), plan.profile(), output, observation, ready, deadline, tool_elapsed)
     }
 
     /// Execute all closed sites before one ordinary continuation. Observe
@@ -856,6 +928,7 @@ impl SqliteSourceState {
         let initial_watches = sites.into_iter().zip(watch_sets).map(|(site, watches)| {
             ArtifactComptimeSiteObservation { site: site.to_owned(), watches }
         }).collect::<Vec<_>>();
+        let tool_started = Instant::now();
         let mut executions = Vec::with_capacity(plan.evaluators().len());
         for (ordinal, (evaluator, before)) in plan.evaluators().iter().zip(&initial_watches).enumerate() {
             if cancelled() || owner.plan().is_none() { return Ok(None); }
@@ -867,18 +940,19 @@ impl SqliteSourceState {
                 }, &before.watches, private_parent, budget.evaluator_module_bytes, deadline.into_std(), &cancelled,
             )?);
         }
-        let Some(emitted) = owner.emit_owned_results(source.generation(), &executions)? else { return Ok(None); };
+        let tool_elapsed = tool_started.elapsed();
+        let Some(ready) = owner.prepare_owned_results(source.generation(), &executions)? else { return Ok(None); };
         let Ok(current) = self.capture_live(plan.target(), plan.profile(), deadline, usize::MAX, true)? else { return Ok(None); };
         if current.captured.selection() != source.selection()
             || current.captured.source.generation() != source.generation()
-            || emitted.source_root != source.selection().root || cancelled()
+            || ready.source_root() != source.selection().root || cancelled()
         {
             return Ok(None);
         }
         let mut watches = initial_watches.into_iter();
         let first = watches.next().ok_or("selected comptime batch has no site")?;
         let observation = ArtifactComptimeObservation {
-            source_root: emitted.source_root.0, result_root: emitted.result_root.identity().0, configuration_inputs,
+            source_root: ready.source_root().0, result_root: ready.result_root().identity().0, configuration_inputs,
             site: first.site, watches: first.watches, additional_sites: watches.collect(),
         };
         if !observation.matches_current(&self.project, plan.target(), plan.profile())
@@ -886,7 +960,7 @@ impl SqliteSourceState {
         {
             return Ok(None);
         }
-        prepare_comptime_builder_inputs(source, current.builder, plan.target(), plan.profile(), output, observation, emitted, deadline)
+        prepare_comptime_builder_inputs(source, current.builder, plan.target(), plan.profile(), output, observation, ready, deadline, tool_elapsed)
     }
 
     /// Reobserve exact ordinary inputs while the caller holds its artifact

@@ -7,6 +7,9 @@ import tempfile
 
 operation, *args = sys.argv[1:]
 if operation == "build":
+    if Path("audit-compiler-reuse").exists():
+        with Path("evaluator-builds").open("ab") as log:
+            log.write(b"build\n")
     ir, output, manifest = map(Path, args)
     module = Path(json.loads(manifest.read_text())["executable"])
     assert module.parent == output
@@ -47,10 +50,17 @@ elif operation in ("artifact-check", "artifact-build", "artifact-build-min", "ar
     if operation == "artifact-build-ordered":
         checks = [("first", 14), ("second", 10), ("tied", 4)]
     elif operation == "artifact-build-exported":
-        profile = metadata["identity"]["artifact_identity"].split(":")[1]
-        checks = [("north", 10)] if profile == "subset" else [
-            ("west", 34), ("south", 34), ("north", 10), ("mirror", 34),
-        ]
+        if Path("audit-compiler-reuse").exists():
+            with Path("final-builds").open("ab") as log:
+                log.write(b"build\n")
+        import tomllib
+        target, profile, _ = metadata["identity"]["artifact_identity"].split(":")
+        authored = tomllib.loads(Path("wosy.toml").read_text())["targets"][target]
+        artifact_name = authored["profiles"][profile]["main_artifact"]
+        roster = authored["artifacts"][artifact_name]["profiles"][profile]["exports"]
+        north = 11 if Path("different-result").exists() else 10
+        returns = {"first": 34, "again": 34, "other": north}
+        checks = [(label, returns[declaration]) for label, declaration in roster.items()]
     else:
         checks = [("bypass", 37), ("first", 34), ("repeated", 34), ("different", expected)]
     checker = []
@@ -111,12 +121,17 @@ elif operation == "ordered-run":
     module = json.loads(manifest.read_text())["executable"]
     completed = subprocess.run(["wasmtime", "run", "-C", "cache=n", module], capture_output=True)
     sys.stderr.buffer.write(completed.stderr)
+    result = completed.stdout
     if not completed.returncode:
+        if result == b"10\n" and Path("different-result").exists():
+            # Simulate a configured host runner changing its delivered
+            # value without a source, configuration, or watch change.
+            result = b"11\n"
         with Path("evaluator-order").open("ab") as log:
-            log.write(completed.stdout)
-        if completed.stdout == b"10\n" and Path("refuse-second-evaluator").exists():
+            log.write(result)
+        if result == b"10\n" and Path("refuse-second-evaluator").exists():
             sys.exit(74)
-    sys.stdout.buffer.write(completed.stdout)
+    sys.stdout.buffer.write(result)
     sys.exit(completed.returncode)
 elif operation == "run":
     manifest, = map(Path, args)

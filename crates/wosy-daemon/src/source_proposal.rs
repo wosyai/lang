@@ -284,6 +284,7 @@ fn comptime_digest(domain: &str, input: &impl serde::Serialize) -> Result<NodeId
 #[cfg(target_os = "linux")]
 pub(super) struct PairDecodedResults {
     pub root: wosy_protocol::ComptimeResultRoot,
+    pub members: NodeId,
     pub values: Vec<wosy_compiler::ScalarExpression>,
     pub modules: Vec<NodeId>,
 }
@@ -500,8 +501,10 @@ fn decode_owned_concrete_results(
         values.push(decoded);
         modules.push(NodeId(*receipt.module().as_bytes()));
     }
-    let root = ComptimeResultRoot::identify(selected.root, selected.target, selected.profile, results)?;
-    Ok(PairDecodedResults { root, values, modules })
+    let (root, members) = ComptimeResultRoot::identify_with_members(
+        selected.root, selected.target, selected.profile, results,
+    )?;
+    Ok(PairDecodedResults { root, members, values, modules })
 }
 
 impl PreparedPendingPairCallGraphComptime {
@@ -540,7 +543,7 @@ impl PreparedPendingPairCallGraphComptime {
     ) -> Result<Option<PreparedPairResultIntake>> {
         let Some(PendingEntryComptimeProjection::Candidate(RootedPairCallGraphComptimeProjection::Emitted(plan))) =
             self.projection() else { return Ok(None); };
-        let PairDecodedResults { root, values, modules } = decode_owned_pair_results(
+        let PairDecodedResults { root, values, modules, .. } = decode_owned_pair_results(
             plan, std::path::Path::new(&self.binding.selected.project), self.configuration_inputs,
             self.binding.attempt, &self.execution_seal, executed,
         )?;

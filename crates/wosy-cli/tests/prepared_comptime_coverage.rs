@@ -1584,6 +1584,14 @@ u32 different = solve(7, 13);
     fs::write(root.join("wosy.toml"), manifest.replace("\"artifact-build\"", "\"artifact-build-min\"")).unwrap();
     check("build");
     check("run");
+    let signed = chosen();
+    let warm = command("build");
+    assert!(warm.status.success());
+    assert!(String::from_utf8_lossy(&warm.stderr).contains("reused compiler LLVM after executing current comptime"));
+    check("run");
+    let refreshed = chosen();
+    assert_ne!(signed.manifest_path(), refreshed.manifest_path());
+    assert_eq!(signed.manifest().identity.llvm_input_identity, refreshed.manifest().identity.llvm_input_identity);
 }
 
 #[cfg(target_os = "linux")]
@@ -1709,12 +1717,21 @@ u32 tied = first ^ second;
     assert_ne!(observation.result_root, original.result_root);
     assert_eq!(fs::read(&first.manifest().executable).unwrap(), retained);
 
+    let warm = command("build");
+    assert!(warm.status.success());
+    assert!(String::from_utf8_lossy(&warm.stderr).contains("reused compiler LLVM after executing current comptime"));
+    checked("run");
+    let refreshed = chosen();
+    assert_ne!(current.manifest_path(), refreshed.manifest_path());
+    assert_eq!(current.manifest().identity.llvm_input_identity, refreshed.manifest().identity.llvm_input_identity);
+    assert_eq!(fs::read(&order).unwrap(), b"14\n10\n14\n10\n14\n10\n14\n10\n");
+
     // A second body capturing the first is outside the closed plan; do
     // not run any of the batch or admit a result for the supported prefix.
     fs::write(&source_path, source.replace("base ^ 7", "base ^ first")).unwrap();
     assert!(!command("build").status.success());
-    assert_eq!(fs::read(&order).unwrap(), b"14\n10\n14\n10\n14\n10\n");
-    assert_eq!(chosen().manifest_path(), current.manifest_path());
+    assert_eq!(fs::read(&order).unwrap(), b"14\n10\n14\n10\n14\n10\n14\n10\n");
+    assert_eq!(chosen().manifest_path(), refreshed.manifest_path());
 }
 
 #[cfg(target_os = "linux")]
@@ -1755,6 +1772,25 @@ toolchain_identity = "ordinary exported WASI fixture"
 command = ["python3", "ordinary_wasip1_pair.py", "ordered-run"]
 [comptime.calculate]
 watch = ["watch.txt"]
+[targets.utility]
+root = "utility.w"
+[targets.utility.artifacts.main]
+artifact = "Utility"
+[targets.utility.artifacts.main.profiles.dev]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "nominal"
+run_runner = "nominal"
+[targets.utility.artifacts.main.profiles.dev.exports]
+util = "other"
+[targets.utility.profiles.dev]
+main_artifact = "main"
+comptime_builder = "pair"
+comptime_runner = "pair"
+build_permissions = []
+build_mounts = []
+[comptime.calculate_utility]
+watch = ["utility-watch.txt"]
 "#;
     let manifest = manifest.replace("[targets.app.profiles.dev]", r#"
 [targets.app.profiles.dev]
@@ -1779,6 +1815,9 @@ u32() unknown = fn { solve(nonliteral(), 1) };
 %%end
 "#;
     fs::write(project.join("main.w"), source).unwrap();
+    fs::write(project.join("utility.w"), source.replace("comptime calculate ", "comptime calculate_utility ")).unwrap();
+    let utility_watch = project.join("utility-watch.txt");
+    fs::write(&utility_watch, b"utility input").unwrap();
     let configuration = wosy_project::ProjectConfiguration::load(project).unwrap();
     let (_, _, artifact_profile, _) = configuration.artifact_profile("app", "dev").unwrap();
     let parsed = wosy_syntax::parse_with_snapshot(
@@ -1791,16 +1830,18 @@ u32() unknown = fn { solve(nonliteral(), 1) };
     assert_eq!(typed_plan.tuples().len(), 2);
 
     let order = project.join("evaluator-order");
-    let command = |verb: &str, profile: &str| Command::new(env!("CARGO_BIN_EXE_wosy"))
-        .current_dir(project).env("WOSY_INCREMENTAL", "1").args([verb, "app", "--profile", profile])
+    let partition_command = |verb: &str, target: &str, profile: &str| Command::new(env!("CARGO_BIN_EXE_wosy"))
+        .current_dir(project).env("WOSY_INCREMENTAL", "1").args([verb, target, "--profile", profile])
         .output().unwrap();
+    let command = |verb: &str, profile: &str| partition_command(verb, "app", profile);
     let checked = |verb: &str, profile: &str| {
         let output = command(verb, profile);
         assert!(output.status.success(), "{verb}/{profile}: {}", String::from_utf8_lossy(&output.stderr));
     };
-    let chosen = |profile: &str| SelectedArtifactGeneration::open(
-        &project.join(format!(".wosy/artifacts/app/{profile}/main/incremental")),
+    let chosen_partition = |target: &str, profile: &str| SelectedArtifactGeneration::open(
+        &project.join(format!(".wosy/artifacts/{target}/{profile}/main/incremental")),
     ).unwrap().unwrap();
+    let chosen = |profile: &str| chosen_partition("app", profile);
     let read_ir = |choice: &SelectedArtifactGeneration| fs::read_to_string(
         choice.manifest_path().parent().unwrap().join("partition.ll"),
     ).unwrap();
@@ -1864,10 +1905,126 @@ u32() unknown = fn { solve(nonliteral(), 1) };
     assert_ne!(current.manifest().comptime.as_ref().unwrap().result_root, observation.result_root);
     assert_eq!(fs::read(&first.manifest().executable).unwrap(), original_wasm);
 
+    // A compiler LLVM hit is allowed only after both evaluated results
+    // are fresh, never instead of evaluator or artifact processes.
+    let hit = "reused compiler LLVM after executing current comptime";
+    let build = |warm: bool| {
+        let start = std::time::Instant::now();
+        let output = command("build", "dev");
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{stderr}");
+        assert_eq!(stderr.contains(hit), warm, "{stderr}");
+        eprintln!("dev LLVM receipt {}: {} ms including ordinary tool processes",
+            if warm { "hit" } else { "miss" }, start.elapsed().as_millis());
+        eprintln!("{}", stderr.lines().find(|line| line.contains("LLVM") && line.contains("evaluator tools")).unwrap());
+    };
+    fs::write(project.join("audit-compiler-reuse"), b"count ordinary process invocations").unwrap();
+    let count = |file: &str| fs::read_to_string(project.join(file)).unwrap().lines().count();
+    let start_runs = count("evaluator-order");
+    build(true);
+    checked("run", "dev");
+    let warm = chosen("dev");
+    assert_ne!(warm.manifest_path(), current.manifest_path());
+    assert_eq!(read_ir(&warm), read_ir(&current));
+    assert_eq!(count("evaluator-builds"), 2);
+    assert_eq!(count("evaluator-order"), start_runs + 2);
+    assert_eq!(count("final-builds"), 1);
+
+    // Corrupt only a disposable generation, then re-derive LLVM from
+    // the actual same typed terminal results rather than trusting bytes.
+    fs::write(warm.manifest_path().parent().unwrap().join("partition.ll"), b"invalid LLVM").unwrap();
+    build(false);
+    checked("run", "dev");
+    let repaired = chosen("dev");
+    assert_eq!(read_ir(&repaired), read_ir(&current));
+
+    // Changed terminal value with the same source, manifest and watches
+    // still invalidates the compiler receipt.
+    fs::write(project.join("different-result"), b"runner returns eleven").unwrap();
+    build(false);
+    checked("run", "dev");
+    let changed = chosen("dev");
+    let before = repaired.manifest().comptime.as_ref().unwrap();
+    let after = changed.manifest().comptime.as_ref().unwrap();
+    assert_eq!(before.source_root, after.source_root);
+    assert_eq!(before.configuration_inputs, after.configuration_inputs);
+    assert_eq!(before.watches, after.watches);
+    assert_ne!(before.result_root, after.result_root);
+    assert_ne!(read_ir(&repaired), read_ir(&changed));
+    assert_ne!(repaired.manifest().identity.llvm_input_identity, changed.manifest().identity.llvm_input_identity);
+    check_export(&changed, "north", "11");
+    build(true);
+    checked("run", "dev");
+    let current = chosen("dev");
+    assert_eq!(read_ir(&current), read_ir(&changed));
+    assert_eq!(count("evaluator-builds"), 8);
+    assert_eq!(count("evaluator-order"), start_runs + 8);
+    assert_eq!(count("final-builds"), 4);
+
+    fs::remove_file(project.join("different-result")).unwrap();
+    let check_partition_build = |target: &str, profile: &str, warm: bool, evaluator_count: usize| {
+        let before = (count("evaluator-builds"), count("evaluator-order"), count("final-builds"));
+        let started = std::time::Instant::now();
+        let output = partition_command("build", target, profile);
+        let stderr = String::from_utf8_lossy(&output.stderr);
+        assert!(output.status.success(), "{target}/{profile}: {stderr}");
+        assert_eq!(stderr.contains(hit), warm, "{target}/{profile}: {stderr}");
+        assert_eq!((count("evaluator-builds"), count("evaluator-order"), count("final-builds")),
+            (before.0 + evaluator_count, before.1 + evaluator_count, before.2 + 1));
+        let run = partition_command("run", target, profile);
+        assert!(run.status.success(), "{target}/{profile}: {}", String::from_utf8_lossy(&run.stderr));
+        eprintln!("{target}/{profile} build+run {} ms: {}", started.elapsed().as_millis(),
+            stderr.lines().find(|line| line.contains("LLVM") && line.contains("evaluator tools")).unwrap());
+    };
+    // All three partitions have their own histories and tool counts.
+    check_partition_build("app", "dev", false, 2);
+    check_partition_build("app", "subset", false, 1);
+    check_partition_build("utility", "dev", false, 1);
+    for (target, profile, expected) in [("app", "dev", 2), ("app", "subset", 1), ("utility", "dev", 1)] {
+        check_partition_build(target, profile, true, expected);
+    }
+    let before_dev = chosen("dev");
+    let before_subset = chosen("subset");
+    let before_utility = chosen_partition("utility", "dev");
+
+    // Rename only one actual export of dev. The whole TOML/root changes,
+    // but neither independent partition's LLVM inputs do.
+    let revised_manifest = manifest.replace("mirror = \"first\"", "replica = \"first\"");
+    fs::write(&manifest_path, &revised_manifest).unwrap();
+    check_partition_build("app", "dev", false, 2);
+    check_partition_build("app", "subset", true, 1);
+    check_partition_build("utility", "dev", true, 1);
+    let revised_dev = chosen("dev");
+    let revised_subset = chosen("subset");
+    let revised_utility = chosen_partition("utility", "dev");
+    assert_ne!(read_ir(&revised_dev), read_ir(&before_dev));
+    check_export(&revised_dev, "replica", "34");
+    assert!(!invoke(&revised_dev, "mirror").status.success());
+    for (prior, revised) in [(&before_subset, &revised_subset), (&before_utility, &revised_utility)] {
+        assert_ne!(revised.manifest_path(), prior.manifest_path());
+        assert_ne!(revised.manifest().identity.configuration_identity, prior.manifest().identity.configuration_identity);
+        let old = prior.manifest().comptime.as_ref().unwrap();
+        let new = revised.manifest().comptime.as_ref().unwrap();
+        assert_ne!(old.source_root, new.source_root);
+        assert_ne!(old.result_root, new.result_root);
+        assert_eq!(old.watches, new.watches);
+        assert_eq!(read_ir(prior), read_ir(revised));
+    }
+
+    // Only utility uses utility-watch.txt; changing it cannot invalidate
+    // app's selected partitions or their warm compiler receipts.
+    fs::write(&utility_watch, b"utility input changed").unwrap();
+    let utility_stale = partition_command("run", "utility", "dev");
+    assert!(String::from_utf8_lossy(&utility_stale.stderr).contains("artifact comptime inputs are stale"));
+    check_partition_build("utility", "dev", false, 1);
+    check_partition_build("app", "dev", true, 2);
+    check_partition_build("app", "subset", true, 1);
+    let current = chosen("dev");
+
     // Making the unknown edge reachable rejects the complete plan before
     // any selected evaluator or the final artifact builder is called.
     let prior = fs::read(&order).unwrap();
-    fs::write(&manifest_path, manifest.replace("mirror = \"first\"", "mirror = \"unknown\"")).unwrap();
+    fs::write(&manifest_path, revised_manifest.replace("replica = \"first\"", "replica = \"unknown\"")).unwrap();
     assert!(!command("build", "dev").status.success());
     assert_eq!(fs::read(order).unwrap(), prior);
     assert_eq!(chosen("dev").manifest_path(), current.manifest_path());

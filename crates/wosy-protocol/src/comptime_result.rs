@@ -100,23 +100,42 @@ impl ComptimeResultRoot {
         prepared_source: NodeId, target: &str, profile: &str,
         results: impl IntoIterator<Item = ComptimeResult>,
     ) -> Result<Self, ComptimeIdentityError> {
-        let scope = identify("Wosy comptime target and profile v1", &(target, profile))?;
-        let mut members = Vec::new();
-        for result in results {
-            if result.key.scope != scope {
-                return Err(ComptimeIdentityError::ForeignTargetOrProfile);
-            }
-            members.push((result.key.identity, result.identity));
-        }
-        members.sort_unstable();
-        members.dedup();
-        if members.windows(2).any(|pair| pair[0].0 == pair[1].0) {
-            return Err(ComptimeIdentityError::ConflictingResult);
-        }
+        let members = checked_result_members(target, profile, results)?;
         Ok(Self(identify("Wosy comptime result root v1", &(prepared_source, target, profile, members))?))
     }
 
+    /// Return the active root and the comparable member identity from
+    /// the same single validated set. The latter is not a result root.
+    pub fn identify_with_members(
+        prepared_source: NodeId, target: &str, profile: &str,
+        results: impl IntoIterator<Item = ComptimeResult>,
+    ) -> Result<(Self, NodeId), ComptimeIdentityError> {
+        let members = checked_result_members(target, profile, results)?;
+        let root = Self(identify("Wosy comptime result root v1", &(prepared_source, target, profile, &members))?);
+        let comparable = identify("Wosy comptime result members v1", &(target, profile, members))?;
+        Ok((root, comparable))
+    }
+
     pub fn identity(self) -> NodeId { self.0 }
+}
+
+fn checked_result_members(
+    target: &str, profile: &str, results: impl IntoIterator<Item = ComptimeResult>,
+) -> Result<Vec<(NodeId, NodeId)>, ComptimeIdentityError> {
+    let scope = identify("Wosy comptime target and profile v1", &(target, profile))?;
+    let mut members = Vec::new();
+    for result in results {
+        if result.key.scope != scope {
+            return Err(ComptimeIdentityError::ForeignTargetOrProfile);
+        }
+        members.push((result.key.identity, result.identity));
+    }
+    members.sort_unstable();
+    members.dedup();
+    if members.windows(2).any(|pair| pair[0].0 == pair[1].0) {
+        return Err(ComptimeIdentityError::ConflictingResult);
+    }
+    Ok(members)
 }
 
 #[derive(Debug)]

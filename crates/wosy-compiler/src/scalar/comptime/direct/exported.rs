@@ -32,6 +32,15 @@ impl ExportedPairWasip1 {
     pub fn evaluators(&self) -> &[BoundedStartupWasip1Evaluator] { &self.evaluators }
     pub fn tuples(&self) -> &[[DirectComptimeArgument; 2]] { &self.tuples }
 
+    /// This continuation can only emit the authenticated single-module
+    /// WASM32 source below, with exactly the selected export names and
+    /// patched call sites. It never searches configuration or imports.
+    pub fn selected_compiler_inputs(&self) -> Result<Vec<u8>, serde_json::Error> {
+        let routes = self.uses.iter().map(|route| (route.declaration, route.call, route.evaluator)).collect::<Vec<_>>();
+        serde_json::to_vec(&(&self.source.source, "wasm32-wasip1", &self.exports, routes))
+    }
+
+
     pub fn emit(&self, values: &[ScalarExpression]) -> Result<crate::LlvmPartition, ClosedComptimeRejection> {
         use ClosedComptimeRejection as Error;
         let unsupported = |feature| Error::Unsupported { site: self.site.clone(), feature };

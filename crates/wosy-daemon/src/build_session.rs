@@ -52,6 +52,42 @@ pub struct SelectedPairComptimeEmission {
     pub partition: wosy_compiler::LlvmPartition,
 }
 
+/// A newly executed and validated complete result set borrowed from its
+/// exact selected lease. Compilation is delayed so the client can check
+/// the existing local compiler partition receipt. This does not authorize
+/// skipping tool execution or accepting a cached result set.
+#[cfg(target_os = "linux")]
+pub struct SelectedComptimeContinuation<'a> {
+    lease: &'a SourceLease,
+    independent_export_inputs: Option<(NodeId, [u8; 32], NodeId)>,
+    source_root: NodeId,
+    result_root: wosy_protocol::ComptimeResultRoot,
+    compiler_image: NodeId,
+    emit: Box<dyn FnOnce() -> Result<wosy_compiler::LlvmPartition> + 'a>,
+}
+
+#[cfg(target_os = "linux")]
+impl SelectedComptimeContinuation<'_> {
+    pub fn source_root(&self) -> NodeId { self.source_root }
+    pub fn result_root(&self) -> wosy_protocol::ComptimeResultRoot { self.result_root }
+    pub fn compiler_image(&self) -> NodeId { self.compiler_image }
+    /// Exact authored CST, authenticated selected typed emitter inputs,
+    /// and currently executed result members. Only the restricted
+    /// dependency-free explicit export emitter can issue this projection.
+    pub fn independent_export_inputs(&self) -> Option<(NodeId, [u8; 32], NodeId)> {
+        self.independent_export_inputs
+    }
+
+    pub fn is_live(&self) -> bool { self.lease.finish_current(|| ()).is_some() }
+    pub fn emit(self) -> Result<Option<SelectedPairComptimeEmission>> {
+        if !self.is_live() { return Ok(None); }
+        let partition = (self.emit)()?;
+        Ok(self.lease.finish_current(|| SelectedPairComptimeEmission {
+            source_root: self.source_root, result_root: self.result_root, partition,
+        }))
+    }
+}
+
 #[cfg(target_os = "linux")]
 impl SelectedPairComptimeOwner<'_> {
     pub fn configuration_inputs(&self) -> NodeId { self.configuration_inputs }
@@ -66,18 +102,30 @@ impl SelectedPairComptimeOwner<'_> {
         &self, acknowledged_generation: i64,
         executed: &wosy_project::packages::OwnedLocalComptimeExecution,
     ) -> Result<Option<SelectedPairComptimeEmission>> {
+        match self.prepare_owned_result(acknowledged_generation, executed)? {
+            Some(ready) => ready.emit(),
+            None => Ok(None),
+        }
+    }
+
+    pub fn prepare_owned_result(
+        &self, acknowledged_generation: i64,
+        executed: &wosy_project::packages::OwnedLocalComptimeExecution,
+    ) -> Result<Option<SelectedComptimeContinuation<'_>>> {
         let Some(plan) = self.plan() else { return Ok(None); };
         let project = std::path::Path::new(&plan.evidence().site().source.project);
         let decoded = super::source_proposal::decode_owned_pair_results(
             plan, project, self.configuration_inputs, acknowledged_generation, &self.execution_seal, executed,
         )?;
         let output = plan.wasip1_output().ok_or("selected paired plan is not ordinary WASIp1")?;
-        let partition = output.emit_ordinary_startup(&decoded.values)
-            .map_err(|error| format!("ordinary comptime continuation rejected: {error:?}"))?;
-        Ok(self.lease.finish_current(|| SelectedPairComptimeEmission {
-            source_root: plan.source_root(), result_root: decoded.root, partition,
+        Ok(self.lease.finish_current(|| SelectedComptimeContinuation {
+            lease: self.lease, source_root: plan.source_root(), result_root: decoded.root, compiler_image: plan.compiler_image(),
+            independent_export_inputs: None,
+            emit: Box::new(move || output.emit_ordinary_startup(&decoded.values)
+                .map_err(|error| format!("ordinary comptime continuation rejected: {error:?}").into())),
         }))
     }
+
 }
 
 #[cfg(target_os = "linux")]
@@ -103,19 +151,25 @@ impl SelectedExportedComptimeOwner<'_> {
     pub fn plan(&self) -> Option<&super::RootedExportedComptime> {
         self.lease.finish_current(|| &self.plan)
     }
-    pub fn emit_owned_results(
+    pub fn prepare_owned_results(
         &self, generation: i64, executed: &wosy_project::packages::OwnedLocalComptimeExecution,
-    ) -> Result<Option<SelectedPairComptimeEmission>> {
+    ) -> Result<Option<SelectedComptimeContinuation<'_>>> {
         let Some(plan) = self.plan() else { return Ok(None); };
         let decoded = super::source_proposal::decode_owned_exported_results(
             plan, self.configuration_inputs, generation, &self.execution_seal, executed,
         )?;
-        let partition = plan.evaluator.emit(&decoded.values)
-            .map_err(|error| format!("selected comptime export continuation rejected: {error:?}"))?;
-        Ok(self.lease.finish_current(|| SelectedPairComptimeEmission {
-            source_root: plan.source_root(), result_root: decoded.root, partition,
+        let independent_export_inputs = plan.evaluator.selected_compiler_inputs().ok().map(|material| {
+            let partition = blake3::derive_key("Wosy typed selected comptime export emitter inputs v1", &material);
+            (plan.authored_cst(), partition, decoded.members)
+        });
+        Ok(self.lease.finish_current(|| SelectedComptimeContinuation {
+            lease: self.lease, source_root: plan.source_root(), result_root: decoded.root, compiler_image: plan.compiler_image(),
+            independent_export_inputs,
+            emit: Box::new(move || plan.evaluator.emit(&decoded.values)
+                .map_err(|error| format!("selected comptime export continuation rejected: {error:?}").into())),
         }))
     }
+
 }
 
 #[cfg(target_os = "linux")]
@@ -134,9 +188,9 @@ impl SelectedOrderedComptimeOwner<'_> {
         self.lease.finish_current(|| &self.plan)
     }
 
-    pub fn emit_owned_results(
+    pub fn prepare_owned_results(
         &self, generation: i64, executions: &[wosy_project::packages::OwnedLocalComptimeExecution],
-    ) -> Result<Option<SelectedPairComptimeEmission>> {
+    ) -> Result<Option<SelectedComptimeContinuation<'_>>> {
         let Some(plan) = self.plan() else { return Ok(None); };
         if plan.evaluators().len() != executions.len() {
             return Err("selected comptime set is incomplete".into());
@@ -153,10 +207,11 @@ impl SelectedOrderedComptimeOwner<'_> {
         let result_root = wosy_protocol::ComptimeResultRoot::identify(
             plan.source_root(), plan.target(), plan.profile(), identities,
         )?;
-        let partition = plan.evaluator.emit_with_values(values)
-            .map_err(|error| format!("ordered comptime continuation rejected: {error:?}"))?;
-        Ok(self.lease.finish_current(|| SelectedPairComptimeEmission {
-            source_root: plan.source_root(), result_root, partition,
+        Ok(self.lease.finish_current(|| SelectedComptimeContinuation {
+            lease: self.lease, source_root: plan.source_root(), result_root, compiler_image: plan.compiler_image(),
+            independent_export_inputs: None,
+            emit: Box::new(move || plan.evaluator.emit_with_values(values)
+                .map_err(|error| format!("ordered comptime continuation rejected: {error:?}").into())),
         }))
     }
 }

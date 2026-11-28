@@ -75,7 +75,7 @@ pub use build_session::{BuildDiagnosticSession, BuildSourceOpening};
 #[cfg(target_os = "linux")]
 pub use build_session::{SelectedPairComptimeEmission, SelectedPairComptimeOwner, SelectedPairComptimePreparation};
 #[cfg(target_os = "linux")]
-pub use build_session::{SelectedComptimePreparation, SelectedExportedComptimeOwner, SelectedOrderedComptimeOwner};
+pub use build_session::{SelectedComptimeContinuation, SelectedComptimePreparation, SelectedExportedComptimeOwner, SelectedOrderedComptimeOwner};
 #[cfg(target_os = "linux")]
 pub use rooted_comptime::{RootedExportedComptime, RootedOrderedComptime};
 pub use framed_session::BuildSessionEnd;

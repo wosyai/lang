@@ -1,6 +1,6 @@
 //! Opt-in ordinary Build→Run through selected source and retained generations.
 use super::*;
-use std::{num::NonZeroUsize, os::unix::fs::{DirBuilderExt, PermissionsExt}, path::Path, sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, os::unix::fs::{DirBuilderExt, PermissionsExt}, path::Path, sync::Arc, time::{Duration, Instant}};
 use wosy_cli::{
     local_build_daemon::{compare_local_build, establish_local_build_source},
     source_recovery::ClientSourceLimits,
@@ -64,7 +64,7 @@ pub(super) fn build(
             None
         }
     };
-    publish_generation(root, target, profile, ordinary_paths, pending, &partition, runtime_ir, comparison, false)
+    publish_generation(root, target, profile, ordinary_paths, pending, &partition, runtime_ir, comparison, false, None)
 }
 
 fn compiler_partition_key(
@@ -104,7 +104,7 @@ pub(super) fn try_retained_partition(
     })();
     let Ok(Some((pending, bytes, state, source))) = candidate else { return Ok(false); };
     let runtime = wosy_compiler::core_runtime(&artifact_profile.backend, &artifact_profile.output)?;
-    publish_generation(root, target, profile, paths, pending, &bytes, runtime, Some((state, source)), true)
+    publish_generation(root, target, profile, paths, pending, &bytes, runtime, Some((state, source)), true, None)
 }
 
 pub(super) fn try_selected_comptime(
@@ -196,14 +196,16 @@ pub(super) fn try_selected_comptime(
     {
         return Ok(false);
     }
-    let (source, pending, partition, runtime) = result.into_builder_inputs();
-    publish_generation(root, target, profile, paths, pending, &partition, runtime, Some((state, source)), false)
+    let (source, pending, partition, runtime, compiler_partition) = result.into_builder_inputs();
+    publish_generation(root, target, profile, paths, pending, &partition, runtime, Some((state, source)),
+        false, Some(compiler_partition))
 }
 
 fn publish_generation(
     root: &Path, target: &str, profile: &str, ordinary_paths: &BuilderInputPaths,
     mut pending: PendingBuilderInputs, partition: &[u8], runtime_ir: &str,
     mut comparison: Option<(SqliteSourceState, AcknowledgedSourceGeneration)>, warm: bool,
+    comptime_partition: Option<wosy_cli::source_state::SelectedComptimePartitionReceipt>,
 ) -> Result<bool, String> {
     fs::create_dir_all(&ordinary_paths.output).map_err(|e| e.to_string())?;
     let destination = sibling_store(&ordinary_paths.output);
@@ -217,17 +219,24 @@ fn publish_generation(
         if !state.revalidate_ordinary_build_inputs(source, profile, &pending, Duration::from_secs(120)).unwrap_or(false) {
             return Ok(false);
         }
-        if warm { eprintln!("incremental build reused compiler LLVM for {}", source.selection().root.hex()); }
+        if warm {
+            eprintln!("incremental build reused compiler LLVM for {}", source.selection().root.hex());
+        }
     }
     stage.materialize_llvm_inputs(partition, runtime_ir.as_bytes()).map_err(|e| e.to_string())?;
+    let builder_started = Instant::now();
     invoke_unpublished_builder(root, &paths, &pending)?;
+    let builder_elapsed = builder_started.elapsed();
     fs::remove_file(&paths.pending_manifest).map_err(|e| e.to_string())?;
     match comparison {
         Some((mut state, source)) => {
-            if !selected_comptime {
-                if let Ok(key) = compiler_partition_key(&source, profile, &pending.manifest.identity.configuration_identity) {
-                    let _ = stage.record_compiler_partition(&key, &pending.manifest.identity.llvm_input_identity);
-                }
+            let key = if selected_comptime {
+                comptime_partition.as_ref().and_then(|partition| partition.key())
+            } else {
+                compiler_partition_key(&source, profile, &pending.manifest.identity.configuration_identity).ok()
+            };
+            if let Some(key) = key {
+                let _ = stage.record_compiler_partition(&key, &pending.manifest.identity.llvm_input_identity);
             }
             if state.publish_ordinary_build_generation(&source, profile, &pending, stage,
                 Duration::from_secs(120), usize::MAX).map_err(|e| e.to_string())?.is_none() {
@@ -241,6 +250,11 @@ fn publish_generation(
             validate_current_generation(root, target, profile, &paths.output.join("artifact-manifest.json"))?;
             prepared.publish().map_err(|e| e.to_string())?;
         }
+    }
+    if let Some(partition) = comptime_partition {
+        eprintln!("incremental build {} compiler LLVM after executing current comptime (LLVM {} us; evaluator tools {} us; final builder {} us)",
+            if partition.reused() { "reused" } else { "compiled" }, partition.llvm_elapsed().as_micros(),
+            partition.tools_elapsed().as_micros(), builder_elapsed.as_micros());
     }
     Ok(true)
 }
