@@ -943,6 +943,30 @@ impl SourceView {
         Ok((self.root, self.dependencies, self.source_config()?.inputs))
     }
 
+    /// Identity of the ordinary authored LLVM projection, not of a
+    /// configured builder or its binary. Bind the full authored closure and
+    /// its ordering, parser policy, installed package selection and exact
+    /// compiler-facing profile. The ordinary authored emitter consumes
+    /// backend/layout/exports from that profile, not its builder or runner.
+    pub fn ordinary_authored_llvm_inputs(&self, profile: &str) -> Result<Option<NodeId>> {
+        let config = self.source_config()?;
+        let Some(artifact) = config.profiles.get(profile) else { return Ok(None); };
+        artifact.target_layout()?;
+        let mut hash = blake3::Hasher::new_derive_key("Wosy ordinary authored LLVM selected input v1");
+        serde_json::to_writer(&mut hash, &(
+            config.schema(), &config.entry, &config.namespaces, &config.target, &config.parser, profile,
+            &artifact.backend, &artifact.output, &artifact.exports,
+            self.executable, self.annotation, self.dependencies,
+        ))?;
+        for file in self.files.values() {
+            // The verified file node itself binds the path, namespace owner,
+            // source revision, and exact authored tree. The view orders by
+            // canonical project/package path before reading its node IDs.
+            hash.update(&file.file.0);
+        }
+        Ok(Some(NodeId(*hash.finalize().as_bytes())))
+    }
+
     /// Describe the exact lock and patch selections of this rooted view,
     /// independently from the current workspace and its editable file bytes.
     pub fn installed_git_selections(&self) -> Result<BTreeMap<String, InstalledGitSelection>> {
