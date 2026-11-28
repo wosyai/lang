@@ -2966,6 +2966,31 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
     };
     let signature = topology.checked_call_signatures.get(&occurrence).ok_or(ProjectCheck::MissingRootOccurrences)?;
     #[cfg(feature = "internal-checker")]
+    if *expected == ScalarType::Unit && pair_receivers.is_none() && proof_site.is_none() {
+        if let Some((wrapper, callback, owner, body, value)) =
+            actual.exact_startup_callable_forwarder(topology, occurrence, declaration, signature, &initialized_argument)
+        {
+            let ordered = collection.map(|(_, ordered)| ordered);
+            if ordered.is_none_or(|ordered| ordered.failures.borrow().startup_search.is_none())
+                && !actual.active.contains(&wrapper) && !actual.active.contains(&callback)
+                && actual.active_depth <= MAX_ACTUAL_CALL_DEPTH.saturating_sub(2)
+            {
+                actual.note_reached(wrapper);
+                actual.note_reached(callback);
+                actual.active.insert(wrapper);
+                actual.active.insert(callback);
+                actual.active_depth += 2;
+                let result = actual.run_exact_calls::<false>(
+                    body, &owner.source, &[value], expected, ordered, None,
+                );
+                actual.active_depth -= 2;
+                actual.active.remove(&callback);
+                actual.active.remove(&wrapper);
+                return result;
+            }
+        }
+    }
+    #[cfg(feature = "internal-checker")]
     let check_completed_scalar_namespace = Observer::EXACT_COMPLETED_NAMESPACE_SCALAR_RETURNS;
     #[cfg(not(feature = "internal-checker"))]
     let check_completed_scalar_namespace = false;
@@ -4377,6 +4402,62 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             .ok_or(ProjectCheck::Unsupported)?;
         self.note_reached(target);
         Ok(Some(result))
+    }
+
+    // A transparent forwarding activation may use the original callback
+    // checker frame: the wrapper must contain exactly the typed indirect call
+    // of its callable formal, with no other evaluation or binding effects.
+    #[cfg(feature = "internal-checker")]
+    fn exact_startup_callable_forwarder<'a>(
+        &self, topology: &'a ModuleInitializationTopology, occurrence: OccurrenceOrdinal,
+        declaration: &wosy_syntax::SourceSpan, signature: &CheckedCallSignature,
+        argument: &impl Fn(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
+    ) -> Option<(PreparedCallable, PreparedCallable, &'project ScalarModule, &'project FunctionCallSites, &'a BigInt)> {
+        use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
+        let (wrapper, owner, _, body) = self.validated_direct_body(
+            &topology.structure, occurrence, &declaration.source, declaration.range,
+        ).ok()?;
+        let [callable_ty @ ScalarType::Callable { parameters, outputs }, input] = signature.parameters.as_slice() else { return None; };
+        if !matches!(parameters.as_slice(), [ty] if ty == input && is_integer_type(ty))
+            || !matches!(outputs.outputs.as_slice(), [out] if out.ty == ScalarType::Unit)
+            || !body.checker_returns_unit() || !body.arms.is_empty() || !body.assignments.is_empty()
+            || !body.allocation_length_calls.is_empty() || body.contextual_formal().is_some()
+            || body.boundary.parameters.len() != signature.parameters.len()
+            || !body.boundary.parameters.iter().zip(&signature.parameters)
+                .all(|(slot, ty)| super::scalar_type_equal(&slot.ty, ty))
+        { return None; }
+        let [formal, input_slot] = body.boundary.checker_parameter_bindings.as_deref()? else { return None; };
+        let [call_site] = body.call_occurrences.as_slice() else { return None; };
+        let [statement] = body.structure.blocks.get(body.structure.root.0)?.items.as_slice() else { return None; };
+        let BlockItemKind::Evaluation { expression: call } = statement.kind else { return None; };
+        if call != call_site.ordinal || !matches!(&body.resolved_call_site(call)?.target,
+            ResolvedCallTarget::LocalCallable(binding) if binding == formal)
+        { return None; }
+        let indirect = body.checked_call_signatures.get(&call)?;
+        if &indirect.parameters != parameters
+            || !matches!(indirect.outputs.outputs.as_slice(), [out] if out.ty == ScalarType::Unit)
+            || indirect.overload.is_some() || indirect.overload_origin.is_some() { return None; }
+        let expression = |structure: &OccurrenceStructure, call, slot| match structure.edges.get(&(
+            OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(slot),
+        ))? { OccurrenceNode::Expression(at) => Some(*at), _ => None };
+        let forwarded = expression(&body.structure, call, 0)?;
+        if !matches!(body.prepared_plain_name(forwarded), Some(PlainNameIdentity::Lexical(binding)) if binding == input_slot)
+            || body.structure.checked_types.expressions.get(&forwarded) != Some(input)
+        { return None; }
+        let selected = expression(&topology.structure, occurrence, 0)?;
+        if !topology.structure.checked_types.expressions.get(&selected)
+            .is_some_and(|ty| super::scalar_type_equal(ty, callable_ty)) { return None; }
+        let target = topology.structure.prepared_callable_value_uses.get(&selected)?;
+        if target.source != owner.source { return None; }
+        let item = owner.items.iter().position(|item| matches!(item, ScalarItem::Function(f)
+            if f.name_span == target.range && super::scalar_type_equal(&f.signature, callable_ty)
+                && f.generic_parameters.is_empty() && f.overload_arms.is_empty()))?;
+        let callback = (wrapper.0, item);
+        let (_, owner, _, callback_body) = self.validated_prepared_body(callback, &target.source, target.range).ok()?;
+        if callback == wrapper || callback_body.contextual_formal().is_some() { return None; }
+        let (value_ty, value) = exact_typed_call_argument_at(&topology.structure, occurrence, 1, false, argument)?;
+        (value_ty == input && integer_literal_fits_type(value, input))
+            .then_some((wrapper, callback, owner, callback_body, value))
     }
 
     fn validated_prepared_body(
@@ -23454,6 +23535,7 @@ i32(i32) transform=fn(x) { x };
                 unit(u8) unopened = fn(value) {{ core.require(value < 4, {}); }};
                 unit(u8) actual = fn(value) {{ core.require(value < 2, {}); }};
                 unit(u8) later = fn(value) {{ core.require(value < 6, {}); }};
+                if (false) {{ unopened(1); }};
                 actual(3);
             %%end"#, output(second), output(first), output(last));
             let prepared = prepare_checker_project(
@@ -23486,6 +23568,31 @@ i32(i32) transform=fn(x) { x };
             let first = reports.into_iter().next().unwrap();
             assert_eq!(main_only, [first]);
             assert_eq!(check_package_roots(&prepared), Err(main_only.into_iter().next().unwrap()));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "checker does not yet transfer a concrete callable through an actual formal"]
+    fn prepared_actual_callable_formal_preserves_callback_guard() {
+        let app = source("src/main.w", "prepared-actual-callable-formal");
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for (value, expected) in [(1, 0), (4, 1)] {
+                let text = format!(r#"%%start
+                    unit(u8) target = fn(value) {{ core.require(value < 4, {OUTPUT}); }};
+                    unit((unit(u8)),u8) dispatch = fn(callback, input) {{ callback(input); }};
+                    dispatch(target, {value});
+                %%end"#);
+                let prepared = prepare_checker_project(
+                    vec![(declarations(&app, &text), Vec::new())], vec![app.clone()],
+                    ScalarPreparationInputs { target_layout },
+                ).unwrap();
+                let (active, failures) = collect_ordered_package_failures(
+                    &prepared, ScalarCheckerScope::MainFlowOnly, 1,
+                ).expect("the exact prepared callback must be checked in its real startup context");
+                assert!(active);
+                assert_eq!(failures.len(), expected);
+            }
         }
     }
 
