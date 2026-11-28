@@ -20829,6 +20829,7 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    #[ignore = "requires independently pinned unmodified Pocket Island engine source"]
     fn pinned_pocket_edit_preserves_chunk_bounds_on_normal_arrival_after_rebuild_effects() {
         use range_envelopes::{Envelope, PreparedEnvelopes};
         let path = std::path::PathBuf::from(std::env::var_os("WOSY_TEST_PINNED_POCKET_ENGINE").unwrap());
