@@ -2,11 +2,11 @@
 use super::*;
 use std::{num::NonZeroUsize, os::unix::fs::{DirBuilderExt, PermissionsExt}, path::Path, sync::Arc, time::{Duration, Instant}};
 use wosy_cli::{
-    local_build_daemon::{compare_owned_child, establish_local_build_source, stage_local_build_source},
+    local_build_daemon::{compare_owned_child, establish_local_build_source, stage_local_build_source, SourceStoreCustody},
     source_recovery::ClientSourceLimits,
     source_state::{AcknowledgedSourceGeneration, SqliteSourceState},
 };
-use wosy_daemon::{BaseCstAdmissionLimits, SourceStore};
+use wosy_daemon::BaseCstAdmissionLimits;
 use wosy_project::{ArtifactConfig, ArtifactProfile, SelectedArtifactGeneration, StagedArtifactGeneration};
 
 pub(super) fn enabled() -> bool {
@@ -120,16 +120,15 @@ pub(super) fn try_selected_comptime(
         return Ok(false);
     }
     let opened = (|| -> Result<_, BoxError> {
+        let Some(custody) = SourceStoreCustody::try_acquire(root)? else { return Ok(None); };
         let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build()?;
-        let local = root.join(".wosy");
-        fs::create_dir_all(&local)?;
-        let store_path = local.join("incremental-daemon");
-        private_directory(&store_path)?;
-        let store = runtime.block_on(async { SourceStore::open(&store_path, 8 << 20) }).map(Arc::new)?;
-        Ok((runtime, store_path, store))
+        let store_path = custody.store_path();
+        let store = runtime.block_on(async { custody.open_store() }).map(Arc::new)?;
+        Ok(Some((custody, runtime, store_path, store)))
     })();
-    let (runtime, store_path, store) = match opened {
-        Ok(opened) => opened,
+    let (custody, runtime, store_path, store) = match opened {
+        Ok(Some(opened)) => opened,
+        Ok(None) => return Ok(false),
         Err(error) => {
             eprintln!("incremental comptime preparation unavailable; trying ordinary Build: {error}");
             return Ok(false);
@@ -171,13 +170,18 @@ pub(super) fn try_selected_comptime(
         };
         Ok::<_, BoxError>(result.map(|result| (state, result)))
     });
-    if let Some(store) = Arc::into_inner(store) {
-        let closed = runtime.block_on(store.close());
+    let close = match Arc::into_inner(store) {
+        Some(store) => runtime.block_on(store.close()).map_err(|error| error.to_string()),
+        None => Err("incremental comptime worker retained the source store".into()),
+    };
+    // Join any remaining store work before another process can reserve it.
+    drop(runtime);
+    drop(custody);
+    if let Err(error) = close {
         if attempt.is_ok() {
-            if let Err(error) = closed {
-                eprintln!("incremental source store close failed: {error}");
-                return Ok(false);
-            }
+            if admitted { return Err(format!("incremental comptime source store close failed: {error}")); }
+            eprintln!("incremental source store close failed: {error}");
+            return Ok(false);
         }
     }
     let (state, result) = match attempt {
@@ -274,13 +278,11 @@ fn selected_source(
     runtime.enable_time();
     if pending.is_some() { runtime.enable_io(); }
     let session = runtime.build()?;
-    let owner = root.join(".wosy");
-    let source_store = owner.join("incremental-daemon");
-    fs::create_dir_all(&owner)?;
-    private_directory(&source_store)?;
+    let Some(custody) = SourceStoreCustody::try_acquire(root)? else { return Ok(None); };
     session.block_on(async {
+        let source_started = Instant::now();
         let mut state = SqliteSourceState::open(root, ClientSourceLimits { nodes: usize::MAX, encoded_bytes: usize::MAX })?;
-        let store = SourceStore::open(&source_store, 8 << 20)?;
+        let store = custody.open_store()?;
         let Some(pending) = pending else {
             // The old acknowledgement is sufficient to look for a proof,
             // never to accept current files. The exact under-writer check
@@ -298,10 +300,13 @@ fn selected_source(
         // in the parent keeps this store open across process activation.
         store.close().await?;
         let Some(staged) = ready? else { return Ok(None); };
-        let Some((source, replayed)) = compare_owned_child(&mut state, target, profile, pending).await? else { return Ok(None); };
+        let source_elapsed = source_started.elapsed();
+        let child_started = Instant::now();
+        let Some((source, replayed)) = compare_owned_child(&mut state, &custody, target, profile, pending).await? else { return Ok(None); };
         if source.selection() != staged.selection() || source.generation() != staged.generation() { return Ok(None); }
-        eprintln!("incremental compiler LLVM compared over local Unix socket for {target}:{profile} in an owned compiler process{}",
-            if replayed { " after source replay" } else { "" });
+        eprintln!("incremental compiler LLVM compared over local Unix socket for {target}:{profile} in an owned compiler process{} (source store {} us; owned comparison {} us)",
+            if replayed { " after source replay" } else { "" },
+            source_elapsed.as_micros(), child_started.elapsed().as_micros());
         Ok(Some((state, source)))
     })
 }

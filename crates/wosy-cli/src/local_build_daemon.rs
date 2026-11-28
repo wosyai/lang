@@ -9,7 +9,7 @@ use {crate::{artifact_inputs::PendingBuilderInputs, source_state::SourceReplay},
 #[cfg(target_os = "linux")]
 mod owned_child;
 #[cfg(target_os = "linux")]
-pub use owned_child::{compare_owned_child, enter_if_requested};
+pub use owned_child::{compare_owned_child, enter_if_requested, SourceStoreCustody};
 use tokio::{task::JoinSet, time::{timeout_at, Instant}};
 use wosy_daemon::{BaseCstAdmissionLimits, SourceStorageWorker, SourceStore};
 
