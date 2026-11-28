@@ -23653,6 +23653,7 @@ i32(i32) transform=fn(x) { x };
                 let (_, authored) = package_obligation_roots(&prepared, ScalarCheckerScope::CurrentPackage, 1, root).unwrap();
                 let (roots, mandatory, _) =
                     plan_closed_authored_roots(&prepared, root, 1, &ordinals, authored, true).unwrap();
+                let mandatory = mandatory.into_iter().map(|(item, _)| (0, item)).collect::<Vec<_>>();
                 let (package, _, _, _) = run_startup_authored_path(
                     &prepared, Some(std::num::NonZeroUsize::MIN), &[], false, &roots,
                     Some(&mandatory), None, false, None,
