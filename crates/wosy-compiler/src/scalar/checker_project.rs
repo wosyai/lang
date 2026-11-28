@@ -350,6 +350,8 @@ enum ProjectCheck {
     MissingRootOccurrences,
     Unsupported,
     #[cfg(feature = "internal-checker")]
+    PendingExternal(Box<stateful_provider::PendingExternalCall>),
+    #[cfg(feature = "internal-checker")]
     StartupAuthoredLimitReached,
     #[cfg(test)]
     NoChecks,
@@ -2516,6 +2518,7 @@ fn try_observed_projected_storage_call(
     };
     let provider_dispatch = RefCell::new(stateful_provider::Dispatch::default());
     let selected_requirement=std::cell::Cell::new(false);
+    let pending_external = RefCell::new(None);
     let reached_requirement=std::cell::Cell::new(false);
     let collect=RefCell::new(failures);
     let provider_call = |body:&FunctionCallSites, site, args, storage:&mut super::checker_flow::ProjectedStorage,
@@ -2537,10 +2540,7 @@ fn try_observed_projected_storage_call(
             // Do not turn an authored pre-host prefix into a completed call,
             // even if its last requirement was proved. Nothing crosses the
             // external boundary without a sound effect/continuation model.
-            #[cfg(test)]
-            stateful_provider::observe_external_pending(pending);
-            #[cfg(not(test))]
-            drop(pending);
+            pending_external.replace(Some(pending));
             return None;
         }
         let (value,result,cost,failure) = outcome?;
@@ -2613,6 +2613,9 @@ fn try_observed_projected_storage_call(
     let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field), Some(&read_array), Some(&math_call), Some(&scalar_getter), Some(&provider_call), Some(&provider_units), Some(&frontiers),
         body_of, |parent, _, site, _| admitted.get(&(parent, site)).copied(), |_, _, _| None);
     if selected_requirement.get() { return Err(ProjectCheck::StartupAuthoredLimitReached); }
+    if let Some(pending) = pending_external.into_inner() {
+        return Err(ProjectCheck::PendingExternal(Box::new(pending)));
+    }
     if !matches!(result, Some(super::checker_flow::CallableHistoryCompletion::Exhausted(false))) {
         return Err(ProjectCheck::Unsupported);
     }
@@ -26299,7 +26302,7 @@ unit(u8) parent = fn(a) {
     fn pinned_orbital_upload_reports_original_false_requirement_only_at_valid_cap() {
         use std::num::NonZeroUsize;
         use wosy_syntax::SourceSpan;
-        use super::stateful_provider::{take_requirement_results as outcomes, take_external_pending};
+        use super::stateful_provider::take_requirement_results as outcomes;
         let engine=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_ENGINE").unwrap()).unwrap();
         let packing=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_PACKING").unwrap()).unwrap();
         let fragment=|from:&str,until:&str| {
@@ -26356,7 +26359,6 @@ unit(u8) parent = fn(a) {
                 ScalarCheckerScope::MainFlowOnly,Vec::new(),
             ).unwrap();
             outcomes();
-            take_external_pending();
             let (failures,completion,trace,active)=prepare(&text).search_startup_authored_path(NonZeroUsize::MIN).unwrap();
             assert_eq!(outcomes(),[(authored.clone(),false)]);
             assert_eq!(completion,StartupAuthoredCompletion::LimitReached);
@@ -26368,11 +26370,9 @@ unit(u8) parent = fn(a) {
             assert_eq!(failure.stderr(),b"Orbital indexed actuator span");
             assert!(trace.call_paths().iter().flatten().any(|site| site==&upload_call));
             assert!(!trace.contains_return(&upload_call));
-            assert!(take_external_pending().is_none());
-
-            assert!(matches!(prepare(&passing).search_startup_authored_path(NonZeroUsize::MIN),Err(ProjectCheck::Unsupported)));
+            let Err(ProjectCheck::PendingExternal(pending)) = prepare(&passing).search_startup_authored_path(NonZeroUsize::MIN)
+                else { panic!("typed prepared indexed call must be pending, not executed"); };
             assert_eq!(outcomes(),[(authored.clone(),true)]);
-            let pending = take_external_pending().expect("typed prepared indexed call is pending, not executed");
             assert_eq!(pending.call.source, provider);
             assert_eq!(pending.declaration.source, provider);
             assert_eq!(&packing[pending.declaration.range.start as usize..pending.declaration.range.end as usize], "indexed");

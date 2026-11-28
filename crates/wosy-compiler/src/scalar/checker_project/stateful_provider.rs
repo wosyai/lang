@@ -410,16 +410,6 @@ fn pending_external_call(
     })
 }
 
-#[cfg(test)]
-thread_local! {
-    static EXTERNAL_PENDING: RefCell<Option<PendingExternalCall>> = const { RefCell::new(None) };
-}
-
-#[cfg(test)]
-pub(super) fn take_external_pending() -> Option<PendingExternalCall> {
-    EXTERNAL_PENDING.with(|pending| pending.borrow_mut().take())
-}
-
 #[derive(Default)]
 pub(super) struct Dispatch<'a> {
     pending_external_call: Option<PendingExternalCall>,
@@ -434,11 +424,6 @@ impl Dispatch<'_> {
     pub(super) fn take_pending_external_call(&mut self) -> Option<PendingExternalCall> {
         self.pending_external_call.take()
     }
-}
-
-#[cfg(test)]
-pub(super) fn observe_external_pending(pending: PendingExternalCall) {
-    EXTERNAL_PENDING.with(|observed| *observed.borrow_mut() = Some(pending));
 }
 
 /// This is capability selection only. The actual call still needs a current,
