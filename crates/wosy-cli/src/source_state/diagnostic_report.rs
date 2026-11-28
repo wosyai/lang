@@ -90,6 +90,38 @@ pub struct AcknowledgedOrdinaryBuilderInputs {
     executable_partition_digest: Option<NodeId>,
     #[cfg(target_os = "linux")]
     profile: String,
+    #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+    origin: BuilderPlanOrigin,
+}
+
+#[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+#[derive(Clone, Copy, Eq, PartialEq)]
+enum BuilderPlanOrigin { LocalAdapter, OwnedNativeChild }
+
+/// Exact staged invocation inputs, not custody of the driver image, workspace
+/// mutations, or permission to execute. A later controller must supply them.
+#[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+struct PreparedNativeBuildInvocation {
+    plan: AcknowledgedOrdinaryBuilderInputs,
+    stage: wosy_project::StagedArtifactGeneration,
+}
+
+#[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+impl PreparedNativeBuildInvocation {
+    fn prepare(
+        plan: AcknowledgedOrdinaryBuilderInputs,
+        stage: wosy_project::StagedArtifactGeneration,
+    ) -> Result<Option<Self>> {
+        if plan.origin != BuilderPlanOrigin::OwnedNativeChild
+            || plan.executable_partition_digest.is_none()
+            || plan.inputs.manifest.identity.output != "wasm-wasip1"
+            || plan.paths.output != stage.output_dir()
+        {
+            return Ok(None);
+        }
+        stage.materialize_llvm_inputs(plan.partition.as_bytes(), plan.runtime.as_bytes())?;
+        Ok(Some(Self { plan, stage }))
+    }
 }
 
 impl AcknowledgedOrdinaryBuilderInputs {
@@ -242,7 +274,7 @@ impl SqliteSourceState {
         let expected_peer = AuthorizedOrdinaryBuilderPeer::from_open_executable(executable.try_clone()?)?;
         require_diagnostic_time(deadline)?;
         let mut child = Some(child);
-        self.live_executable_builder_inputs(&selected.target, profile, deadline.saturating_duration_since(Instant::now()),
+        let result = self.live_executable_builder_inputs(&selected.target, profile, deadline.saturating_duration_since(Instant::now()),
             max_authored_source_bytes, max_partition_bytes, &expected_peer, output,
             |actual| {
                 let child = child.take();
@@ -253,7 +285,32 @@ impl SqliteSourceState {
                     let child = child.ok_or("native V3 activation can only open one connection")?;
                     Ok(wosy_protocol::native_diagnostics::connect_owned_child(directory, child, executable).await?)
                 }
-            }).await
+            }).await?;
+        Ok(match result {
+            AcknowledgedOrdinaryLlvm::Partition(mut plan) => {
+                plan.origin = BuilderPlanOrigin::OwnedNativeChild;
+                AcknowledgedOrdinaryLlvm::Partition(plan)
+            }
+            other => other,
+        })
+    }
+
+    /// Prepare only inputs for the caller-owned generational workspace and
+    /// the genuine owned compiler child; the next step is not implicit.
+    #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+    async fn prepare_native_owned_build_invocation(
+        &mut self, directory: &Path, child: &mut std::process::Child, executable: &File,
+        selected: &BuildSourceSelection, profile: &str, timeout: Duration,
+        max_authored_source_bytes: usize, max_partition_bytes: usize,
+        stage: wosy_project::StagedArtifactGeneration,
+    ) -> Result<Option<PreparedNativeBuildInvocation>> {
+        let output = stage.output_dir();
+        let result = self.native_owned_executable_builder_inputs(
+            directory, child, executable, selected, profile, timeout,
+            max_authored_source_bytes, max_partition_bytes, output,
+        ).await?;
+        let AcknowledgedOrdinaryLlvm::Partition(plan) = result else { return Ok(None); };
+        PreparedNativeBuildInvocation::prepare(plan, stage)
     }
 
     /// Explicit local-adapter request for ordinary authored LLVM (not an
@@ -503,7 +560,9 @@ fn bind_builder_inputs(
     Ok(AcknowledgedOrdinaryBuilderInputs { project: observed.project, source, paths, inputs,
         partition: projection.partition, runtime, executable_partition_digest,
         #[cfg(target_os = "linux")]
-        profile: projection.profile })
+        profile: projection.profile,
+        #[cfg(all(target_os = "linux", feature = "native-diagnostics"))]
+        origin: BuilderPlanOrigin::LocalAdapter })
 }
 
 #[cfg(target_os = "linux")]
@@ -822,7 +881,27 @@ main_artifact = "main"
         (AcknowledgedOrdinaryBuilderInputs {
             source: captured.source, project: observed.project, paths, inputs,
             partition: String::new(), runtime: "", executable_partition_digest: Some(digest), profile: "wasm".into(),
+            #[cfg(feature = "native-diagnostics")]
+            origin: BuilderPlanOrigin::LocalAdapter,
         }, stage)
+    }
+
+    #[cfg(feature = "native-diagnostics")]
+    #[test]
+    fn local_adapter_plan_cannot_prepare_a_native_invocation() {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("wosy-local-plan-not-native-{}-{now}", std::process::id())));
+        fs::DirBuilder::new().mode(0o700).create(&scratch.0).unwrap();
+        fs::write(scratch.0.join("wosy.toml"), CONFIG).unwrap();
+        fs::write(scratch.0.join("main.w"), "%%start\ni32 value = 42;\n%%end\n").unwrap();
+        let mut source = SqliteSourceState::open(&scratch.0, ClientSourceLimits { nodes: 1000, encoded_bytes: BYTES }).unwrap();
+        let staged = source.stage("app").unwrap();
+        assert!(source.acknowledge("app", staged.pending.unwrap()).unwrap());
+        let (plan, stage) = make_plan(&mut source, &scratch.0);
+        let candidate = stage.output_dir();
+        assert!(PreparedNativeBuildInvocation::prepare(plan, stage).unwrap().is_none());
+        assert!(!candidate.exists());
+        assert!(!scratch.0.join("artifact-manifest.json").exists());
     }
 
     #[test]

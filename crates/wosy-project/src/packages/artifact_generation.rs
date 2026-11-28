@@ -132,6 +132,14 @@ impl StagedArtifactGeneration {
         self.parent_path.join(&self.name)
     }
 
+    /// Materialize the existing Builder ABI's two LLVM inputs in this held
+    /// directory. The ordinary invocation still owns the pending manifest.
+    /// This neither selects nor runs a driver.
+    pub fn materialize_llvm_inputs(&self, partition: &[u8], runtime: &[u8]) -> io::Result<()> {
+        write_new(&self.descriptor.join("partition.ll"), partition)?;
+        write_new(&self.descriptor.join("runtime.ll"), runtime)
+    }
+
     /// Prepare pointer bytes after the controlled driver relinquishes output.
     /// Validate file ownership, not executable contents or driver authority.
     pub fn prepare(mut self, manifest: &ArtifactManifest) -> io::Result<PreparedArtifactGeneration> {
@@ -281,6 +289,22 @@ mod tests {
             executable: stage.output_dir().join(OUTPUT),
             source_observations: Vec::new(),
         }
+    }
+
+    #[test]
+    fn materializes_exact_llvm_inputs_without_pending_manifest_or_publication() {
+        let scratch = Scratch::new();
+        let stage = StagedArtifactGeneration::create(&scratch.0).unwrap();
+        let output = stage.output_dir();
+        stage.materialize_llvm_inputs(b"partition bytes", b"runtime bytes").unwrap();
+        assert_eq!(fs::read(output.join("partition.ll")).unwrap(), b"partition bytes");
+        assert_eq!(fs::read(output.join("runtime.ll")).unwrap(), b"runtime bytes");
+        assert_eq!(stage.materialize_llvm_inputs(b"other", b"other").unwrap_err().kind(), io::ErrorKind::AlreadyExists);
+        assert_eq!(fs::read(output.join("partition.ll")).unwrap(), b"partition bytes");
+        assert!(!output.join("artifact-manifest.pending.json").exists());
+        assert!(!scratch.0.join(MANIFEST).exists());
+        drop(stage);
+        assert!(!output.exists());
     }
 
     #[test]
