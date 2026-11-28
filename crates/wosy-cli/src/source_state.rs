@@ -15,6 +15,7 @@ type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>
 
 mod diagnostics;
 mod diagnostic_report;
+mod publication_selection;
 mod delta;
 mod current_view;
 mod pending_comptime;
