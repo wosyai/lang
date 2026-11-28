@@ -132,6 +132,20 @@ impl StagedArtifactGeneration {
         self.parent_path.join(&self.name)
     }
 
+    /// The controlled store must be a separate private directory within
+    /// the selected project, not an alias of the project owner lock.
+    pub fn is_workspace_subdirectory(&self, project: &Path) -> io::Result<bool> {
+        let project_dir = GitDirectory::new(GitDirectory::open_absolute(project)?)
+            .map_err(io::Error::other)?;
+        let resolved_parent = self.parent_path.canonicalize()?;
+        let current_parent = GitDirectory::new(GitDirectory::open_absolute(&self.parent_path)?)
+            .map_err(io::Error::other)?;
+        Ok(resolved_parent != project
+            && resolved_parent.starts_with(project)
+            && self.parent != project_dir
+            && self.parent == current_parent)
+    }
+
     /// Materialize the existing Builder ABI's two LLVM inputs in this held
     /// directory. The ordinary invocation still owns the pending manifest.
     /// This neither selects nor runs a driver.
@@ -296,6 +310,7 @@ mod tests {
         let scratch = Scratch::new();
         let stage = StagedArtifactGeneration::create(&scratch.0).unwrap();
         let output = stage.output_dir();
+        assert!(!stage.is_workspace_subdirectory(&scratch.0).unwrap());
         stage.materialize_llvm_inputs(b"partition bytes", b"runtime bytes").unwrap();
         assert_eq!(fs::read(output.join("partition.ll")).unwrap(), b"partition bytes");
         assert_eq!(fs::read(output.join("runtime.ll")).unwrap(), b"runtime bytes");

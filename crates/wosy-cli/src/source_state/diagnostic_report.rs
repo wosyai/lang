@@ -304,6 +304,11 @@ impl SqliteSourceState {
         max_authored_source_bytes: usize, max_partition_bytes: usize,
         stage: wosy_project::StagedArtifactGeneration,
     ) -> Result<Option<PreparedNativeBuildInvocation>> {
+        // A stage rooted at the project directory would hold its advisory
+        // writer lock while the live capture attempts a project read lock.
+        if !stage.is_workspace_subdirectory(&self.project)? {
+            return Ok(None);
+        }
         let output = stage.output_dir();
         let result = self.native_owned_executable_builder_inputs(
             directory, child, executable, selected, profile, timeout,
@@ -897,11 +902,14 @@ main_artifact = "main"
         let mut source = SqliteSourceState::open(&scratch.0, ClientSourceLimits { nodes: 1000, encoded_bytes: BYTES }).unwrap();
         let staged = source.stage("app").unwrap();
         assert!(source.acknowledge("app", staged.pending.unwrap()).unwrap());
-        let (plan, stage) = make_plan(&mut source, &scratch.0);
+        let store = scratch.0.join("controlled-fixture-store");
+        fs::DirBuilder::new().mode(0o700).create(&store).unwrap();
+        let (plan, stage) = make_plan(&mut source, &store);
+        assert!(stage.is_workspace_subdirectory(&scratch.0).unwrap());
         let candidate = stage.output_dir();
         assert!(PreparedNativeBuildInvocation::prepare(plan, stage).unwrap().is_none());
         assert!(!candidate.exists());
-        assert!(!scratch.0.join("artifact-manifest.json").exists());
+        assert!(!store.join("artifact-manifest.json").exists());
     }
 
     #[test]
