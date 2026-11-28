@@ -263,7 +263,9 @@ def verify_layout_switch(root):
     path.write_text(saved.replace('"native"', '"wasm"').replace('output = "wasm"', 'output = "wasm-wasip1"'))
     expect_stale(root)
     wasm, wasm_digest, _, _ = build(root, False)
-    assert wasm_digest != native_digest and Path(wasm["executable"]).read_bytes().startswith(b"\x00asm")
+    # The scalar program has no pointer-sized operation. Equal raw bytes
+    # still don't make the other compiler-facing layout reusable.
+    assert wasm_digest == native_digest and Path(wasm["executable"]).read_bytes().startswith(b"\x00asm")
     require_runner(root, "runner-v1", "alpha")
     assert build(root, True)[1] == wasm_digest
     path.write_text(saved)
