@@ -1378,3 +1378,209 @@ fn ordinary_v2_plan_reobserves_imported_source_after_real_framed_reply() {
         Arc::into_inner(store).unwrap().close().await.unwrap();
     });
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+fn prepares_owned_pair_from_the_first_committed_selected_source() {
+    exercise_first_selected_pair(false);
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires ordinary clang, wasm-ld, python3 and wasmtime on PATH"]
+fn prepares_ordinary_builder_inputs_by_executing_first_selected_comptime() {
+    exercise_first_selected_pair(true);
+}
+
+#[cfg(target_os = "linux")]
+fn exercise_first_selected_pair(run_tools: bool) {
+    use wosy_compiler::ScalarTargetLayout;
+    use wosy_daemon::{RootedClosedComptimeRefusal, RootedClosedComptimeRequest, SelectedPairComptimePreparation};
+    use wosy_project::PackageRelativePath;
+    use wosy_protocol::FileKey;
+
+    let fixture = Scratch::new();
+    let project = fixture.0.join("selected-first");
+    fs::create_dir(&project).unwrap();
+    let mut manifest = MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\"");
+    if run_tools {
+        manifest = manifest.replace(r#""fixture-must-not-build""#, r#""python3", "ordinary_wasip1_pair.py", "build""#)
+            .replace(r#""fixture-must-not-run""#, r#""python3", "ordinary_wasip1_pair.py", "run""#)
+            .replace("[targets.app.profiles.dev]", "[targets.app.profiles.dev]\ncomptime_builder = \"nominal\"\ncomptime_runner = \"nominal\"\nbuild_permissions = []\nbuild_mounts = []");
+        fs::write(project.join("ordinary_wasip1_pair.py"), include_str!("fixtures/ordinary_wasip1_pair.py")).unwrap();
+    }
+    fs::write(project.join("wosy.toml"), manifest).unwrap();
+    fs::write(project.join("main.w"), r#"%%start
+u32(u32, u32) solve = fn(left, right) { comptime prepare { right ^ left } };
+u32 first = solve(7, 37);
+u32 repeated = solve(7, 37);
+u32 different = solve(7, 13);
+%%end
+"#).unwrap();
+
+    tokio::runtime::Builder::new_current_thread().enable_time().build().unwrap().block_on(async {
+        let store = Arc::new(SourceStore::open(&fixture.0.join("selected-cas"), 8 << 20).unwrap());
+        let one = NonZeroUsize::new(1).unwrap();
+        let worker = SourceStorageWorker::new(Arc::clone(&store), tokio::runtime::Handle::current(), one, one, one).unwrap();
+        let mut client = SqliteSourceState::open(&project, CLIENT).unwrap();
+        let first = client.stage("app").unwrap();
+        let replay = client.replay("app", ReplaySource::Pending).unwrap().unwrap();
+        store.publish(first.root, &replay.source.delta).await.unwrap();
+        assert!(client.acknowledge("app", first.pending.unwrap()).unwrap());
+        assert!(client.selection("app").unwrap().pending.is_none());
+
+        let selected = client.acknowledged_build_source("app").unwrap().unwrap();
+        let session = worker.open_build_diagnostics(selected, TTL).await.unwrap().unwrap();
+        let request = |profile: &str, path: &str| RootedClosedComptimeRequest {
+            profile: profile.into(),
+            file: FileKey { package: "app".into(), path: PackageRelativePath::new(path.into()).unwrap() },
+            id: "prepare".into(), evaluator_layout: ScalarTargetLayout::WASM32,
+            source_limits: LIMITS, output_bytes: 1 << 20,
+        };
+        assert!(matches!(session.prepare_selected_pair_wasip1(request("missing", "main.w"), 11).await.unwrap(),
+            SelectedPairComptimePreparation::Refused(RootedClosedComptimeRefusal::ProfileNotSelected)));
+        assert!(matches!(session.prepare_selected_pair_wasip1(request("dev", "missing.w"), 11).await.unwrap(),
+            SelectedPairComptimePreparation::Refused(RootedClosedComptimeRefusal::FileNotRooted)));
+        let SelectedPairComptimePreparation::Ready(owner) =
+            session.prepare_unique_selected_pair_wasip1("dev".into(), LIMITS, 1 << 20, 11).await.unwrap()
+            else { panic!("first committed exact source should admit its unique bounded pair plan"); };
+        let plan = owner.plan().expect("same live selected lease");
+        assert_eq!(plan.source_root(), first.root);
+        assert_eq!(plan.target(), "app");
+        assert_eq!(plan.profile(), "dev");
+        assert_eq!(plan.evaluators().len(), 2);
+        let ordinals = plan.evidence().calls().map(|(call, _)| call.evaluator_index()).collect::<Vec<_>>();
+        assert_eq!(ordinals, [0, 0, 1]);
+        assert!(client.selection("app").unwrap().pending.is_none());
+        if run_tools {
+            use std::os::unix::fs::DirBuilderExt;
+            let stage = project.join("compilation");
+            fs::DirBuilder::new().mode(0o700).create(&stage).unwrap();
+            let selected = client.prepare_selected_pair_ordinary_inputs(
+                &owner, &stage, &project.join("artifact"), wosy_cli::source_state::SelectedPairToolBudget {
+                    watch_limits: wosy_project::packages::ComptimeWatchLimits::default(),
+                    evaluator_ir_bytes: 1 << 20, evaluator_module_bytes: 1 << 20, timeout: Duration::from_secs(10),
+                }, || false,
+            ).unwrap().expect("real first selected compilation");
+            assert_eq!(selected.source().selection().root, first.root);
+            assert_eq!(selected.inputs().manifest.identity.output, "wasm-wasip1");
+            let ir = std::str::from_utf8(selected.partition()).unwrap();
+            assert_eq!(ir.matches("i32 34").count(), 2);
+            assert!(ir.contains("i32 10"));
+            assert_eq!(selected.runtime(), wosy_compiler::core_runtime("llvm", "wasm-wasip1").unwrap());
+            assert_eq!(fs::read_dir(&stage).unwrap().count(), 0);
+            assert!(!project.join("artifact").exists());
+        }
+        drop(owner);
+        drop(session);
+        fs::write(project.join("main.w"), r#"%%start
+u32(u32, u32) solve = fn(left, right) { comptime first { right ^ left } };
+u32(u32, u32) duplicate = fn(left, right) { comptime second { right ^ left } };
+u32 result = solve(7, 37);
+%%end
+"#).unwrap();
+        let changed = client.stage("app").unwrap();
+        let replay = client.replay("app", ReplaySource::Pending).unwrap().unwrap();
+        store.publish(changed.root, &replay.source.delta).await.unwrap();
+        assert!(client.acknowledge("app", changed.pending.unwrap()).unwrap());
+        let session = worker.open_build_diagnostics(client.acknowledged_build_source("app").unwrap().unwrap(), TTL)
+            .await.unwrap().unwrap();
+        assert!(matches!(session.prepare_unique_selected_pair_wasip1("dev".into(), LIMITS, 1 << 20, 11).await.unwrap(),
+            SelectedPairComptimePreparation::Refused(RootedClosedComptimeRefusal::MultipleComptimeSites)));
+        drop(session);
+        drop(worker);
+        Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+    });
+}
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires ordinary clang, wasm-ld, python3 and wasmtime on PATH"]
+fn ordinary_cli_publishes_selected_comptime_and_checks_watched_inputs() {
+    use std::process::Command;
+    use wosy_project::SelectedArtifactGeneration;
+
+    let fixture = Scratch::new();
+    let root = &fixture.0;
+    let manifest = MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\"")
+        .replace(r#""fixture-must-not-build""#, r#""python3", "ordinary_wasip1_pair.py", "artifact-build""#)
+        .replace(r#""fixture-must-not-run""#, r#""python3", "ordinary_wasip1_pair.py", "artifact-run""#)
+        .replace("[targets.app.profiles.dev]", "[targets.app.profiles.dev]\ncomptime_builder = \"pair\"\ncomptime_runner = \"pair\"\nbuild_permissions = []\nbuild_mounts = []")
+        + r#"
+[builders.pair]
+command = ["python3", "ordinary_wasip1_pair.py", "build"]
+toolchain_identity = "ordinary WASI fixture"
+[runners.pair]
+command = ["python3", "ordinary_wasip1_pair.py", "run"]
+[comptime.prepare]
+watch = ["watch.txt"]
+"#;
+    fs::write(root.join("wosy.toml"), &manifest).unwrap();
+    fs::write(root.join("ordinary_wasip1_pair.py"), include_str!("fixtures/ordinary_wasip1_pair.py")).unwrap();
+    let watch = root.join("watch.txt");
+    fs::write(&watch, b"first watched contents").unwrap();
+    let source = r#"%%start
+u32(u32, u32) solve = fn(left, right) { comptime prepare { right ^ left } };
+u32(bool, u32, u32) choose = fn(select_path, left, right) {
+    if (select_path) { solve(left, right) } else { right }
+};
+u32 bypass = choose(false, 7, 37);
+u32 first = choose(true, 7, bypass);
+u32 repeated = solve(7, bypass);
+u32 different = solve(7, 13);
+%%end
+"#;
+    fs::write(root.join("main.w"), source).unwrap();
+
+    let command = |verb: &str| Command::new(env!("CARGO_BIN_EXE_wosy"))
+        .current_dir(root).env("WOSY_INCREMENTAL", "1").args([verb, "app"]).output().unwrap();
+    let check = |verb: &str| {
+        let output = command(verb);
+        assert!(output.status.success(), "{verb}: {}", String::from_utf8_lossy(&output.stderr));
+    };
+    let generation_store = root.join(".wosy/artifacts/app/dev/main/incremental");
+    let chosen = || SelectedArtifactGeneration::open(&generation_store).unwrap().unwrap();
+
+    check("build");
+    let first = chosen();
+    let original = first.manifest().comptime.as_ref().expect("selected comptime observation");
+    assert_eq!(original.site, "prepare");
+    assert_eq!(original.watches.len(), 1);
+    let original_wasm = fs::read(&first.manifest().executable).unwrap();
+    check("run");
+
+    fs::write(&watch, b"changed watched contents").unwrap();
+    let stale = command("run");
+    assert!(!stale.status.success());
+    assert!(String::from_utf8_lossy(&stale.stderr).contains("artifact comptime inputs are stale"));
+    let refuse = root.join("refuse-final-builder");
+    fs::write(&refuse, b"exercise the previous current generation").unwrap();
+    let failed = command("build");
+    assert!(!failed.status.success());
+    let builder_error = String::from_utf8_lossy(&failed.stderr);
+    assert!(builder_error.contains("python3 exited with exit status: 72"), "{builder_error}");
+    eprintln!("{builder_error}");
+    assert_eq!(chosen().manifest_path(), first.manifest_path());
+    fs::remove_file(refuse).unwrap();
+
+    check("build");
+    let current = chosen();
+    assert_ne!(current.manifest_path(), first.manifest_path());
+    assert_ne!(current.manifest().comptime.as_ref().unwrap().watches, original.watches);
+    assert_eq!(fs::read(&first.manifest().executable).unwrap(), original_wasm);
+    check("run");
+
+    let minimum = source.replace("u32", "i32")
+        .replace("solve(7, 13)", "solve(1, -2147483647)");
+    let parsed = wosy_syntax::parse_with_snapshot(
+        wosy_syntax::SourceIdentity::new("signed".into(), "entry".into(), "main.w".into(), "signed".into()),
+        minimum.clone(), &["WHY".into()],
+    );
+    let plan = wosy_compiler::derive_pair_startup_call_graph_wasip1_stdout(&parsed, "prepare", b"-2147483648\n".len())
+        .expect("typed signed boundary must enter the exact compiler corridor");
+    assert!(plan.into_bounded_wasip1_output(usize::MAX).is_ok(), "evaluator must materialize within the exact wire width");
+    fs::write(root.join("main.w"), minimum).unwrap();
+    fs::write(root.join("wosy.toml"), manifest.replace("\"artifact-build\"", "\"artifact-build-min\"")).unwrap();
+    check("build");
+    check("run");
+}

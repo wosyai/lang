@@ -1,6 +1,6 @@
 //! Opt-in ordinary Build→Run through selected source and retained generations.
 use super::*;
-use std::{os::unix::fs::{DirBuilderExt, PermissionsExt}, path::Path, sync::Arc, time::Duration};
+use std::{num::NonZeroUsize, os::unix::fs::{DirBuilderExt, PermissionsExt}, path::Path, sync::Arc, time::Duration};
 use wosy_cli::{
     local_build_daemon::{compare_local_build, establish_local_build_source},
     source_recovery::ClientSourceLimits,
@@ -93,7 +93,7 @@ pub(super) fn try_retained_partition(
     let candidate = (|| -> Result<_, Box<dyn std::error::Error + Send + Sync>> {
         let Some(previous) = select_for_run(&paths.output.join("artifact-manifest.json"))? else { return Ok(None); };
         let manifest = previous.manifest();
-        if manifest.identity.configuration_identity != config_identity { return Ok(None); }
+        if manifest.comptime.is_some() || manifest.identity.configuration_identity != config_identity { return Ok(None); }
         let Some((state, source)) = selected_source(root, target, profile, None)? else { return Ok(None); };
         let key = compiler_partition_key(&source, profile, config_identity)?;
         let Some(bytes) = previous.retained_compiler_partition(&key)? else { return Ok(None); };
@@ -107,6 +107,92 @@ pub(super) fn try_retained_partition(
     publish_generation(root, target, profile, paths, pending, &bytes, runtime, Some((state, source)), true)
 }
 
+pub(super) fn try_selected_comptime(
+    root: &Path, target: &str, profile: &str, paths: &BuilderInputPaths,
+    config_identity: &str, artifact_identity_name: &str,
+) -> Result<bool, String> {
+    use wosy_cli::source_state::SelectedPairToolBudget;
+    use wosy_daemon::{SelectedPairComptimePreparation, SourceStorageWorker};
+    type BoxError = Box<dyn std::error::Error + Send + Sync>;
+    const LIFETIME: Duration = Duration::from_secs(120);
+
+    if wosy_project::SelectedComptimeTools::load(root, target, profile)?.is_none() {
+        return Ok(false);
+    }
+    let opened = (|| -> Result<_, BoxError> {
+        let runtime = tokio::runtime::Builder::new_current_thread().enable_time().build()?;
+        let local = root.join(".wosy");
+        fs::create_dir_all(&local)?;
+        let store_path = local.join("incremental-daemon");
+        private_directory(&store_path)?;
+        let store = runtime.block_on(async { SourceStore::open(&store_path, 8 << 20) }).map(Arc::new)?;
+        Ok((runtime, store_path, store))
+    })();
+    let (runtime, store_path, store) = match opened {
+        Ok(opened) => opened,
+        Err(error) => {
+            eprintln!("incremental comptime preparation unavailable; trying ordinary Build: {error}");
+            return Ok(false);
+        }
+    };
+    let mut admitted = false;
+    let attempt = runtime.block_on(async {
+        let mut state = SqliteSourceState::open(root, ClientSourceLimits { nodes: usize::MAX, encoded_bytes: usize::MAX })?;
+        if !establish_local_build_source(&mut state, &store, target).await? { return Ok(None); }
+        let Some(selected) = state.acknowledged_build_source(target)? else { return Ok(None); };
+        let one = NonZeroUsize::MIN;
+        let worker = SourceStorageWorker::new(Arc::clone(&store), tokio::runtime::Handle::current(), one, one, one)?;
+        let Some(session) = worker.open_build_diagnostics(selected, LIFETIME).await? else { return Ok(None); };
+        let limits = BaseCstAdmissionLimits {
+            records: usize::MAX, record_bytes: usize::MAX, graph_edges: usize::MAX,
+            expanded_record_bytes: usize::MAX, cst_occurrences: usize::MAX, cst_depth: usize::MAX,
+            authored_bytes: usize::MAX,
+        };
+        let SelectedPairComptimePreparation::Ready(owner) = session.prepare_unique_selected_pair_wasip1(
+            profile.to_owned(), limits, usize::MAX,
+            // The supported scalar pair uses one decimal/Bool line.
+            b"-2147483648\n".len(),
+        ).await? else { return Ok(None); };
+        admitted = true;
+        let result = state.prepare_selected_pair_ordinary_inputs(
+            &owner, &store_path, &paths.output, SelectedPairToolBudget {
+                watch_limits: wosy_project::packages::ComptimeWatchLimits {
+                    entries: usize::MAX, files: usize::MAX, content_bytes: u64::MAX,
+                },
+                evaluator_ir_bytes: usize::MAX, evaluator_module_bytes: u64::MAX, timeout: LIFETIME,
+            }, || false,
+        )?;
+        Ok::<_, BoxError>(result.map(|result| (state, result)))
+    });
+    if let Some(store) = Arc::into_inner(store) {
+        let closed = runtime.block_on(store.close());
+        if attempt.is_ok() {
+            if let Err(error) = closed {
+                eprintln!("incremental source store close failed: {error}");
+                return Ok(false);
+            }
+        }
+    }
+    let (state, result) = match attempt {
+        Ok(Some(result)) => result,
+        Ok(None) => return Ok(false),
+        Err(error) if admitted => return Err(format!("selected comptime tool execution did not complete: {error}")),
+        Err(error) => {
+            eprintln!("incremental comptime preparation unavailable; trying ordinary Build: {error}");
+            return Ok(false);
+        }
+    };
+    let pending = result.inputs();
+    let identity = &pending.manifest.identity;
+    if identity.configuration_identity != config_identity
+        || identity.artifact_identity != format!("{target}:{profile}:{artifact_identity_name}")
+    {
+        return Ok(false);
+    }
+    let (source, pending, partition, runtime) = result.into_builder_inputs();
+    publish_generation(root, target, profile, paths, pending, &partition, runtime, Some((state, source)), false)
+}
+
 fn publish_generation(
     root: &Path, target: &str, profile: &str, ordinary_paths: &BuilderInputPaths,
     mut pending: PendingBuilderInputs, partition: &[u8], runtime_ir: &str,
@@ -118,20 +204,23 @@ fn publish_generation(
     let mut stage = StagedArtifactGeneration::create(&destination).map_err(|e| e.to_string())?;
     let paths = BuilderInputPaths::new(stage.output_dir());
     pending.manifest.executable = paths.output.join("main");
-    if warm {
+    let selected_comptime = pending.manifest.comptime.is_some();
+    if warm || selected_comptime {
         let Some((state, source)) = comparison.as_mut() else { return Ok(false); };
         if !state.revalidate_ordinary_build_inputs(source, profile, &pending, Duration::from_secs(120)).unwrap_or(false) {
             return Ok(false);
         }
-        eprintln!("incremental build reused compiler LLVM for {}", source.selection().root.hex());
+        if warm { eprintln!("incremental build reused compiler LLVM for {}", source.selection().root.hex()); }
     }
     stage.materialize_llvm_inputs(partition, runtime_ir.as_bytes()).map_err(|e| e.to_string())?;
     invoke_unpublished_builder(root, &paths, &pending)?;
     fs::remove_file(&paths.pending_manifest).map_err(|e| e.to_string())?;
     match comparison {
         Some((mut state, source)) => {
-            if let Ok(key) = compiler_partition_key(&source, profile, &pending.manifest.identity.configuration_identity) {
-                let _ = stage.record_compiler_partition(&key, &pending.manifest.identity.llvm_input_identity);
+            if !selected_comptime {
+                if let Ok(key) = compiler_partition_key(&source, profile, &pending.manifest.identity.configuration_identity) {
+                    let _ = stage.record_compiler_partition(&key, &pending.manifest.identity.llvm_input_identity);
+                }
             }
             if state.publish_ordinary_build_generation(&source, profile, &pending, stage,
                 Duration::from_secs(120), usize::MAX).map_err(|e| e.to_string())?.is_none() {
@@ -153,7 +242,7 @@ fn validate_current_generation(root: &Path, target: &str, profile: &str, manifes
     let (current, document) = ProjectConfiguration::load_with_manifest(root)?;
     let identity = project_configuration_identity(document.raw().as_bytes(), &current)?;
     let (_, artifact, artifact_profile, _) = current.artifact_profile(target, profile)?;
-    validate_run_manifest(manifest, &current, &identity, target, profile, artifact, artifact_profile)?;
+    validate_run_manifest(root, manifest, &current, &identity, target, profile, artifact, artifact_profile)?;
     Ok(())
 }
 

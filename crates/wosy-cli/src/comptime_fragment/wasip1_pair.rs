@@ -60,25 +60,62 @@ pub struct StagedPendingPairWasip1Evaluator<'a> {
     evaluator: &'a BoundedStartupWasip1Evaluator,
 }
 
+fn stage_pair_evaluators(
+    plan: &BoundedPairStartupWasip1Output, private_parent: &Path, max_ir_bytes: usize,
+) -> io::Result<Vec<EvaluatorFiles>> {
+    if plan.ir_bytes() > max_ir_bytes.min(1 << 20) {
+        return Err(io::Error::other("closed comptime evaluator IR exceeds byte budget"));
+    }
+    let mut files = Vec::with_capacity(plan.evaluators().len());
+    for evaluator in plan.evaluators() {
+        let ir = evaluator.bytes();
+        let own = EvaluatorFiles::create(private_parent, |file| {
+            file.write_all(ir)?;
+            Ok(StagedEvaluatorIr { bytes: ir.len(), blake3: blake3::hash(ir) })
+        })?;
+        write_private_manifest(own.create_manifest()?, own.module_path())?;
+        files.push(own);
+    }
+    Ok(files)
+}
+
+fn evaluator_stages<'a>(
+    files: &'a [EvaluatorFiles], max_module_bytes: u64, max_stdout: usize,
+) -> Vec<ComptimeEvaluatorStage<'a>> {
+    files.iter().map(|file| ComptimeEvaluatorStage {
+        scratch: file.scratch(),
+        inputs: StagedComptimePairInputs {
+            ir_bytes: file.ir().bytes, ir: file.ir().blake3, max_module_bytes, max_stdout,
+        },
+    }).collect()
+}
+
+/// Client-owned selected-source execution, using the same stage and exact
+/// argument/watch ABI as the pending-source route.
+pub(crate) fn execute_selected_pair_wasip1(
+    plan: &BoundedPairStartupWasip1Output, project: &Path,
+    scope: wosy_project::packages::LocalComptimeInputScope<'_>,
+    expected_config: [u8; 32], attempt: wosy_project::packages::ComptimeExecutionAttempt,
+    private_parent: &Path, max_ir_bytes: usize, max_module_bytes: u64,
+    deadline: std::time::Instant, cancelled: &impl Fn() -> bool,
+) -> io::Result<wosy_project::packages::OwnedLocalComptimeExecution> {
+    use wosy_project::packages::{execute_observed_comptime_set, observe_owned_local_comptime_inputs, LocalComptimeInputScope};
+    let staged = observe_owned_local_comptime_inputs(project, LocalComptimeInputScope {
+        target: scope.target, profile: scope.profile, site: scope.site, watch_limits: scope.watch_limits,
+    }, expected_config).map_err(io::Error::other)?;
+    require_no_parameters(!staged.declarations().parameters().is_empty())?;
+    let files = stage_pair_evaluators(plan, private_parent, max_ir_bytes)?;
+    execute_observed_comptime_set(project, scope, expected_config, attempt, staged.watches(),
+        &evaluator_stages(&files, max_module_bytes, plan.max_stdout()), deadline, cancelled)
+}
+
 impl<'plan> StagedPendingPairWasip1<'plan> {
     pub(crate) fn create(
         observation: PendingPairComptimeInputObservation, plan: &'plan BoundedPairStartupWasip1Output,
         execution_seal: PreparedComptimeExecutionSeal, private_parent: &Path, max_ir_bytes: usize,
     ) -> io::Result<Self> {
         require_no_parameters(!observation.declarations().parameters().is_empty())?;
-        if plan.ir_bytes() > max_ir_bytes.min(1 << 20) {
-            return Err(io::Error::other("closed comptime evaluator IR exceeds byte budget"));
-        }
-        let mut files = Vec::with_capacity(plan.evaluators().len());
-        for evaluator in plan.evaluators() {
-            let ir = evaluator.bytes();
-            let own = EvaluatorFiles::create(private_parent, |file| {
-                file.write_all(ir)?;
-                Ok(StagedEvaluatorIr { bytes: ir.len(), blake3: blake3::hash(ir) })
-            })?;
-            write_private_manifest(own.create_manifest()?, own.module_path())?;
-            files.push(own);
-        }
+        let files = stage_pair_evaluators(plan, private_parent, max_ir_bytes)?;
         Ok(Self { observation, plan, files, execution_seal })
     }
 
@@ -105,13 +142,7 @@ impl<'plan> StagedPendingPairWasip1<'plan> {
     }
 
     pub(crate) fn execution_stages(&self, max_module_bytes: u64) -> Vec<ComptimeEvaluatorStage<'_>> {
-        self.evaluators().map(|evaluator| ComptimeEvaluatorStage {
-            scratch: evaluator.files.scratch(),
-            inputs: StagedComptimePairInputs {
-                ir_bytes: evaluator.evaluator_ir().bytes, ir: evaluator.evaluator_ir().blake3,
-                max_module_bytes, max_stdout: self.plan.max_stdout(),
-            },
-        }).collect()
+        evaluator_stages(&self.files, max_module_bytes, self.plan.max_stdout())
     }
 
     pub fn evaluators(&self) -> impl ExactSizeIterator<Item = StagedPendingPairWasip1Evaluator<'_>> {

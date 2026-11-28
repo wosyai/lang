@@ -30,6 +30,8 @@ pub use diagnostic_report::{
     AcknowledgedBuildDiagnostics, AcknowledgedLlvmPartition, AcknowledgedOrdinaryBuilderInputs, AcknowledgedOrdinaryLlvm, AuthorizedOrdinaryBuilderPeer,
     ProjectDiagnosticExchange, RootedDiagnosticReport,
 };
+#[cfg(target_os = "linux")]
+pub use diagnostic_report::{SelectedPairOrdinaryInputs, SelectedPairToolBudget};
 pub use current_view::PinnedEntryCst;
 pub use pins::{LocalSourcePin, PinnedSourceReplay};
 pub use pin_reconciliation::{PinIntentPage, PinIntentPageRead, PinPage, PinPageItem, PinPageResult, PinScanCursor, PinSyncStatus};

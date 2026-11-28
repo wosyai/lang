@@ -32,9 +32,17 @@ attributes #0 = { noreturn "wasm-import-module"="wasi_snapshot_preview1" "wasm-i
         subprocess.run(["wasm-ld", "--no-entry", "--export=_start", "--export-memory",
                         f"--allow-undefined-file={allowed}", directory / "evaluator.o",
                         directory / "start.o", "-o", module], check=True)
-elif operation == "artifact-check":
-    ir, runtime, output = map(Path, args[:3])
-    expected = int(args[3])
+elif operation in ("artifact-check", "artifact-build", "artifact-build-min"):
+    if operation == "artifact-check":
+        ir, runtime, output = map(Path, args[:3])
+        expected = int(args[3])
+    else:
+        ir, directory, manifest, runtime = map(Path, args)
+        output = Path(json.loads(manifest.read_text())["executable"])
+        assert output.parent == directory
+        expected = -2147483648 if operation == "artifact-build-min" else 10
+        if Path("refuse-final-builder").is_file():
+            sys.exit(72)
     with tempfile.TemporaryDirectory(dir=output.parent) as temp:
         directory = Path(temp)
         observed = directory / "observed.ll"
@@ -82,7 +90,13 @@ attributes #0 = { noreturn "wasm-import-module"="wasi_snapshot_preview1" "wasm-i
             objects.append(object_file)
         subprocess.run(["wasm-ld", "--no-entry", "--export=_start", "--export-memory",
                         f"--allow-undefined-file={allowed}", *objects, "-o", output], check=True)
-    sys.exit(subprocess.run(["wasmtime", "run", "-C", "cache=n", output]).returncode)
+    if operation == "artifact-check":
+        sys.exit(subprocess.run(["wasmtime", "run", "-C", "cache=n", output]).returncode)
+elif operation == "artifact-run":
+    manifest, separator = args
+    assert separator == "--"
+    module = json.loads(Path(manifest).read_text())["executable"]
+    sys.exit(subprocess.run(["wasmtime", "run", "-C", "cache=n", module]).returncode)
 elif operation == "run":
     manifest, = map(Path, args)
     module = json.loads(manifest.read_text())["executable"]

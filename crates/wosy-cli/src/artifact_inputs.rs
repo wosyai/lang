@@ -41,7 +41,7 @@ pub fn pending_builder_inputs(
     let (identity, builder) = artifact_identity(configuration_identity, configuration, target, profile,
         artifact, artifact_profile, source_identity, llvm_input_identity)?;
     Ok(PendingBuilderInputs {
-        manifest: ArtifactManifest { identity, executable: output.join("main"), source_observations },
+        manifest: ArtifactManifest { identity, executable: output.join("main"), source_observations, comptime: None },
         builder: builder.clone(),
     })
 }

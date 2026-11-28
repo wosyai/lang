@@ -60,6 +60,7 @@ pub enum RootedClosedComptimeRefusal {
     ProfileNotSelected,
     ProfileNotWasip1,
     FileNotRooted,
+    MultipleComptimeSites,
     NotTargetEntry,
     DirectCallRequiresSingleModule,
     UnsupportedSourceEpoch,
@@ -248,6 +249,8 @@ impl RootedComptimeIdentity {
 }
 
 struct VerifiedComptimeSource {
+    configuration_inputs: NodeId,
+    artifact: wosy_project::ArtifactProfile,
     source: RootedComptimeIdentity,
     fresh: FreshParseResult,
 }
@@ -310,7 +313,7 @@ impl SourceStore {
     }
 
     /// Project the ordinary finite graph from the same verified pending CST.
-    pub(super) fn project_pair_call_graph_from_pending_parse(
+    pub(super) fn project_pair_call_graph_from_verified_parse(
         &self, root: NodeId, authored_cst: NodeId, target: String,
         request: &RootedClosedComptimeRequest, fresh: &FreshParseResult, max_wasip1_stdout: Option<usize>,
     ) -> Result<RootedPairCallGraphComptimeProjection> {
@@ -341,6 +344,67 @@ impl SourceStore {
         Ok(RootedPairCallGraphComptimeProjection::Emitted(RootedPairCallGraphComptimePlan {
             source, typed, evaluators,
         }))
+    }
+
+    /// Same closed pair producer for a committed selected source. The
+    /// source lease is the authority; no pending predecessor is fabricated.
+    #[cfg(target_os = "linux")]
+    pub(super) fn project_selected_pair_wasip1_for_lease(
+        &self, lease: &SourceLease, request: RootedClosedComptimeRequest, max_stdout: usize,
+        infer_site: bool,
+    ) -> Result<SelectedComptime<(NodeId, RootedPairCallGraphComptimePlan)>> {
+        self.project_comptime_for_lease(lease, request, SiteScope::DirectTargetCall, |input, request| {
+            if input.artifact.backend != "llvm" || input.artifact.output != "wasm-wasip1"
+                || input.artifact.exports.is_some()
+            {
+                return Ok(Err(RootedClosedComptimeRefusal::ProfileNotWasip1));
+            }
+            let automatic;
+            let request = if infer_site {
+                let mut sites = input.fresh.result().canonical_cst().root.descendants()
+                    .filter_map(|node| wosy_syntax::ComptimeCst::from_node(&node));
+                let Some(site) = sites.next() else {
+                    return Ok(Err(RootedClosedComptimeRefusal::Compiler(ClosedComptimeRejection::SiteNotFound)));
+                };
+                if sites.next().is_some() {
+                    return Ok(Err(RootedClosedComptimeRefusal::MultipleComptimeSites));
+                }
+                automatic = RootedClosedComptimeRequest {
+                    profile: request.profile.clone(), file: request.file.clone(), id: site.id.text().to_owned(),
+                    evaluator_layout: request.evaluator_layout, source_limits: request.source_limits,
+                    output_bytes: request.output_bytes,
+                };
+                automatic.check_selector_bytes()?;
+                &automatic
+            } else {
+                request
+            };
+            let scoped = self.project_pair_call_graph_from_verified_parse(
+                input.source.root, input.source.authored_cst, input.source.target,
+                request, &input.fresh, Some(max_stdout),
+            )?;
+            Ok(match scoped {
+                RootedPairCallGraphComptimeProjection::Emitted(plan) => Ok((input.configuration_inputs, plan)),
+                RootedPairCallGraphComptimeProjection::Refused(reason) => Err(reason),
+            })
+        })
+    }
+
+    #[cfg(target_os = "linux")]
+    pub(super) fn project_unique_selected_pair_for_lease(
+        &self, lease: &SourceLease, profile: String, limits: BaseCstAdmissionLimits,
+        output_bytes: usize, max_stdout: usize,
+    ) -> Result<SelectedComptime<(NodeId, RootedPairCallGraphComptimePlan)>> {
+        let (tx, _read) = self.begin_leased_source(lease.grant(), Mode::ReadOnly)?
+            .ok_or(BuildRequestRejection::Expired)?;
+        let mut records = bounded_source_records(&tx, limits);
+        let (_, config) = checked_source_header_using(lease.grant().root, &mut records)?;
+        let request = RootedClosedComptimeRequest {
+            profile, file: config.entry, id: String::new(), evaluator_layout: ScalarTargetLayout::WASM32,
+            source_limits: limits, output_bytes,
+        };
+        request.check_selector_bytes()?;
+        self.project_selected_pair_wasip1_for_lease(lease, request, max_stdout, true)
     }
 
     pub(super) fn project_closed_comptime_for_lease(
@@ -453,9 +517,9 @@ impl SourceStore {
         if parts.kind_encoding() != CstKindEncoding::Current {
             return Ok(Err(Refusal::UnsupportedSourceEpoch));
         }
-        if !config.profiles.contains_key(&request.profile) {
+        let Some(artifact) = config.profiles.get(&request.profile).cloned() else {
             return Ok(Err(Refusal::ProfileNotSelected));
-        }
+        };
         let Some(image) = self.derivation_image() else {
             return Ok(Err(Refusal::CompilerImageUnavailable));
         };
@@ -479,6 +543,7 @@ impl SourceStore {
             return Ok(Err(Refusal::AuthoredGrammarNotVerified));
         };
         Ok(Ok(VerifiedComptimeSource {
+            configuration_inputs: config.inputs, artifact,
             source: RootedComptimeIdentity {
                 root, authored_cst: file.authored, compiler_image: image,
                 target: config.target, profile: request.profile.clone(),

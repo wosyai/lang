@@ -6,6 +6,7 @@ use super::{
     ScalarBlockItem, ScalarExpression, ScalarItem, ScalarPreparationInputs, ScalarTargetLayout,
     ScalarType,
 };
+use super::super::UnaryOperator;
 use super::super::{
     control::{
         CallableBodyCallNodes, CallablePointFacts, InitializerFacts, ModuleInitializationStepKind,
@@ -23,6 +24,19 @@ pub enum DirectComptimeArgument {
     I32(i32),
     U32(u32),
     Bool(bool),
+}
+
+fn typed_startup_literal(value: DirectComptimeArgument, span: ByteSpan) -> ScalarExpression {
+    match value {
+        DirectComptimeArgument::I32(value) if value < 0 => ScalarExpression::Unary {
+            operator: UnaryOperator::Negate,
+            operand: Box::new(ScalarExpression::Integer { value: value.unsigned_abs().into(), span }),
+            span,
+        },
+        DirectComptimeArgument::I32(value) => ScalarExpression::Integer { value: value.into(), span },
+        DirectComptimeArgument::U32(value) => ScalarExpression::Integer { value: value.into(), span },
+        DirectComptimeArgument::Bool(value) => ScalarExpression::Boolean { value, span },
+    }
 }
 
 /// A checked argument's authored literal origin. If the occurrence is a
@@ -524,11 +538,6 @@ impl BoundedPairStartupWasip1Output {
         let values = self.evaluators.iter().zip(values).map(|(evaluator, value)| {
             typed_value(evaluator.result_type(), value).ok_or_else(|| unsupported("ordinary comptime result type changed"))
         }).collect::<Result<Vec<_>, _>>()?;
-        let literal = |value, span| match value {
-            DirectComptimeArgument::Bool(value) => ScalarExpression::Boolean { value, span },
-            DirectComptimeArgument::I32(value) => ScalarExpression::Integer { value: value.into(), span },
-            DirectComptimeArgument::U32(value) => ScalarExpression::Integer { value: value.into(), span },
-        };
         let ordinary = self.ordinary_continuation();
         let site = ordinary.comptime_site();
         let tail = ordinary.callable_tail();
@@ -580,7 +589,7 @@ impl BoundedPairStartupWasip1Output {
             if original != call.range || enclosure.start > original.start || enclosure.end < original.end {
                 return Err(unsupported("ordinary initializer no longer matches the prepared call"));
             }
-            binding.value = literal(value, original);
+            binding.value = typed_startup_literal(value, original);
             output.value = binding.value.clone();
         }
         declarations.items.drain(..prefix);
@@ -770,11 +779,7 @@ fn emit_bound_evaluator<const ARITY: usize>(
     };
     for input in facts.inputs() {
         let span = input.read.range;
-        let value = match input.value {
-            DirectComptimeArgument::I32(value) => ScalarExpression::Integer { value: value.into(), span },
-            DirectComptimeArgument::U32(value) => ScalarExpression::Integer { value: value.into(), span },
-            DirectComptimeArgument::Bool(value) => ScalarExpression::Boolean { value, span },
-        };
+        let value = typed_startup_literal(input.value, span);
         let Some(read) = input.operand.get_mut(item) else {
             return Err(ClosedComptimeRejection::Emitter("verified formal operand disappeared".into()));
         };
@@ -1217,6 +1222,11 @@ impl StartupArgumentFacts<'_> {
                 i32::try_from(value).ok().map(DirectComptimeArgument::I32),
             (ScalarExpression::Integer { value, .. }, ScalarType::U32) =>
                 u32::try_from(value).ok().map(DirectComptimeArgument::U32),
+            (ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. }, ScalarType::I32) =>
+                match operand.as_ref() {
+                    ScalarExpression::Integer { value, .. } => i32::try_from(-value).ok().map(DirectComptimeArgument::I32),
+                    _ => None,
+                },
             (ScalarExpression::Boolean { value, .. }, ScalarType::Bool) => Some(DirectComptimeArgument::Bool(*value)),
             _ => None,
         };

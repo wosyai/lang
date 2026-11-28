@@ -405,6 +405,7 @@ mod tests {
             },
             executable: stage.output_dir().join(OUTPUT),
             source_observations: Vec::new(),
+            comptime: None,
         }
     }
 

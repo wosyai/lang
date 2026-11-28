@@ -135,6 +135,37 @@ impl AcknowledgedOrdinaryBuilderInputs {
     pub fn executable_partition_digest(&self) -> Option<NodeId> { self.executable_partition_digest }
 }
 
+/// Selected-source compiler result with its actual final comptime input
+/// identity. This object is inert; artifact Build owns invocation/publication.
+#[cfg(target_os = "linux")]
+pub struct SelectedPairOrdinaryInputs {
+    source: AcknowledgedSourceGeneration,
+    result_root: wosy_protocol::ComptimeResultRoot,
+    inputs: PendingBuilderInputs,
+    partition: Vec<u8>,
+    runtime: &'static str,
+}
+
+#[cfg(target_os = "linux")]
+impl SelectedPairOrdinaryInputs {
+    pub fn source(&self) -> &AcknowledgedSourceGeneration { &self.source }
+    pub fn result_root(&self) -> wosy_protocol::ComptimeResultRoot { self.result_root }
+    pub fn inputs(&self) -> &PendingBuilderInputs { &self.inputs }
+    pub fn partition(&self) -> &[u8] { &self.partition }
+    pub fn runtime(&self) -> &'static str { self.runtime }
+    pub fn into_builder_inputs(self) -> (AcknowledgedSourceGeneration, PendingBuilderInputs, Vec<u8>, &'static str) {
+        (self.source, self.inputs, self.partition, self.runtime)
+    }
+}
+
+#[cfg(target_os = "linux")]
+pub struct SelectedPairToolBudget {
+    pub watch_limits: wosy_project::packages::ComptimeWatchLimits,
+    pub evaluator_ir_bytes: usize,
+    pub evaluator_module_bytes: u64,
+    pub timeout: Duration,
+}
+
 struct LiveCapture {
     captured: CapturedBuildDiagnostics,
     builder: Option<ObservedBuilderBasis>,
@@ -599,10 +630,22 @@ fn matches_ordinary_builder(
     let Some(observed) = observed else { return Ok(false); };
     let (_, artifact, profile_config, _) = observed.configuration.artifact_profile(target, profile)?;
     let output = ordinary.manifest.executable.parent().ok_or("ordinary builder output has no directory")?;
-    let recomputed = pending_builder_inputs(
+    let mut recomputed = pending_builder_inputs(
         &observed.configuration, observed.configuration_identity, target, profile,
         artifact, profile_config, observed.source, ordinary.manifest.identity.llvm_input_identity.clone(), output,
     )?;
+    if let Some(observation) = &ordinary.manifest.comptime {
+        #[cfg(target_os = "linux")]
+        if !observation.matches_current(&observed.project, target, profile) {
+            return Ok(false);
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = observation;
+            return Ok(false);
+        }
+        recomputed.manifest.comptime = Some(observation.clone());
+    }
     Ok(recomputed.manifest == ordinary.manifest && recomputed.builder == ordinary.builder)
 }
 
@@ -637,6 +680,71 @@ fn bind_builder_inputs(
 
 #[cfg(target_os = "linux")]
 impl SqliteSourceState {
+    /// Execute only the acknowledged selected plan and prepare its ordinary
+    /// builder inputs. The real compiler result and all declared inputs are
+    /// checked again on the current source before returning. Not an artifact
+    /// cache or permission to select a different builder.
+    pub fn prepare_selected_pair_ordinary_inputs(
+        &mut self, owner: &wosy_daemon::SelectedPairComptimeOwner<'_>,
+        private_parent: &Path, output: &Path, budget: SelectedPairToolBudget,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Option<SelectedPairOrdinaryInputs>> {
+        use wosy_project::packages::{observe_owned_local_comptime_inputs, ComptimeExecutionAttempt, LocalComptimeInputScope};
+        let Some(plan) = owner.plan() else { return Ok(None); };
+        let Some(evaluators) = plan.wasip1_output() else { return Ok(None); };
+        let deadline = llvm_deadline(plan.profile(), budget.timeout)?;
+        let Ok(initial) = self.capture_live(plan.target(), plan.profile(), deadline, usize::MAX, true)? else { return Ok(None); };
+        let source = initial.captured.source;
+        if source.selection().root != plan.source_root()
+            || source.selection().project != plan.evidence().site().source.project
+            || initial.builder.is_none() || cancelled()
+        {
+            return Ok(None);
+        }
+        let watch_scope = || LocalComptimeInputScope {
+            target: plan.target(), profile: plan.profile(), site: plan.id(), watch_limits: budget.watch_limits,
+        };
+        let execution = crate::comptime_fragment::execute_selected_pair_wasip1(
+            evaluators, &self.project, watch_scope(), owner.configuration_inputs().0,
+            ComptimeExecutionAttempt {
+                seal: owner.execution_seal().clone(), root: plan.source_root().0,
+                generation: source.generation(), authored_cst: plan.authored_cst().0,
+            }, private_parent, budget.evaluator_ir_bytes, budget.evaluator_module_bytes, deadline.into_std(), &cancelled,
+        )?;
+        let Some(emitted) = owner.emit_owned_result(source.generation(), &execution)? else { return Ok(None); };
+        let Ok(current) = self.capture_live(plan.target(), plan.profile(), deadline, usize::MAX, true)? else { return Ok(None); };
+        if current.captured.selection() != source.selection()
+            || current.captured.source.generation() != source.generation()
+            || cancelled() || emitted.source_root != source.selection().root
+        {
+            return Ok(None);
+        }
+        let watches = observe_owned_local_comptime_inputs(&self.project, watch_scope(), owner.configuration_inputs().0)?;
+        if watches.watches() != execution.observed().watches() || !current.captured.is_current(self)?
+            || owner.plan().is_none()
+        {
+            return Ok(None);
+        }
+        require_diagnostic_time(deadline)?;
+        let observed = current.builder.ok_or("selected comptime artifact has no live builder inputs")?;
+        let (_, artifact, profile, _) = observed.configuration.artifact_profile(plan.target(), plan.profile())?;
+        let runtime = wosy_compiler::core_runtime(&profile.backend, &profile.output)?;
+        let mut partition = Vec::new();
+        emitted.partition.write_text(&mut partition)?;
+        let mut inputs = pending_builder_inputs(
+            &observed.configuration, observed.configuration_identity, plan.target(), plan.profile(),
+            artifact, profile, observed.source, blake3::hash(&partition).to_hex().to_string(), output,
+        )?;
+        inputs.manifest.comptime = Some(wosy_project::ArtifactComptimeObservation {
+            source_root: source.selection().root.0,
+            result_root: emitted.result_root.identity().0,
+            configuration_inputs: owner.configuration_inputs().0,
+            site: plan.id().to_owned(),
+            watches: watches.watches().to_vec(),
+        });
+        Ok(Some(SelectedPairOrdinaryInputs { source, result_root: emitted.result_root, inputs, partition, runtime }))
+    }
+
     /// Reobserve exact ordinary inputs while the caller holds its artifact
     /// writer reservation. This does not exclude non-participating editors.
     pub fn revalidate_ordinary_build_inputs(
@@ -645,6 +753,9 @@ impl SqliteSourceState {
     ) -> Result<bool> {
         let deadline = llvm_deadline(profile, timeout)?;
         let selection = source.selection();
+        if ordinary.manifest.comptime.as_ref().is_some_and(|item| item.source_root != selection.root.0) {
+            return Ok(false);
+        }
         let Ok(live) = self.capture_live(&selection.target, profile, deadline, usize::MAX, true)? else {
             return Ok(false);
         };
@@ -666,7 +777,8 @@ impl SqliteSourceState {
     ) -> Result<Option<PathBuf>> {
         let deadline = llvm_deadline(profile, timeout)?;
         let selection = source.selection();
-        if ordinary.manifest.executable != stage.output_dir().join("main")
+        if ordinary.manifest.comptime.as_ref().is_some_and(|item| item.source_root != selection.root.0)
+            || ordinary.manifest.executable != stage.output_dir().join("main")
             || !stage.is_workspace_subdirectory(&self.project)?
         {
             return Ok(None);

@@ -72,6 +72,8 @@ mod source_reconciliation;
 mod storage_worker;
 pub use base_declarations::{BaseDeclarationsView, QueryDisposition};
 pub use build_session::{BuildDiagnosticSession, BuildSourceOpening};
+#[cfg(target_os = "linux")]
+pub use build_session::{SelectedPairComptimeEmission, SelectedPairComptimeOwner, SelectedPairComptimePreparation};
 pub use framed_session::BuildSessionEnd;
 pub use installed_git_scope::InstalledGitScopeRejection;
 pub use wosy_protocol::{encode_session_frame, SessionFrameError, SessionFrameReader, MAX_SESSION_FRAME_BYTES};

@@ -188,6 +188,26 @@ fn scalar_argument(value: wosy_compiler::DirectComptimeArgument) -> wosy_protoco
     }
 }
 
+fn pair_evaluator_shapes(plan: &super::RootedPairCallGraphComptimePlan) -> Option<Vec<PreparedPairEvaluatorShape>> {
+    let output = plan.wasip1_output()?;
+    let mut by_ordinal = vec![None; output.evaluators().len()];
+    for (call, _) in output.evidence().calls() {
+        let index = call.evaluator_index();
+        let values = std::array::from_fn(|index| scalar_argument(call.facts().inputs()[index].value()));
+        let selected = by_ordinal.get_mut(index)?;
+        if selected.as_ref().is_some_and(|prior| prior != &values) { return None; }
+        *selected = Some(values);
+    }
+    let evaluators = output.evaluators().iter().zip(by_ordinal).map(|(evaluator, values)| {
+        Some(PreparedPairEvaluatorShape {
+            fragment_ir: NodeId(*blake3::hash(evaluator.bytes()).as_bytes()),
+            concrete_values: values?,
+            result_type: evaluator.result_type().clone(),
+        })
+    }).collect::<Option<Vec<_>>>()?;
+    Some(evaluators)
+}
+
 /// Complete typed semantic input candidate for the exact prepared owner.
 /// It is not a committed snapshot or evidence of undeclared program reads.
 #[cfg(target_os = "linux")]
@@ -261,6 +281,109 @@ fn comptime_digest(domain: &str, input: &impl serde::Serialize) -> Result<NodeId
     Ok(NodeId(blake3::derive_key(domain, &serde_json::to_vec(input)?)))
 }
 
+#[cfg(target_os = "linux")]
+pub(super) struct PairDecodedResults {
+    pub root: wosy_protocol::ComptimeResultRoot,
+    pub values: Vec<wosy_compiler::ScalarExpression>,
+    pub modules: Vec<NodeId>,
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn decode_owned_pair_results(
+    plan: &super::RootedPairCallGraphComptimePlan, project: &std::path::Path,
+    configuration_inputs: NodeId, expected_generation: i64,
+    seal: &wosy_project::packages::PreparedComptimeExecutionSeal,
+    executed: &wosy_project::packages::OwnedLocalComptimeExecution,
+) -> Result<PairDecodedResults> {
+    use std::ffi::OsStr;
+    use wosy_compiler::{ScalarExpression as Expression, ScalarType};
+    use wosy_project::packages::{OwnedComptimeToolResult, WatchRoot};
+    use wosy_protocol::{ComptimeInputs, ComptimeResultRoot, ComptimeScalarValue as Value, ComptimeValue, ComptimeWatchIdentity};
+
+    let output = plan.wasip1_output().ok_or("expected a selected WASIp1 plan")?;
+    let evaluators = pair_evaluator_shapes(plan).ok_or("incomplete selected evaluator plan")?;
+    let observed = executed.observed();
+    let executions = executed.pairs();
+    let attempt = executed.attempt();
+    if !seal.same_owner(&attempt.seal) || attempt.root != plan.source_root().0 || attempt.generation != expected_generation
+        || attempt.authored_cst != plan.authored_cst().0
+    {
+        return Err("owned comptime execution belongs to a different prepared attempt".into());
+    }
+    let scope = observed.declarations();
+    let tools = scope.tools();
+    if observed.project() != project
+        || observed.site() != plan.id() || tools.target() != plan.target() || tools.profile() != plan.profile()
+        || observed.configuration_identity() != configuration_inputs.0
+        || !scope.parameters().is_empty()
+        || executions.len() != evaluators.len()
+    {
+        return Err("executed comptime result does not match the full prepared scope".into());
+    }
+
+    let (_, builder) = tools.builder();
+    let (_, runner) = tools.runner();
+    let matches_tool = |actual: &OwnedComptimeToolResult, command: &[String], args: &[String], suffix: usize| {
+        let Some((executable, fixed)) = command.split_first() else { return false; };
+        actual.status().success() && actual.working_directory() == observed.project()
+            && actual.executable() == OsStr::new(executable)
+            && actual.arguments().len() == fixed.len() + args.len() + suffix
+            && actual.arguments().iter().zip(fixed.iter().chain(args))
+                .all(|(actual, declared)| actual == OsStr::new(declared))
+    };
+    let mut watches = Vec::with_capacity(observed.watches().len());
+    for watch in observed.watches() {
+        let root_tag = match watch.root { WatchRoot::OwningPackage => 0u8, WatchRoot::ConsumingProject => 1 };
+        watches.push(ComptimeWatchIdentity {
+            input: comptime_digest("Wosy resolved comptime watch v1", &(root_tag, &watch.path))?,
+            content: NodeId::parse_hex(&watch.revision.0)?,
+        });
+    }
+    let builder_id = comptime_digest("Wosy declared comptime builder v1", &tools.builder())?;
+    let runner_id = comptime_digest("Wosy declared comptime runner v1", &tools.runner())?;
+    let toolchain = comptime_digest("Wosy declared comptime toolchain v1", &builder.toolchain_identity)?;
+    let function = comptime_digest("Wosy authored comptime function v1", &(plan.authored_cst(), plan.id()))?;
+    let no_parameters = comptime_digest("Wosy empty comptime parameters v1", &())?;
+    let no_permissions = comptime_digest("Wosy empty comptime permissions v1", &())?;
+
+    let mut results = Vec::with_capacity(executions.len());
+    let mut values = Vec::with_capacity(executions.len());
+    let mut modules = Vec::with_capacity(executions.len());
+    for ((expected, evaluator), receipt) in evaluators.iter().zip(output.evaluators()).zip(executions) {
+        if expected.fragment_ir.0 != *receipt.ir().as_bytes()
+            || !matches_tool(receipt.builder(), &builder.command, &builder.args, 3)
+            || !matches_tool(receipt.runner(), &runner.command, &runner.args, 1)
+        {
+            return Err("owned comptime terminal differs from the selected evaluator or invocation".into());
+        }
+        let decoded = evaluator.parse_stdout(receipt.runner().stdout(), output.max_stdout())
+            .map_err(|error| format!("owned comptime stdout failed typed decoding: {error:?}"))?;
+        let (type_name, value) = match (&expected.result_type, &decoded) {
+            (ScalarType::Bool, Expression::Boolean { value, .. }) => ("bool", Value::Bool(*value)),
+            (ScalarType::I32, Expression::Integer { value, .. }) => ("i32", Value::Signed { width: 32,
+                value: i32::try_from(value).map_err(|_| "invalid owned comptime i32")?.into() }),
+            (ScalarType::U32, Expression::Integer { value, .. }) => ("u32", Value::Unsigned { width: 32,
+                value: u32::try_from(value).map_err(|_| "invalid owned comptime u32")?.into() }),
+            _ => return Err("owned comptime typed result has no supported canonical identity".into()),
+        };
+        let specialization = comptime_digest("Wosy concrete comptime specialization v1", &expected.concrete_values)?;
+        let key = ComptimeInputs {
+            fragment_ir: expected.fragment_ir, function, specialization,
+            concrete_values: expected.concrete_values.iter().cloned().map(ComptimeValue::Scalar).collect(),
+            target: plan.target().to_owned(), profile: plan.profile().to_owned(), compiler_image: plan.compiler_image(),
+            builder: builder_id, runner: runner_id, toolchain, params: no_parameters, permissions: no_permissions,
+            watches: watches.clone(),
+        }.key()?;
+        results.push(key.identify_result(
+            comptime_digest("Wosy resolved comptime scalar type v1", &type_name)?, &ComptimeValue::Scalar(value),
+        )?);
+        values.push(decoded);
+        modules.push(NodeId(*receipt.module().as_bytes()));
+    }
+    let root = ComptimeResultRoot::identify(plan.source_root(), plan.target(), plan.profile(), results)?;
+    Ok(PairDecodedResults { root, values, modules })
+}
+
 impl PreparedPendingPairCallGraphComptime {
     pub fn base(&self) -> &PreparedBaseDeclarations { &self.base }
     pub fn binding(&self) -> &BaseCstProposalBinding { &self.binding }
@@ -278,22 +401,7 @@ impl PreparedPendingPairCallGraphComptime {
             if plan.source_root() != self.binding.proposed || plan.target() != self.binding.selected.target {
                 return None;
             }
-            let output = plan.wasip1_output()?;
-            let mut by_ordinal = vec![None; output.evaluators().len()];
-            for (call, _) in output.evidence().calls() {
-                let index = call.evaluator_index();
-                let values = std::array::from_fn(|index| scalar_argument(call.facts().inputs()[index].value()));
-                let selected = by_ordinal.get_mut(index)?;
-                if selected.as_ref().is_some_and(|prior| prior != &values) { return None; }
-                *selected = Some(values);
-            }
-            let evaluators = output.evaluators().iter().zip(by_ordinal).map(|(evaluator, values)| {
-                Some(PreparedPairEvaluatorShape {
-                    fragment_ir: NodeId(*blake3::hash(evaluator.bytes()).as_bytes()),
-                    concrete_values: values?,
-                    result_type: evaluator.result_type().clone(),
-                })
-            }).collect::<Option<Vec<_>>>()?;
+            let evaluators = pair_evaluator_shapes(plan)?;
             Some(PreparedPairResultShape {
                 prepared: self.base.identity(), binding: self.binding.clone(),
                 authored_cst: plan.authored_cst(), compiler_image: plan.compiler_image(),
@@ -310,98 +418,16 @@ impl PreparedPendingPairCallGraphComptime {
     pub fn prepare_owned_result_intake(
         &self, executed: &wosy_project::packages::OwnedLocalComptimeExecution,
     ) -> Result<Option<PreparedPairResultIntake>> {
-        use std::{ffi::OsStr, path::Path};
-        use wosy_compiler::{ScalarExpression as Expression, ScalarType};
-        use wosy_project::packages::{OwnedComptimeToolResult, WatchRoot};
-        use wosy_protocol::{ComptimeInputs, ComptimeResultRoot, ComptimeScalarValue as Value, ComptimeValue, ComptimeWatchIdentity};
-
-        let Some(shape) = self.result_shape() else { return Ok(None); };
         let Some(PendingEntryComptimeProjection::Candidate(RootedPairCallGraphComptimeProjection::Emitted(plan))) =
             self.projection() else { return Ok(None); };
-        let output = plan.wasip1_output().ok_or("expected a selected WASIp1 plan")?;
-        let observed = executed.observed();
-        let executions = executed.pairs();
-        let attempt = executed.attempt();
-        if !self.execution_seal.same_owner(&attempt.seal) || attempt.root != self.binding.proposed.0 || attempt.generation != self.binding.attempt
-            || attempt.authored_cst != shape.authored_cst.0
-        {
-            return Err("owned comptime execution belongs to a different prepared attempt".into());
-        }
-        let scope = observed.declarations();
-        let tools = scope.tools();
-        if observed.project() != Path::new(&self.binding.selected.project)
-            || observed.site() != shape.site() || tools.target() != shape.target() || tools.profile() != shape.profile()
-            || observed.configuration_identity() != self.configuration_inputs.0
-            || !scope.parameters().is_empty()
-            || executions.len() != shape.evaluators.len()
-        {
-            return Err("executed comptime result does not match the full prepared scope".into());
-        }
-
-        let (_, builder) = tools.builder();
-        let (_, runner) = tools.runner();
-        let matches_tool = |actual: &OwnedComptimeToolResult, command: &[String], args: &[String], suffix: usize| {
-            let Some((executable, fixed)) = command.split_first() else { return false; };
-            actual.status().success() && actual.working_directory() == observed.project()
-                && actual.executable() == OsStr::new(executable)
-                && actual.arguments().len() == fixed.len() + args.len() + suffix
-                && actual.arguments().iter().zip(fixed.iter().chain(args))
-                    .all(|(actual, declared)| actual == OsStr::new(declared))
-        };
-        let mut watches = Vec::with_capacity(observed.watches().len());
-        for watch in observed.watches() {
-            let root_tag = match watch.root { WatchRoot::OwningPackage => 0u8, WatchRoot::ConsumingProject => 1 };
-            watches.push(ComptimeWatchIdentity {
-                input: comptime_digest("Wosy resolved comptime watch v1", &(root_tag, &watch.path))?,
-                content: NodeId::parse_hex(&watch.revision.0)?,
-            });
-        }
-        let builder_id = comptime_digest("Wosy declared comptime builder v1", &tools.builder())?;
-        let runner_id = comptime_digest("Wosy declared comptime runner v1", &tools.runner())?;
-        let toolchain = comptime_digest("Wosy declared comptime toolchain v1", &builder.toolchain_identity)?;
-        let function = comptime_digest("Wosy authored comptime function v1", &(shape.authored_cst, shape.site()))?;
-        let no_parameters = comptime_digest("Wosy empty comptime parameters v1", &())?;
-        let no_permissions = comptime_digest("Wosy empty comptime permissions v1", &())?;
-
-        let mut results = Vec::with_capacity(executions.len());
-        let mut values = Vec::with_capacity(executions.len());
-        let mut modules = Vec::with_capacity(executions.len());
-        for ((expected, evaluator), receipt) in shape.evaluators.iter().zip(output.evaluators()).zip(executions) {
-            if expected.fragment_ir.0 != *receipt.ir().as_bytes()
-                || !matches_tool(receipt.builder(), &builder.command, &builder.args, 3)
-                || !matches_tool(receipt.runner(), &runner.command, &runner.args, 1)
-            {
-                return Err("owned comptime terminal differs from the selected evaluator or invocation".into());
-            }
-            let decoded = evaluator.parse_stdout(receipt.runner().stdout(), output.max_stdout())
-                .map_err(|error| format!("owned comptime stdout failed typed decoding: {error:?}"))?;
-            let (type_name, value) = match (&expected.result_type, &decoded) {
-                (ScalarType::Bool, Expression::Boolean { value, .. }) => ("bool", Value::Bool(*value)),
-                (ScalarType::I32, Expression::Integer { value, .. }) => ("i32", Value::Signed { width: 32,
-                    value: i32::try_from(value).map_err(|_| "invalid owned comptime i32")?.into() }),
-                (ScalarType::U32, Expression::Integer { value, .. }) => ("u32", Value::Unsigned { width: 32,
-                    value: u32::try_from(value).map_err(|_| "invalid owned comptime u32")?.into() }),
-                _ => return Err("owned comptime typed result has no supported canonical identity".into()),
-            };
-            let specialization = comptime_digest("Wosy concrete comptime specialization v1", &expected.concrete_values)?;
-            let key = ComptimeInputs {
-                fragment_ir: expected.fragment_ir, function, specialization,
-                concrete_values: expected.concrete_values.iter().cloned().map(ComptimeValue::Scalar).collect(),
-                target: shape.target.clone(), profile: shape.profile.clone(), compiler_image: shape.compiler_image,
-                builder: builder_id, runner: runner_id, toolchain, params: no_parameters, permissions: no_permissions,
-                watches: watches.clone(),
-            }.key()?;
-            results.push(key.identify_result(
-                comptime_digest("Wosy resolved comptime scalar type v1", &type_name)?, &ComptimeValue::Scalar(value),
-            )?);
-            values.push(decoded);
-            modules.push(NodeId(*receipt.module().as_bytes()));
-        }
-        let root = ComptimeResultRoot::identify(shape.binding.proposed, shape.target(), shape.profile(), results)?;
+        let PairDecodedResults { root, values, modules } = decode_owned_pair_results(
+            plan, std::path::Path::new(&self.binding.selected.project), self.configuration_inputs,
+            self.binding.attempt, &self.execution_seal, executed,
+        )?;
         Ok(self.base.lease.finish_current(|| PreparedPairResultIntake {
-            seal: self.execution_seal.clone(),
-            prepared: shape.prepared, binding: shape.binding, root, values, modules,
-            site: shape.site, profile: shape.profile, watches: observed.watches().to_vec(),
+            seal: self.execution_seal.clone(), prepared: self.base.identity(), binding: self.binding.clone(),
+            root, values, modules, site: plan.id().to_owned(), profile: plan.profile().to_owned(),
+            watches: executed.observed().watches().to_vec(),
         }))
     }
 
@@ -545,7 +571,7 @@ impl ValidatedProposal {
                 RootedClosedComptimeRefusal::ProfileNotWasip1,
             )));
         }
-        let projected = store.project_pair_call_graph_from_pending_parse(
+        let projected = store.project_pair_call_graph_from_verified_parse(
             root, entry.file.authored, target, request, &entry.fresh, max_wasip1_stdout,
         )?;
         Ok(PendingPairCallGraphComptimeProjection::Candidate(projected))

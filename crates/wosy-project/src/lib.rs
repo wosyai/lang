@@ -1128,10 +1128,31 @@ pub struct ArtifactIdentity {
 }
 
 #[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
+pub struct ArtifactComptimeObservation {
+    pub source_root: [u8; 32],
+    pub result_root: [u8; 32],
+    pub configuration_inputs: [u8; 32],
+    pub site: String,
+    pub watches: Vec<packages::WatchedComptimeFile>,
+}
+
+impl ArtifactComptimeObservation {
+    #[cfg(target_os = "linux")]
+    pub fn matches_current(&self, project: &Path, target: &str, profile: &str) -> bool {
+        packages::observe_owned_local_comptime_inputs(project, packages::LocalComptimeInputScope {
+            target, profile, site: &self.site,
+            watch_limits: packages::ComptimeWatchLimits { entries: usize::MAX, files: usize::MAX, content_bytes: u64::MAX },
+        }, self.configuration_inputs).is_ok_and(|current| current.watches() == self.watches)
+    }
+}
+
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct ArtifactManifest {
     pub identity: ArtifactIdentity,
     pub executable: PathBuf,
     pub source_observations: Vec<SourceObservation>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub comptime: Option<ArtifactComptimeObservation>,
 }
 
 pub fn load_artifact_manifest(path: &Path) -> Result<ArtifactManifest, String> {
@@ -1163,6 +1184,7 @@ pub fn publish_artifact(
         identity,
         executable,
         source_observations,
+        comptime: None,
     };
     let manifest_path = output_dir.join("artifact-manifest.json");
     let bytes = serde_json::to_vec_pretty(&manifest).map_err(|error| error.to_string())?;
@@ -1387,6 +1409,7 @@ mod tests {
             },
             executable: PathBuf::from("main"),
             source_observations: observations,
+            comptime: None,
         })
         .expect("artifact manifest serialization");
         assert_eq!(

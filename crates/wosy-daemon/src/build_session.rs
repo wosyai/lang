@@ -27,6 +27,59 @@ pub struct BuildDiagnosticSession<'a> {
     lease: Arc<SourceLease>,
 }
 
+/// Borrowed exact committed source owner. Dropping the parent session
+/// releases authority; this is neither a pending source nor a tool result.
+#[cfg(target_os = "linux")]
+pub struct SelectedPairComptimeOwner<'a> {
+    lease: &'a SourceLease,
+    configuration_inputs: NodeId,
+    plan: super::RootedPairCallGraphComptimePlan,
+    execution_seal: wosy_project::packages::PreparedComptimeExecutionSeal,
+}
+
+#[cfg(target_os = "linux")]
+pub enum SelectedPairComptimePreparation<'a> {
+    Ready(SelectedPairComptimeOwner<'a>),
+    Refused(super::RootedClosedComptimeRefusal),
+}
+
+/// Validated ordinary LLVM from the exact local selected scope. The
+/// client still holds source/watch and configured artifact publication cuts.
+#[cfg(target_os = "linux")]
+pub struct SelectedPairComptimeEmission {
+    pub source_root: NodeId,
+    pub result_root: wosy_protocol::ComptimeResultRoot,
+    pub partition: wosy_compiler::LlvmPartition,
+}
+
+#[cfg(target_os = "linux")]
+impl SelectedPairComptimeOwner<'_> {
+    pub fn configuration_inputs(&self) -> NodeId { self.configuration_inputs }
+    pub fn execution_seal(&self) -> &wosy_project::packages::PreparedComptimeExecutionSeal { &self.execution_seal }
+    pub fn plan(&self) -> Option<&super::RootedPairCallGraphComptimePlan> {
+        self.lease.finish_current(|| &self.plan)
+    }
+
+    /// Use the same owned execution intake as a pending proposal. Do not
+    /// turn a committed source into a synthetic base/pending pair.
+    pub fn emit_owned_result(
+        &self, acknowledged_generation: i64,
+        executed: &wosy_project::packages::OwnedLocalComptimeExecution,
+    ) -> Result<Option<SelectedPairComptimeEmission>> {
+        let Some(plan) = self.plan() else { return Ok(None); };
+        let project = std::path::Path::new(&plan.evidence().site().source.project);
+        let decoded = super::source_proposal::decode_owned_pair_results(
+            plan, project, self.configuration_inputs, acknowledged_generation, &self.execution_seal, executed,
+        )?;
+        let output = plan.wasip1_output().ok_or("selected paired plan is not ordinary WASIp1")?;
+        let partition = output.emit_ordinary_startup(&decoded.values)
+            .map_err(|error| format!("ordinary comptime continuation rejected: {error:?}"))?;
+        Ok(self.lease.finish_current(|| SelectedPairComptimeEmission {
+            source_root: plan.source_root(), result_root: decoded.root, partition,
+        }))
+    }
+}
+
 pub enum BuildSourceOpening<'a> {
     ReplayRequired { root: NodeId },
     Opened { session: BuildDiagnosticSession<'a>, restored: Option<SourceReconciliation> },
@@ -235,6 +288,47 @@ impl BuildDiagnosticSession<'_> {
         &self, request: RootedClosedComptimeRequest,
     ) -> Result<RootedForwardedPairStartupComptimeProjection> {
         self.project_startup_comptime_using(request, SourceStore::project_forwarded_pair_startup_comptime_for_lease).await
+    }
+
+    /// Prepare the exact already-committed singleton, including first Build.
+    /// No synthetic predecessor, inherited tool result, or runtime execution.
+    #[cfg(target_os = "linux")]
+    pub async fn prepare_selected_pair_wasip1(
+        &self, request: RootedClosedComptimeRequest, max_stdout: usize,
+    ) -> Result<SelectedPairComptimePreparation<'_>> {
+        let answer = self.project_startup_comptime_using(request, move |store, lease, request| {
+            store.project_selected_pair_wasip1_for_lease(lease, request, max_stdout, false)
+        }).await?;
+        self.selected_pair_owner(answer)
+    }
+
+    /// Discover exactly one authored site in the authenticated selected
+    /// singleton, without interpreting source text in the CLI.
+    #[cfg(target_os = "linux")]
+    pub async fn prepare_unique_selected_pair_wasip1(
+        &self, profile: String, limits: BaseCstAdmissionLimits, output_bytes: usize, max_stdout: usize,
+    ) -> Result<SelectedPairComptimePreparation<'_>> {
+        let slot = self.worker.try_slot()?;
+        let lease = Arc::clone(&self.lease);
+        let answer = self.worker.spawn_reserved(slot, move |store| {
+            store.project_unique_selected_pair_for_lease(&lease, profile, limits, output_bytes, max_stdout)
+        }).await??;
+        self.selected_pair_owner(answer)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn selected_pair_owner(&self, answer: std::result::Result<(NodeId, super::RootedPairCallGraphComptimePlan),
+        super::RootedClosedComptimeRefusal>) -> Result<SelectedPairComptimePreparation<'_>> {
+        Ok(match answer {
+            Err(reason) => SelectedPairComptimePreparation::Refused(reason),
+            Ok((configuration_inputs, plan)) => {
+                self.lease.finish_current(|| ()).ok_or("selected comptime source lease expired")?;
+                SelectedPairComptimePreparation::Ready(SelectedPairComptimeOwner {
+                    lease: self.lease.as_ref(), configuration_inputs, plan,
+                    execution_seal: wosy_project::packages::PreparedComptimeExecutionSeal::fresh(),
+                })
+            }
+        })
     }
 
     async fn project_startup_comptime_using<T: Send + 'static>(

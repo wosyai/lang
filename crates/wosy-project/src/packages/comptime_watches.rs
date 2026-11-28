@@ -1,14 +1,15 @@
 use crate::{ContentRevision, ObservedClosedComptimeProfile, PackageRelativePath, ProjectConfiguration};
+use serde::{Deserialize, Serialize};
 use std::path::Path;
 use toml_edit::ImDocument;
 
-#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd)]
+#[derive(Clone, Copy, Debug, Eq, Ord, PartialEq, PartialOrd, Serialize, Deserialize)]
 pub enum WatchRoot {
     OwningPackage,
     ConsumingProject,
 }
 
-#[derive(Clone, Debug, Eq, PartialEq)]
+#[derive(Clone, Debug, Eq, PartialEq, Serialize, Deserialize)]
 pub struct WatchedComptimeFile {
     pub root: WatchRoot,
     pub path: PackageRelativePath,

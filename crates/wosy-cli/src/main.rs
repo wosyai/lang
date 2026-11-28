@@ -221,6 +221,14 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     )? {
         return Ok(());
     }
+    #[cfg(target_os = "linux")]
+    if ordinary_incremental::enabled() && artifact_profile.output == "wasm-wasip1"
+        && ordinary_incremental::try_selected_comptime(
+            &root, &target_name, profile, &paths, &configuration_identity, &artifact.artifact,
+        )?
+    {
+        return Ok(());
+    }
     let (llvm, source_observations) = compile_project(
         &root,
         &project,
@@ -255,6 +263,7 @@ fn finalize_ordinary_build(
         identity,
         executable,
         source_observations,
+        comptime: _,
     } = inputs.manifest;
     publish_artifact(&paths.output, executable, identity, source_observations)?;
     fs::remove_file(paths.pending_manifest).map_err(|error| error.to_string())?;
@@ -317,7 +326,7 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
     #[cfg(target_os = "linux")]
     let manifest_path = selected.as_ref().map_or(manifest_path.as_path(), |selected| selected.manifest_path());
     let runner = validate_run_manifest(
-        &manifest_path, &configuration, &configuration_identity, &target_name, profile, artifact, artifact_profile,
+        &root, &manifest_path, &configuration, &configuration_identity, &target_name, profile, artifact, artifact_profile,
     )?;
     invoke_direct_with_arguments(&root, &runner.command, &runner.args, &manifest_path, arguments)
 }
@@ -326,6 +335,7 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
 /// manifest or rewrite the path passed to the existing custom runner.
 /// This does not pin a mutable manifest across runner execution.
 fn validate_run_manifest<'a>(
+    _project: &std::path::Path,
     manifest_path: &std::path::Path,
     configuration: &'a ProjectConfiguration,
     configuration_identity: &str,
@@ -338,6 +348,17 @@ fn validate_run_manifest<'a>(
         .map_err(|error| format!("artifact manifest error: {error}"))?;
     if manifest.identity.configuration_identity != configuration_identity {
         return Err("artifact manifest is stale".to_owned());
+    }
+    if let Some(observation) = &manifest.comptime {
+        #[cfg(target_os = "linux")]
+        if !observation.matches_current(_project, target_name, profile) {
+            return Err("artifact comptime inputs are stale".to_owned());
+        }
+        #[cfg(not(target_os = "linux"))]
+        {
+            let _ = observation;
+            return Err("artifact comptime inputs are unavailable on this host".to_owned());
+        }
     }
     let current_observations = manifest
         .source_observations
