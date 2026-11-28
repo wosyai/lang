@@ -88,6 +88,8 @@ pub struct AcknowledgedOrdinaryBuilderInputs {
     partition: String,
     runtime: &'static str,
     executable_partition_digest: Option<NodeId>,
+    #[cfg(target_os = "linux")]
+    profile: String,
 }
 
 impl AcknowledgedOrdinaryBuilderInputs {
@@ -499,7 +501,54 @@ fn bind_builder_inputs(
         artifact, profile, observed.source, projection.digest.hex(), &paths.output)?;
     let executable_partition_digest = (projection.version == ORDINARY_EXECUTABLE_BUILDER_INPUT_VERSION).then_some(projection.digest);
     Ok(AcknowledgedOrdinaryBuilderInputs { project: observed.project, source, paths, inputs,
-        partition: projection.partition, runtime, executable_partition_digest })
+        partition: projection.partition, runtime, executable_partition_digest,
+        #[cfg(target_os = "linux")]
+        profile: projection.profile })
+}
+
+#[cfg(target_os = "linux")]
+impl SqliteSourceState {
+    /// Local storage completion only. The caller must already own a
+    /// verified controlled driver, output custody and workspace write
+    /// coordination. The receipt alone cannot grant any of those.
+    ///
+    /// The live reobservation checks current authored bytes/configuration;
+    /// the final SQLite reservation excludes a competing acknowledgement,
+    /// not an editor bypassing the caller's workspace coordination.
+    fn complete_controlled_generation_storage(
+        &mut self,
+        plan: AcknowledgedOrdinaryBuilderInputs,
+        stage: wosy_project::StagedArtifactGeneration,
+        timeout: std::time::Duration,
+        max_authored_source_bytes: usize,
+    ) -> Result<Option<PathBuf>> {
+        let Some(digest) = plan.executable_partition_digest else { return Ok(None); };
+        if plan.inputs.manifest.identity.output != "wasm-wasip1"
+            || stage.output_dir() != plan.paths.output {
+            return Ok(None);
+        }
+        let prepared = stage.prepare(&plan.inputs.manifest)?;
+        let deadline = llvm_deadline(&plan.profile, timeout)?;
+        let target = &plan.source.selection().target;
+        let Ok(live) = self.capture_live(target, &plan.profile, deadline, max_authored_source_bytes, true)? else {
+            return Ok(None);
+        };
+        if live.captured.selection() != plan.source.selection() || live.captured.generation() != plan.source.generation() {
+            return Ok(None);
+        }
+        let observed = live.builder.ok_or("verified live capture did not retain builder inputs")?;
+        let (_, artifact, profile, _) = observed.configuration.artifact_profile(target, &plan.profile)?;
+        let current = pending_builder_inputs(
+            &observed.configuration, observed.configuration_identity, target, &plan.profile,
+            artifact, profile, observed.source, digest.hex(), &plan.paths.output,
+        )?;
+        if current.manifest != plan.inputs.manifest || current.builder != plan.inputs.builder {
+            return Ok(None);
+        }
+        let Some(_held) = self.hold_publication_selection(&plan.source)? else { return Ok(None); };
+        require_diagnostic_time(deadline)?;
+        Ok(Some(prepared.publish()?))
+    }
 }
 
 async fn open_stream<Open, Opening, Stream>(
@@ -714,5 +763,108 @@ mod tests {
         assert!(capture.project_report(&mut local, report(wrong, range), budget()).is_err());
         assert!(capture.project_report(&mut local, report(source, ByteSpan::new(unicode + 1, unicode + 3)),
             budget()).is_err());
+    }
+}
+
+#[cfg(all(test, target_os = "linux"))]
+mod controlled_generation_storage_tests {
+    use super::*;
+    use crate::source_recovery::ClientSourceLimits;
+    use std::{fs, os::unix::fs::DirBuilderExt, path::Path, time::{Duration, SystemTime, UNIX_EPOCH}};
+    use wosy_project::{SelectedArtifactGeneration, StagedArtifactGeneration};
+
+    const TIME: Duration = Duration::from_secs(5);
+    const BYTES: usize = 1 << 20;
+    const CONFIG: &str = r#"
+[package]
+name = "app"
+default_target = "app"
+[comments]
+categories = []
+[builders.fixture]
+command = ["must-not-invoke"]
+toolchain_identity = "fixture-only"
+[runners.fixture]
+command = ["must-not-run"]
+[targets.app]
+root = "main.w"
+[targets.app.artifacts.main]
+artifact = "Main"
+[targets.app.artifacts.main.profiles.wasm]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "fixture"
+run_runner = "fixture"
+[targets.app.profiles.wasm]
+main_artifact = "main"
+"#;
+
+    struct Scratch(PathBuf);
+    impl Drop for Scratch {
+        fn drop(&mut self) { let _ = fs::remove_dir_all(&self.0); }
+    }
+
+    fn make_plan(
+        source: &mut SqliteSourceState, store: &Path,
+    ) -> (AcknowledgedOrdinaryBuilderInputs, StagedArtifactGeneration) {
+        let stage = StagedArtifactGeneration::create(store).unwrap();
+        let paths = BuilderInputPaths::new(stage.output_dir());
+        let LiveCapture { captured, builder } = source.capture_live("app", "wasm",
+            llvm_deadline("wasm", TIME).unwrap(), BYTES, true).unwrap().ok().unwrap();
+        let observed = builder.unwrap();
+        let (_, artifact, profile, _) = observed.configuration.artifact_profile("app", "wasm").unwrap();
+        // This creates only a disposable storage fixture, not a native plan
+        // authorization or a fixture driver that the product may execute.
+        let digest = NodeId([1; 32]);
+        let inputs = pending_builder_inputs(&observed.configuration, observed.configuration_identity, "app", "wasm",
+            artifact, profile, observed.source, digest.hex(), &paths.output).unwrap();
+        fs::write(&inputs.manifest.executable, b"storage-only fixture bytes").unwrap();
+        (AcknowledgedOrdinaryBuilderInputs {
+            source: captured.source, project: observed.project, paths, inputs,
+            partition: String::new(), runtime: "", executable_partition_digest: Some(digest), profile: "wasm".into(),
+        }, stage)
+    }
+
+    #[test]
+    fn only_current_observed_inputs_commit_and_old_reader_is_retained() {
+        let now = SystemTime::now().duration_since(UNIX_EPOCH).unwrap().as_nanos();
+        let scratch = Scratch(std::env::temp_dir().join(format!("wosy-complete-generation-{}-{now}", std::process::id())));
+        fs::DirBuilder::new().mode(0o700).create(&scratch.0).unwrap();
+        let store = scratch.0.join("controlled-fixture-store");
+        fs::DirBuilder::new().mode(0o700).create(&store).unwrap();
+        let config = scratch.0.join("wosy.toml");
+        fs::write(&config, CONFIG).unwrap();
+        let entry = scratch.0.join("main.w");
+        let first = "%%start\ni32 value = 42;\n%%end\n";
+        let changed = "%%start\ni32 value = 43;\n%%end\n";
+        fs::write(&entry, first).unwrap();
+        let mut source = SqliteSourceState::open(&scratch.0, ClientSourceLimits { nodes: 1000, encoded_bytes: BYTES }).unwrap();
+        let staged = source.stage("app").unwrap();
+        assert!(source.acknowledge("app", staged.pending.unwrap()).unwrap());
+        let (plan, candidate) = make_plan(&mut source, &store);
+        let prior = source.complete_controlled_generation_storage(plan, candidate, TIME, BYTES).unwrap().unwrap();
+        let reader = SelectedArtifactGeneration::open(&store).unwrap().unwrap();
+        assert_eq!(reader.manifest_path(), prior);
+
+        let (plan, candidate) = make_plan(&mut source, &store);
+        let refused = candidate.output_dir();
+        fs::write(&entry, changed).unwrap();
+        assert!(source.complete_controlled_generation_storage(plan, candidate, TIME, BYTES).unwrap().is_none());
+        assert!(!refused.exists());
+        assert_eq!(SelectedArtifactGeneration::open(&store).unwrap().unwrap().manifest_path(), prior);
+
+        fs::write(&entry, first).unwrap();
+        let (plan, candidate) = make_plan(&mut source, &store);
+        fs::write(&config, CONFIG.replace("fixture-only", "changed-toolchain")).unwrap();
+        assert!(source.complete_controlled_generation_storage(plan, candidate, TIME, BYTES).unwrap().is_none());
+        assert_eq!(SelectedArtifactGeneration::open(&store).unwrap().unwrap().manifest_path(), prior);
+
+        fs::write(&config, CONFIG).unwrap();
+        let (plan, candidate) = make_plan(&mut source, &store);
+        let next = source.complete_controlled_generation_storage(plan, candidate, TIME, BYTES).unwrap().unwrap();
+        assert_ne!(prior, next);
+        assert_eq!(SelectedArtifactGeneration::open(&store).unwrap().unwrap().manifest_path(), next);
+        assert_eq!(reader.manifest_path(), prior);
+        assert_eq!(fs::read(&reader.manifest().executable).unwrap(), b"storage-only fixture bytes");
     }
 }
