@@ -340,6 +340,24 @@ pub(super) fn qualified_store_reachable(project:&ScalarProject,calls:&ProjectCal
     false
 }
 
+#[cfg(test)]
+#[derive(Debug, PartialEq, Eq)]
+pub(super) struct ObservedExecutionSite {
+    pub(super) owner: SourceSpan,
+    pub(super) site: SourceSpan,
+    pub(super) incoming: Vec<SourceSpan>,
+}
+
+#[cfg(test)]
+thread_local! {
+    static EXECUTION_SITE: RefCell<Option<ObservedExecutionSite>> = const { RefCell::new(None) };
+}
+
+#[cfg(test)]
+pub(super) fn take_execution_site() -> Option<ObservedExecutionSite> {
+    EXECUTION_SITE.with(|boundary| boundary.borrow_mut().take())
+}
+
 #[derive(Default)]
 pub(super) struct Dispatch<'a> {
     declarations:HashMap<PreparedCallable,(&'a ScalarFunction,&'a FunctionCallSites,ScalarType)>,
@@ -433,6 +451,8 @@ pub(super) fn run<'a>(
     tasks.extend([Task::Finish(None,ret),Task::Block(body.structure.root,0,output)]);
     while let Some(task)=tasks.pop() {
         charge_call_work(&mut work,1)?;
+        #[cfg(test)]
+        let incoming = stack.iter().filter_map(|activation| activation.entered_at.clone()).collect::<Vec<_>>();
         let frame=stack.last_mut()?;
         let (function,body,_) = get_symbol(&mut dispatch.declarations,frame.target)?;
         let owner=&project.modules.get(frame.target.0)?.source;
@@ -445,7 +465,15 @@ pub(super) fn run<'a>(
         match task {
             Task::Block(block,index,output) => {
                 let region=st.blocks.get(block.0)?;
-                if region.unsafe_context { return None; }
+                if region.unsafe_context {
+                    #[cfg(test)]
+                    EXECUTION_SITE.with(|boundary| *boundary.borrow_mut() = Some(ObservedExecutionSite {
+                        owner: SourceSpan::new(owner.clone(), function.name_span),
+                        site: SourceSpan::new(owner.clone(), region.span),
+                        incoming,
+                    }));
+                    return None;
+                }
                 let Some(item)=region.items.get(index) else {
                     if !matches!(output,Output::Unit) { return None; }
                     values.push(ResultValue::Unit);
@@ -506,6 +534,12 @@ pub(super) fn run<'a>(
                 if value.ty()!=ty || frame.slots.insert(id,value).is_some() { return None; }
             }
             Task::Eval(at) => {
+                #[cfg(test)]
+                EXECUTION_SITE.with(|trace| *trace.borrow_mut() = Some(ObservedExecutionSite {
+                    owner: SourceSpan::new(owner.clone(), function.name_span),
+                    site: span(at).expect("prepared eval occurrence"),
+                    incoming,
+                }));
                 let ty=st.checked_types.expressions.get(&at)?;
                 if st.checker_contextual_occurrences.contains(&at) { return None; }
                 if let Some(value)=st.prepared_range_literals.get(&at) {

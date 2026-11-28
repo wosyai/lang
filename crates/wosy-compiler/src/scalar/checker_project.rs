@@ -26276,7 +26276,7 @@ unit(u8) parent = fn(a) {
     fn pinned_orbital_upload_reports_original_false_requirement_only_at_valid_cap() {
         use std::num::NonZeroUsize;
         use wosy_syntax::SourceSpan;
-        use super::stateful_provider::take_requirement_results as outcomes;
+        use super::stateful_provider::{take_requirement_results as outcomes, take_execution_site};
         let engine=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_ENGINE").unwrap()).unwrap();
         let packing=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_PACKING").unwrap()).unwrap();
         let fragment=|from:&str,until:&str| {
@@ -26333,6 +26333,7 @@ unit(u8) parent = fn(a) {
                 ScalarCheckerScope::MainFlowOnly,Vec::new(),
             ).unwrap();
             outcomes();
+            take_execution_site();
             let (failures,completion,trace,active)=prepare(&text).search_startup_authored_path(NonZeroUsize::MIN).unwrap();
             assert_eq!(outcomes(),[(authored.clone(),false)]);
             assert_eq!(completion,StartupAuthoredCompletion::LimitReached);
@@ -26344,9 +26345,21 @@ unit(u8) parent = fn(a) {
             assert_eq!(failure.stderr(),b"Orbital indexed actuator span");
             assert!(trace.call_paths().iter().flatten().any(|site| site==&upload_call));
             assert!(!trace.contains_return(&upload_call));
+            let stopped = take_execution_site().expect("false guard evaluated its prepared expression");
+            assert_eq!(stopped.owner.source, app);
 
             assert!(matches!(prepare(&passing).search_startup_authored_path(NonZeroUsize::MIN),Err(ProjectCheck::Unsupported)));
             assert_eq!(outcomes(),[(authored.clone(),true)]);
+            let refused = take_execution_site().expect("original transmit reaching exact prepared expression after the true guard");
+            let original = if refused.site.source == provider { &packing } else { &passing };
+            eprintln!("actual last owner {:?}, expression {:?}, path {:?}", refused.owner,
+                &original[refused.site.range.start as usize..refused.site.range.end as usize], refused.incoming);
+            assert_eq!(refused.owner.source, provider);
+            assert_eq!(&packing[refused.owner.range.start as usize..refused.owner.range.end as usize], "transmit");
+            let block = &packing[refused.site.range.start as usize..refused.site.range.end as usize];
+            assert!(block.contains("bridge.indexed"));
+            assert!(refused.incoming.iter().any(|site| site.source == app
+                && passing[site.range.start as usize..site.range.end as usize].starts_with("packing.transmit(")));
             assert!(matches!(prepare(&text).search_startup_authored_path(NonZeroUsize::new(2).unwrap()),Err(ProjectCheck::Unsupported)));
             assert!(matches!(prepare(&text).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
             assert!(matches!(prepare(&passing).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
