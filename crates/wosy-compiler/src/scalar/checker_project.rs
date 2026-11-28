@@ -20948,7 +20948,7 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 let binding=module.items.iter().find_map(|item| match item {
                     ScalarItem::Binding(binding) if binding.name==wanted=>Some(binding), _=>None,
                 }).unwrap();
-                wosy_syntax::SourceSpan::new(source.clone(),binding.receivers[0].span)
+                wosy_syntax::SourceSpan::new(source.clone(),binding.name_span)
             };
             let edit=(0,module.items.iter().position(|item|matches!(item,ScalarItem::Function(f) if f.name=="store_exterior_edit")).unwrap());
             let nominal=module.structs.iter().find(|item|item.name=="TerrainEdit").unwrap();
