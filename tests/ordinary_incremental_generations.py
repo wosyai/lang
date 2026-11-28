@@ -199,6 +199,8 @@ def verify_lifecycle(path):
     changed = original.replace(b"calls + 1", b"calls + 2")
     assert changed != original
     dependency.write_bytes(changed)
+    stale, _ = command(path, "run", status=1)
+    assert "artifact manifest is stale" in stale, stale
     expect_cold(path)
     b = generation(path)
     assert b[0] != a[0] and b[1] > a[1]
@@ -222,7 +224,26 @@ def verify_lifecycle(path):
     command(path, "run")
     expect_warm(path)
     assert generation(path) == c
-    print(json.dumps({"package_lifecycle": "pass", "generations": [a[1], b[1], c[1]],
+    # Changing the resolved dependency's package path changes identity
+    # even when the imported bytes are the same.
+    manifest = path / "wosy.toml"
+    original_manifest = manifest.read_text()
+    prior_identity = current(path)["identity"]["configuration_identity"]
+    (path / "dependency").rename(path / "dependency-moved")
+    manifest.write_text(original_manifest.replace('path = "dependency"', 'path = "dependency-moved"'))
+    expect_cold(path)
+    d = generation(path)
+    assert d[0] != c[0] and d[1] > c[1]
+    assert current(path)["identity"]["configuration_identity"] != prior_identity
+    command(path, "run")
+    (path / "dependency-moved").rename(path / "dependency")
+    manifest.write_text(original_manifest)
+    expect_cold(path)
+    e = generation(path)
+    assert e[0] == c[0] and e[1] > d[1]
+    assert current(path)["identity"]["configuration_identity"] == prior_identity
+    command(path, "run")
+    print(json.dumps({"package_lifecycle": "pass", "generations": [a[1], b[1], c[1], d[1], e[1]],
         "pinned_runner": "pass", "partial_output_rollback": "pass", "busy_custody_fallback": "pass",
         "recovery_fresh_child": "pass", "builder_invocations_completed": len((path / "builder-ms").read_text().splitlines())}))
 
