@@ -2,7 +2,7 @@
 use super::*;
 use std::{num::NonZeroUsize, os::unix::fs::{DirBuilderExt, PermissionsExt}, path::Path, sync::Arc, time::{Duration, Instant}};
 use wosy_cli::{
-    local_build_daemon::{compare_local_build, establish_local_build_source},
+    local_build_daemon::{compare_owned_child, establish_local_build_source, stage_local_build_source},
     source_recovery::ClientSourceLimits,
     source_state::{AcknowledgedSourceGeneration, SqliteSourceState},
 };
@@ -278,36 +278,30 @@ fn selected_source(
     let source_store = owner.join("incremental-daemon");
     fs::create_dir_all(&owner)?;
     private_directory(&source_store)?;
-    let store = session.block_on(async { SourceStore::open(&source_store, 8 << 20) }).map(Arc::new)?;
-    let comparison = session.block_on(async {
+    session.block_on(async {
         let mut state = SqliteSourceState::open(root, ClientSourceLimits { nodes: usize::MAX, encoded_bytes: usize::MAX })?;
+        let store = SourceStore::open(&source_store, 8 << 20)?;
         let Some(pending) = pending else {
             // The old acknowledgement is sufficient to look for a proof,
             // never to accept current files. The exact under-writer check
             // below the lookup must still match the live source and config.
-            let Some(source) = state.capture_acknowledged_source(target)? else { return Ok(None); };
-            if store.snapshot(source.selection().root)?.is_none() { return Ok(None); }
-            return Ok(Some((state, source)));
+            let answer = (|| {
+                let Some(source) = state.capture_acknowledged_source(target)? else { return Ok(None); };
+                if store.snapshot(source.selection().root)?.is_none() { return Ok(None); }
+                Ok::<_, Box<dyn std::error::Error + Send + Sync>>(Some((state, source)))
+            })();
+            store.close().await?;
+            return answer;
         };
-        if !establish_local_build_source(&mut state, &store, target).await? { return Ok(None); }
-        let limits = BaseCstAdmissionLimits {
-            records: usize::MAX, record_bytes: usize::MAX, graph_edges: usize::MAX,
-            expanded_record_bytes: usize::MAX, cst_occurrences: usize::MAX, cst_depth: usize::MAX,
-            authored_bytes: usize::MAX,
-        };
-        let source = compare_local_build(&mut state, Arc::clone(&store), target, profile, pending,
-            limits, wosy_protocol::MAX_SESSION_FRAME_BYTES, Duration::from_secs(120)).await?;
-        let Some(source) = source else { return Ok(None); };
-        let Some(view) = store.snapshot(source.selection().root)? else { return Ok(None); };
-        if !store.ordinary_view_has_no_comptime(&view)? { return Ok(None); }
+        let ready = stage_local_build_source(&mut state, &store, target).await;
+        // SurrealKV's owner moves to the private child serially. Nothing
+        // in the parent keeps this store open across process activation.
+        store.close().await?;
+        let Some(staged) = ready? else { return Ok(None); };
+        let Some((source, replayed)) = compare_owned_child(&mut state, target, profile, pending).await? else { return Ok(None); };
+        if source.selection() != staged.selection() || source.generation() != staged.generation() { return Ok(None); }
+        eprintln!("incremental compiler LLVM compared over local Unix socket for {target}:{profile} in an owned compiler process{}",
+            if replayed { " after source replay" } else { "" });
         Ok(Some((state, source)))
-    });
-    let comparison: Result<_, Box<dyn std::error::Error + Send + Sync>> = comparison;
-    if let Some(store) = Arc::into_inner(store) {
-        session.block_on(store.close())?;
-    }
-    if pending.is_some() && matches!(&comparison, Ok(Some(_))) {
-        eprintln!("incremental compiler LLVM compared over local Unix socket for {target}:{profile}");
-    }
-    comparison
+    })
 }

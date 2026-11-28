@@ -1838,6 +1838,7 @@ dependencies = [
  "codespan-reporting",
  "rowan",
  "rusqlite",
+ "rustix",
  "serde",
  "serde_json",
  "tokio",

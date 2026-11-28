@@ -88,6 +88,10 @@ enum DepCommand {
 }
 
 fn main() -> ExitCode {
+    #[cfg(target_os = "linux")]
+    if let Some(exit) = wosy_cli::local_build_daemon::enter_if_requested() {
+        return exit;
+    }
     let arguments = Arguments::parse();
     match arguments.command {
         Command::Init => match env::current_dir()

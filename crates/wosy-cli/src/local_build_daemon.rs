@@ -1,54 +1,64 @@
-//! An ordinary, in-process daemon peer. The Build comparison uses an
-//! anonymous Unix socket, with no endpoint path, listener or external
-//! producer. Only our linked worker receives the other stream end.
+//! Local daemon coordination. Ordinary opt-in Build owns a private
+//! compiler child; private builder-plan inspection stays in process.
 
-use crate::source_state::{AuthorizedOrdinaryBuilderPeer, ReplaySource, SqliteSourceState};
-#[cfg(target_os = "linux")]
-use crate::{artifact_inputs::PendingBuilderInputs, source_state::AcknowledgedSourceGeneration};
+use crate::source_state::{AcknowledgedSourceGeneration, AuthorizedOrdinaryBuilderPeer, ReplaySource, SqliteSourceState};
 use std::{fs::File, num::NonZeroUsize, sync::Arc, time::Duration};
+#[cfg(all(test, target_os = "linux"))]
+use {crate::{artifact_inputs::PendingBuilderInputs, source_state::SourceReplay},
+    tokio::net::UnixStream, wosy_daemon::BuildSessionEnd, wosy_protocol::BuildSourceSelection};
 #[cfg(target_os = "linux")]
-use {crate::source_state::SourceReplay, tokio::net::UnixStream, wosy_daemon::BuildSessionEnd,
-    wosy_protocol::BuildSourceSelection};
+mod owned_child;
+#[cfg(target_os = "linux")]
+pub use owned_child::{compare_owned_child, enter_if_requested};
 use tokio::{task::JoinSet, time::{timeout_at, Instant}};
 use wosy_daemon::{BaseCstAdmissionLimits, SourceStorageWorker, SourceStore};
 
 type Result<T> = std::result::Result<T, Box<dyn std::error::Error + Send + Sync>>;
 
-/// Acknowledge only a committed daemon source root. A pending client
-/// proposal left by an interrupted build is replayable, not a trusted result.
-pub async fn establish_local_build_source(
+/// Acknowledge a new client cut only after its delta commits. For an
+/// already acknowledged cut, retaining the graph is only an observation:
+/// the scoped child can challenge and replay it on a fresh connection.
+pub async fn stage_local_build_source(
     source: &mut SqliteSourceState,
     store: &SourceStore,
     target: &str,
-) -> Result<bool> {
+) -> Result<Option<AcknowledgedSourceGeneration>> {
     if let Some(pending) = source.replay(target, ReplaySource::Pending)? {
         let attempt = pending.attempt.ok_or("pending source has no attempt")?;
         store.publish(pending.source.root, &pending.source.delta).await?;
         if !source.acknowledge(target, attempt)? {
-            return Ok(false);
+            return Ok(None);
         }
     }
     let staged = source.stage(target)?;
     if let Some(attempt) = staged.pending {
         let Some(pending) = source.replay(target, ReplaySource::Pending)? else {
-            return Ok(false);
+            return Ok(None);
         };
         if pending.attempt != Some(attempt) {
-            return Ok(false);
+            return Ok(None);
         }
         store.publish(pending.source.root, &pending.source.delta).await?;
         if !source.acknowledge(target, attempt)? {
-            return Ok(false);
+            return Ok(None);
         }
     }
 
-    let Some(selected) = source.capture_acknowledged_source(target)? else {
+    Ok(source.capture_acknowledged_source(target)?
+        .filter(|selected| selected.selection().root == staged.root))
+}
+
+/// Local callers outside the child comparison need the graph present in
+/// the same SourceStore in which they will acquire their lease.
+pub async fn establish_local_build_source(
+    source: &mut SqliteSourceState,
+    store: &SourceStore,
+    target: &str,
+) -> Result<bool> {
+    let Some(selected) = stage_local_build_source(source, store, target).await? else {
         return Ok(false);
     };
     let selection = selected.selection();
-    if selection.root != staged.root {
-        return Ok(false);
-    }
     if store.snapshot(selection.root)?.is_none() {
         let Some(replay) = source.replay_acknowledged_at(selection, Some(selected.generation()))? else {
             return Ok(false);
@@ -63,46 +73,7 @@ pub async fn establish_local_build_source(
         && store.snapshot(selection.root)?.is_some())
 }
 
-#[cfg(target_os = "linux")]
-pub async fn compare_local_build(
-    source: &mut SqliteSourceState,
-    store: Arc<SourceStore>,
-    target: &str,
-    profile: &str,
-    ordinary: &PendingBuilderInputs,
-    limits: BaseCstAdmissionLimits,
-    max_partition_bytes: usize,
-    timeout: Duration,
-) -> Result<Option<AcknowledgedSourceGeneration>> {
-    let deadline = Instant::now().checked_add(timeout).ok_or("ordinary comparison deadline overflow")?;
-    timeout_at(deadline, async {
-        let expected = AuthorizedOrdinaryBuilderPeer::from_open_executable(open_running_image()?)?;
-        let one = NonZeroUsize::MIN;
-        let worker = Arc::new(SourceStorageWorker::new(store, tokio::runtime::Handle::current(), one, one, one)?);
-        // A dropped comparison (including timeout) aborts all framed sessions.
-        let mut sessions = JoinSet::new();
-        let answer = source.compare_selected_ordinary_llvm(
-            target, profile, deadline.saturating_duration_since(Instant::now()),
-            limits.authored_bytes, max_partition_bytes, &expected, ordinary,
-            |selection, replay| std::future::ready(open_scoped_session(
-                &worker, &mut sessions, selection, replay, profile, limits, max_partition_bytes, deadline,
-            )),
-        ).await;
-        if answer.is_err() {
-            sessions.shutdown().await;
-            return answer;
-        }
-        while let Some(result) = sessions.join_next().await {
-            if let Err(error) = result.map_err(Into::into).and_then(|session| session) {
-                sessions.shutdown().await;
-                return Err(error);
-            }
-        }
-        answer
-    }).await?
-}
-
-#[cfg(target_os = "linux")]
+#[cfg(all(test, target_os = "linux"))]
 fn open_scoped_session(
     worker: &Arc<SourceStorageWorker>, sessions: &mut JoinSet<Result<BuildSessionEnd>>,
     selection: BuildSourceSelection, replay: Option<SourceReplay>, profile: &str,
