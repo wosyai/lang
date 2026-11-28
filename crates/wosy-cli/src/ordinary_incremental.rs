@@ -71,7 +71,10 @@ fn compiler_partition_key(
     source: &AcknowledgedSourceGeneration, profile: &str, configuration: &str,
 ) -> std::io::Result<blake3::Hash> {
     let image = wosy_protocol::compiler_image_digest(fs::File::open("/proc/self/exe")?)?;
-    let mut key = blake3::Hasher::new_derive_key("Wosy ordinary authored compiler result v1");
+    // Only cold builds with a verified all-root absence of comptime can
+    // seed this domain. Warm publication may carry that proof forward for
+    // precisely the same rooted source, compiler and configuration.
+    let mut key = blake3::Hasher::new_derive_key("Wosy ordinary authored no-comptime compiler result v2");
     for component in [
         source.selection().project.as_bytes(), source.selection().target.as_bytes(),
         &source.selection().root.0, profile.as_bytes(), configuration.as_bytes(), &image.0,
@@ -91,7 +94,6 @@ pub(super) fn try_retained_partition(
         let Some(previous) = select_for_run(&paths.output.join("artifact-manifest.json"))? else { return Ok(None); };
         let manifest = previous.manifest();
         if manifest.identity.configuration_identity != config_identity { return Ok(None); }
-        validate_current_generation(root, target, profile, previous.manifest_path())?;
         let Some((state, source)) = selected_source(root, target, profile, None)? else { return Ok(None); };
         let key = compiler_partition_key(&source, profile, config_identity)?;
         let Some(bytes) = previous.retained_compiler_partition(&key)? else { return Ok(None); };
@@ -166,14 +168,15 @@ fn selected_source(
     let store = session.block_on(async { SourceStore::open(&source_store, 8 << 20) }).map(Arc::new)?;
     let comparison = session.block_on(async {
         let mut state = SqliteSourceState::open(root, ClientSourceLimits { nodes: usize::MAX, encoded_bytes: usize::MAX })?;
-        if !establish_local_build_source(&mut state, &store, target).await? { return Ok(None); }
-        if pending.is_none() {
+        let Some(pending) = pending else {
+            // The old acknowledgement is sufficient to look for a proof,
+            // never to accept current files. The exact under-writer check
+            // below the lookup must still match the live source and config.
             let Some(source) = state.capture_acknowledged_source(target)? else { return Ok(None); };
-            let Some(view) = store.snapshot(source.selection().root)? else { return Ok(None); };
-            if !store.ordinary_view_has_no_comptime(&view)? { return Ok(None); }
+            if store.snapshot(source.selection().root)?.is_none() { return Ok(None); }
             return Ok(Some((state, source)));
-        }
-        let pending = pending.expect("cold comparison includes ordinary inputs");
+        };
+        if !establish_local_build_source(&mut state, &store, target).await? { return Ok(None); }
         let limits = BaseCstAdmissionLimits {
             records: usize::MAX, record_bytes: usize::MAX, graph_edges: usize::MAX,
             expanded_record_bytes: usize::MAX, cst_occurrences: usize::MAX, cst_depth: usize::MAX,
