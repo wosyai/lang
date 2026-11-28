@@ -26343,6 +26343,108 @@ unit(u8) parent = fn(a) {
 
     #[cfg(feature = "internal-checker")]
     #[test]
+    #[ignore = "requires independently pinned original Orbital engine and indexed-pack provider"]
+    fn pinned_orbital_publish_completes_false_and_empty_mask_routes() {
+        use super::super::checker_flow::ProjectedStorage;
+        use super::ordered_float_prefix::ObservedStep;
+        let engine=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_ENGINE").unwrap()).unwrap();
+        let packing=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_PACKING").unwrap()).unwrap();
+        let fragment=|from:&str,until:&str| {
+            let start=engine.find(from).unwrap();
+            let end=start+engine[start..].find(until).unwrap();
+            &engine[start..end]
+        };
+        let prepare=fragment("bool(i32,i32) prepare_actuators=", "unit(i32,i32) upload_actuators=");
+        let pack=fragment("unit(i32,i32) pack_prepared=", "f32 r =");
+        let mesh=fragment("f32[8] vertex =", "f32[38] state =");
+        let range=fragment("unit(i32,i32) index_range=", "unit(i32,i32) static_partition=");
+        let moving=fragment("unit(i32) moving_partition=", "i32(i32,i32) pack_moving=");
+        let publish=fragment("unit(i32,i32) upload_actuators=", "f32 pilot_x=");
+        let namespace=r#"packing=namespace demo "indexed-pack.w";"#;
+        // Closed companion geometry only. False and out-of-mask paths
+        // exercise the original publish/prepare/pack/upload dispatcher.
+        let text=format!(r#"%%start
+            {namespace}
+            {mesh}
+            i32 count=27; i32 fallback=0; i32 room_partial=8;
+            i32[5] motion_first=[4098,0,0,0,0];
+            i32[5] motion_size=[3,0,0,0,0];
+            i32[5] motion_base=[37,0,0,0,0];
+            i32[5] motion_unique=[0,0,0,0,0];
+            unit(i32) emit_actuator=fn(id){{count=count+4+id;}};
+            unit() eva_room=fn{{fallback=fallback+1;count=99;}};
+            {range}
+            {moving}
+            {pack}
+            {prepare}
+            {publish}
+        %%end"#);
+        let app=source("src/main.w","pinned-orbital-publish-fallback-and-empty");
+        let provider=source("src/indexed-pack.w","pinned-orbital-publish-original-indexed-pack");
+        let ns_at=text.find(namespace).unwrap() as u32;
+        let call_at=|needle:&str| {
+            let at=text.find(needle).unwrap() as u32;
+            wosy_syntax::SourceSpan::new(app.clone(),ByteSpan::new(at,at+needle.len() as u32))
+        };
+        let start=call_at("packing.start()");
+        let prepare_at=call_at("prepare_actuators(mask,0)");
+        let pack_at=call_at("pack_prepared(mask,0)");
+        let upload_at=call_at("upload_actuators(mask,0)");
+        let fallback_at=call_at("eva_room()");
+        let i32_value=|n:i32| ObservedExactValue::Integer(ScalarType::I32,n.into());
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let prepared=prepare_checker_project(vec![(declarations(&app,&text),vec![ScalarNamespaceBinding {
+                    binding:"packing".into(),target:provider.clone(),span:ByteSpan::new(ns_at,ns_at+namespace.len() as u32),
+                }]),(declarations(&provider,&packing),Vec::new())],vec![app.clone(),provider.clone()],
+                ScalarPreparationInputs {target_layout}).unwrap();
+            let (project,calls)=prepared.parts();
+            let app_id=project.modules.iter().position(|m|m.source==app).unwrap();
+            let provider_id=project.modules.iter().position(|m|m.source==provider).unwrap();
+            let mut visits=vec![InitializationVisit::Completed;project.modules.len()];
+            visits[app_id]=InitializationVisit::Started;
+            let target=(app_id,project.modules[app_id].items.iter().position(|item|
+                matches!(item,ScalarItem::Function(f) if f.name=="publish_actuators")).unwrap());
+            let binding=|module:usize,name:&str| project.modules[module].items.iter().find_map(|item|match item {
+                ScalarItem::Binding(b) if b.name==name=>Some(wosy_syntax::SourceSpan::new(project.modules[module].source.clone(),b.name_span)),
+                _=>None,
+            }).unwrap();
+            for mask in [1,32] {
+                let mut state=ProjectedStorage::default();
+                for (name,n) in [("count",27),("fallback",0),("room_partial",8)] {
+                    state.observe_scalar(binding(app_id,name),&ScalarType::I32,&n.into());
+                }
+                let failed=binding(provider_id,"failed");
+                state.observe_boolean(failed.clone(),true);
+                for (name,values) in [("motion_first",[4098,0,0,0,0]),("motion_size",[3,0,0,0,0])] {
+                    let marker=binding(app_id,name);
+                    let ty=ScalarType::Array {element:Box::new(ScalarType::I32),length:5,
+                        length_span:marker.range,span:marker.range};
+                    state.observe_array(marker,&ty,values.map(BigInt::from).iter());
+                }
+                let mut dispatch=stateful_provider::Dispatch::default();
+                let (result,history,_,selection)=stateful_provider::run(project,calls,target,vec![i32_value(mask)],
+                    &mut state,true,&mut dispatch,&HashMap::new(),&visits,false,&std::cell::Cell::new(false),
+                    |state,cell,ty| {
+                        if *ty!=ScalarType::I32 {return None;}
+                        Some((i32_value(state.observed_flat_i32(cell)?),1))
+                    },|_,_,_|None).expect("original provider completes a path with no selected upload or opaque effect");
+                assert!(result.is_none() && selection.is_none() && dispatch.take_stop().is_none());
+                let history=history.unwrap();
+                let calls=history.root.iter().filter_map(|step| match step {
+                    ObservedStep::Call {site,..}=>Some(site), _=>None,
+                }).collect::<Vec<_>>();
+                if mask==1 { assert_eq!(calls,[&prepare_at,&fallback_at]); }
+                else { assert_eq!(calls,[&prepare_at,&start,&pack_at,&upload_at]); }
+                assert_eq!(state.observed_atom(&binding(app_id,"count")),Some(i32_value(27)));
+                assert_eq!(state.observed_atom(&binding(app_id,"fallback")),Some(i32_value(i32::from(mask==1))));
+                assert_eq!(state.observed_atom(&binding(app_id,"room_partial")),Some(i32_value(if mask==1 {8}else{0})));
+                assert_eq!(state.observed_atom(&failed),Some(ObservedExactValue::Boolean(mask==1)));
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
     #[ignore = "requires independently pinned original Orbital engine"]
     fn pinned_orbital_prepare_actuator_preserves_ranked_scalar_return_and_local_assignment() {
         use super::super::checker_flow::ProjectedStorage;
