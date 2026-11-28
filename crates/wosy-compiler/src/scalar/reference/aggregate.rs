@@ -108,7 +108,6 @@ struct CertifiedInputFork {
     parent: Option<(usize, usize)>,
 }
 
-pub(super) const MAX_LOCAL_CHOICE_LEAVES: usize = 8;
 
 struct ConditionalInputCertificate {
     paths: Vec<ConditionalPath>,
@@ -4008,7 +4007,7 @@ impl Body<'_> {
         mut exact_relay: impl FnMut(CfgPointId) -> Option<usize>,
     ) -> Option<LocalReceiptChoice> {
         let facts = self.facts?;
-        if !self.is_monomorphic || !(2..=MAX_LOCAL_CHOICE_LEAVES).contains(&facts.calls.len()) { return None; }
+        if !self.is_monomorphic || facts.calls.len() < 2 { return None; }
         let outputs = &self.sites.boundary.root_outputs;
         let mixed = self.mixed_result_lanes();
         let owner_lane = mixed.map_or(0, |lanes| lanes.owner);
@@ -4692,8 +4691,17 @@ impl Body<'_> {
         let points = &self.cfg.points;
         let root = points.first()?.scope;
         let next = |id| points.get(linear_successor(points, id)?.0);
-        let find_region = |expression| facts.conditional_input_regions.values()
-            .find(|region| region.expression == expression);
+        // Index exact typed occurrences once. Multiple graph rows for
+        // the same occurrence do not authorize selecting one arbitrarily.
+        let mut regions = HashMap::new();
+        for region in facts.conditional_input_regions.values() {
+            regions.entry(region.expression).and_modify(|row| *row = None).or_insert(Some(region));
+        }
+        let mut calls = HashMap::new();
+        for (&point, &occurrence) in &facts.calls {
+            calls.entry(occurrence).and_modify(|row| *row = None).or_insert(Some(point));
+        }
+        let find_region = |expression| regions.get(&expression).copied().flatten();
         let typed_arms = |expression| match self.sites.conditionals.get(&expression)? {
             ConditionalRegion::Value { then_block, else_block, .. } => Some([*then_block, *else_block]),
             _ => None,
@@ -4702,8 +4710,8 @@ impl Body<'_> {
         let mut seen = HashSet::new();
         let mut leaves = BTreeSet::new();
         while let Some((expression, scope)) = pending.pop() {
-            // In a full binary tree of at most N leaves there are fewer than N forks.
-            if seen.len() >= MAX_LOCAL_CHOICE_LEAVES - 1 || !seen.insert(expression) {
+            // Repeated occurrences still fail closure; tree size does not.
+            if !seen.insert(expression) {
                 return None;
             }
             let region = independent.or_else(|| find_region(expression).copied())?;
@@ -4720,7 +4728,8 @@ impl Body<'_> {
                     || terminal.scope != entry.scope || entry.scope == scope
                     || !matches!(terminal.kind, CfgPointKind::ScopeExit) || next(terminal.id)?.id != join.id
                 { return None; }
-                if let Some((&id, _)) = facts.calls.iter().find(|(_, ordinal)| **ordinal == output.expression) {
+                if let Some(reaching_call) = calls.get(&output.expression) {
+                    let id = (*reaching_call)?;
                     if points.get(id.0)?.scope != entry.scope || next(id)?.id != terminal.id || !leaves.insert(id) {
                         return None;
                     }
@@ -11800,6 +11809,102 @@ mod tests {
         assert!(!could_call_fresh_recursive_array(Some(&row(ScalarType::U16, 3, ScalarType::U64, other_site)), &candidates));
         assert!(!could_call_fresh_recursive_array(Some(&row(ScalarType::U8, 2, ScalarType::U64, other_site)), &candidates));
         assert!(!could_call_fresh_recursive_array(Some(&row(ScalarType::U8, 3, ScalarType::Bool, other_site)), &candidates));
+    }
+
+    #[test]
+    fn local_choice_source_covers_every_exact_prepared_leaf_without_a_numeric_cap() {
+        fn choice_source(start: usize, end: usize, foreign: Option<usize>) -> String {
+            if start + 1 == end {
+                return if foreign == Some(start) { "control".to_owned() }
+                    else { format!("make({start})") };
+            }
+            // Vary the number of leaves without making fixture depth itself
+            // the stressor. Every branch and leaf still has its own CFG row.
+            let midpoint = (start + end) / 2;
+            format!("if (key < {midpoint}) {{ {} }} else {{ {} }}",
+                choice_source(start, midpoint, foreign), choice_source(midpoint, end, foreign))
+        }
+        const SIZES: [(usize, bool); 5] = [(2, false), (8, false), (9, false), (33, false), (9, true)];
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            for (leaf_count, unowned_leaf) in SIZES {
+                for returns in [false, true] {
+                    let choice = choice_source(0, leaf_count, unowned_leaf.then_some(leaf_count - 1));
+                    let extra_parameter = if unowned_leaf { ", Parcel" } else { "" };
+                    let extra_binding = if unowned_leaf { ", control" } else { "" };
+                    let output = if returns { "Parcel" } else { "u64" };
+                    let use_choice = if returns { "Parcel forwarded = relay(selected); forwarded" }
+                        else { "selected.stamp" };
+                    let text = format!("%%start
+struct Parcel {{ u64 stamp; }}
+Parcel(u64) make = fn(stamp) {{
+    Parcel parcel = {{ .stamp = stamp; }};
+    parcel
+}};
+Parcel(Parcel) relay = fn(input) {{ input }};
+{output}(u64{extra_parameter}) inspect = fn(key{extra_binding}) {{
+    Parcel selected = {choice};
+    {use_choice}
+}};
+%%end");
+                    let source = SourceIdentity::new("project".into(), "workbench".into(), "src/local_choice.w".into(), "r1".into());
+                    let parsed = crate::parse_source(source.clone(), text, &[]);
+                    assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+                    let prepared = prepare_scalar_project(
+                        vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                        vec![source.clone()], ScalarPreparationInputs { target_layout },
+                    ).unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+                    let module = &prepared.project().modules[0];
+                    let analyze = |name| {
+                        let (item, function) = module.items.iter().enumerate().find_map(|(item, value)| {
+                            match value {
+                                ScalarItem::Function(function) if function.name == name => Some((item, function)),
+                                _ => None,
+                            }
+                        }).expect("exact named fixture function");
+                        let sites = prepared.function_calls(0, item);
+                        let mut errors = Vec::new();
+                        let result = derive_function_reference_result(
+                            &source, function, &HashSet::new(), sites, &module.structs, &module.enums,
+                            None, ReferenceCapture { call_points: true, ..Default::default() }, &mut errors,
+                        );
+                        assert!(errors.is_empty(), "{errors:?}");
+                        (function, sites, result)
+                    };
+                    let (relay, relay_sites, relay_result) = analyze("relay");
+                    let relay_body = Body { facts: Some(&relay_result.aggregate), cfg: &relay_result.cfg,
+                        sites: relay_sites, source: &source, is_monomorphic: true, supports_input_result: false };
+                    let slot = relay_body.exact_identity_relay_slot().expect("exact identity relay");
+                    let (_, sites, mut result) = analyze("inspect");
+                    let resolved_relay = |point: CfgPointId| match &result.cfg.points.get(point.0)?.kind {
+                        CfgPointKind::Call { target: ResolvedCallTarget::ModuleCallable {
+                            source: actual, declaration_span, concrete: ConcreteCallSelection::Declaration,
+                        }, .. } if *actual == source && *declaration_span == relay.name_span => Some(slot),
+                        _ => None,
+                    };
+                    let body = Body { facts: Some(&result.aggregate), cfg: &result.cfg, sites, source: &source,
+                        is_monomorphic: true, supports_input_result: false };
+                    let choice = body.local_receipt_choice(resolved_relay);
+                    assert_eq!(choice.is_some(), !unowned_leaf,
+                        "layout={target_layout:?}, leaves={leaf_count}, returns={returns}");
+                    if let Some(choice) = choice {
+                        assert_eq!(choice.leaves.len(), leaf_count);
+                        assert_eq!(choice.leaves, result.aggregate.calls.keys().copied()
+                            .filter(|&point| resolved_relay(point).is_none()).collect());
+                        assert_eq!(choice.recommits.len(), usize::from(returns));
+                        assert_eq!(matches!(choice.use_site, LocalChoiceUse::Return { .. }), returns);
+                        assert_eq!(matches!(choice.use_site, LocalChoiceUse::Observe(_)), !returns);
+                        let [first, second, ..] = choice.leaves.iter().copied().collect::<Vec<_>>()[..] else { unreachable!() };
+                        let duplicate = result.aggregate.calls[&first];
+                        result.aggregate.calls.insert(second, duplicate);
+                        let ambiguous = Body { facts: Some(&result.aggregate), cfg: &result.cfg, sites, source: &source,
+                            is_monomorphic: true, supports_input_result: false };
+                        let root_type = &sites.structure.checked_types.expressions[&choice.conditional];
+                        assert!(ambiguous.local_choice_leaves(choice.conditional, root_type, None).is_none(),
+                            "same typed call occurrence at two points cannot be credited");
+                    }
+                }
+            }
+        }
     }
 
     #[test]
