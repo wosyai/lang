@@ -24,7 +24,7 @@ pub use provision::{ClosedComptimeModuleObservation, ProvisionedClosedComptime,
 #[cfg(target_os = "linux")]
 mod wasip1_pair;
 #[cfg(target_os = "linux")]
-pub(crate) use wasip1_pair::execute_selected_closed_wasip1;
+pub(crate) use wasip1_pair::{execute_selected_closed_wasip1, execute_selected_concrete_wasip1};
 #[cfg(target_os = "linux")]
 pub use wasip1_pair::{PendingPairWasip1Occurrence, PendingPairWasip1Readback, PendingPairWasip1ReadbackError,
     StagedPendingPairWasip1, StagedPendingPairWasip1Evaluator, StagedWasip1ToolPair};

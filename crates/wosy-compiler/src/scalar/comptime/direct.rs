@@ -19,7 +19,10 @@ use rowan::{ast::SyntaxNodePtr, GreenNode};
 use wosy_syntax::{ByteSpan, CanonicalCstRoot, ComptimeCst, CstNode, FreshParseResult, SourceSpan, SyntaxKind, WosyLanguage};
 
 
-#[derive(Clone, Copy, Debug, PartialEq, Eq)]
+mod exported;
+pub use exported::{prepare_exported_pair_wasip1, ExportedPairWasip1};
+
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash)]
 pub enum DirectComptimeArgument {
     I32(i32),
     U32(u32),
@@ -749,17 +752,16 @@ fn emit_startup_plan<const ARITY: usize>(
     let mut plan = DirectStartupComptimePlan {
         calls: Vec::with_capacity(calls.len()), evaluators: Vec::new(),
     };
-    let mut values = Vec::new();
+    let mut values = std::collections::HashMap::new();
     for facts in calls {
         // Function, exact reads and layout are fixed in this analysis.
         let tuple = facts.tuple();
-        let evaluator = match values.iter().position(|value| *value == tuple) {
-            Some(index) => index,
-            None => {
+        let evaluator = match values.entry(tuple) {
+            std::collections::hash_map::Entry::Occupied(entry) => *entry.get(),
+            std::collections::hash_map::Entry::Vacant(entry) => {
                 let index = plan.evaluators.len();
                 plan.evaluators.push(emit_bound_evaluator(id, layout, body, name_span, &facts, max_wasip1_stdout)?);
-                values.push(tuple);
-                index
+                *entry.insert(index)
             }
         };
         plan.calls.push(DirectStartupComptimeUse { facts, evaluator });
@@ -1192,6 +1194,22 @@ fn with_verified_startup_calls<const ARITY: usize, T>(
     observe(selected, body, super::super::token_span(&site.id), proof)
 }
 
+fn concrete_scalar_literal(argument: &ScalarExpression, parameter: &ScalarType) -> Option<DirectComptimeArgument> {
+    match (argument, parameter) {
+            (ScalarExpression::Integer { value, .. }, ScalarType::I32) =>
+                i32::try_from(value).ok().map(DirectComptimeArgument::I32),
+            (ScalarExpression::Integer { value, .. }, ScalarType::U32) =>
+                u32::try_from(value).ok().map(DirectComptimeArgument::U32),
+            (ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. }, ScalarType::I32) =>
+                match operand.as_ref() {
+                    ScalarExpression::Integer { value, .. } => i32::try_from(-value).ok().map(DirectComptimeArgument::I32),
+                    _ => None,
+                },
+            (ScalarExpression::Boolean { value, .. }, ScalarType::Bool) => Some(DirectComptimeArgument::Bool(*value)),
+            _ => None,
+        }
+}
+
 #[derive(Debug)]
 struct CheckedStartupArgument {
     occurrence: SourceSpan,
@@ -1217,19 +1235,7 @@ impl StartupArgumentFacts<'_> {
             return Err(unsupported("argument does not have the selected formal type"));
         }
         let occurrence = (self.scope)(span_of(argument));
-        let literal = match (argument, parameter) {
-            (ScalarExpression::Integer { value, .. }, ScalarType::I32) =>
-                i32::try_from(value).ok().map(DirectComptimeArgument::I32),
-            (ScalarExpression::Integer { value, .. }, ScalarType::U32) =>
-                u32::try_from(value).ok().map(DirectComptimeArgument::U32),
-            (ScalarExpression::Unary { operator: UnaryOperator::Negate, operand, .. }, ScalarType::I32) =>
-                match operand.as_ref() {
-                    ScalarExpression::Integer { value, .. } => i32::try_from(-value).ok().map(DirectComptimeArgument::I32),
-                    _ => None,
-                },
-            (ScalarExpression::Boolean { value, .. }, ScalarType::Bool) => Some(DirectComptimeArgument::Bool(*value)),
-            _ => None,
-        };
+        let literal = concrete_scalar_literal(argument, parameter);
         if let Some(value) = literal {
             return Ok(CheckedStartupArgument {
                 origin: StartupArgumentOrigin { literal: occurrence.clone(), prior_bypass_slot: None },

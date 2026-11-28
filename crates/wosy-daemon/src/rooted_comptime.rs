@@ -241,6 +241,25 @@ struct RootedComptimeIdentity {
 pub(super) enum RootedSelectedComptime {
     Pair(RootedPairCallGraphComptimePlan),
     Ordered(RootedOrderedComptime),
+    Exports(RootedExportedComptime),
+}
+
+#[cfg(target_os = "linux")]
+pub struct RootedExportedComptime {
+    source: RootedComptimeIdentity,
+    pub(crate) evaluator: wosy_compiler::ExportedPairWasip1,
+}
+
+#[cfg(target_os = "linux")]
+impl RootedExportedComptime {
+    pub fn source_root(&self) -> NodeId { self.source.root }
+    pub fn authored_cst(&self) -> NodeId { self.source.authored_cst }
+    pub fn compiler_image(&self) -> NodeId { self.source.compiler_image }
+    pub fn target(&self) -> &str { &self.source.target }
+    pub fn profile(&self) -> &str { &self.source.profile }
+    pub fn project(&self) -> &str { &self.evaluator.site().source.project }
+    pub fn id(&self) -> &str { self.evaluator.id() }
+    pub fn evaluators(&self) -> &[wosy_compiler::BoundedStartupWasip1Evaluator] { self.evaluator.evaluators() }
 }
 
 #[cfg(target_os = "linux")]
@@ -444,10 +463,15 @@ impl SourceStore {
         };
         request.check_selector_bytes()?;
         self.project_comptime_for_lease(lease, request, SiteScope::DirectTargetCall, |input, request| {
-            if input.artifact.backend != "llvm" || input.artifact.output != "wasm-wasip1"
-                || input.artifact.exports.is_some()
-            {
+            if input.artifact.backend != "llvm" || input.artifact.output != "wasm-wasip1" {
                 return Ok(Err(RootedClosedComptimeRefusal::ProfileNotWasip1));
+            }
+            if let Some(exports) = &input.artifact.exports {
+                return Ok(match wosy_compiler::prepare_exported_pair_wasip1(&input.fresh, exports, request.output_bytes) {
+                    Ok(evaluator) => Ok((input.configuration_inputs,
+                        RootedSelectedComptime::Exports(RootedExportedComptime { source: input.source, evaluator }))),
+                    Err(reason) => Err(compiler_refusal(reason)),
+                });
             }
             let mut sites = input.fresh.result().canonical_cst().root.descendants().filter_map(|node| {
                 let site = wosy_syntax::ComptimeCst::from_node(&node)?;

@@ -476,6 +476,27 @@ pub fn emit_scalar_build_wasm_root_exports_artifact_llvm(
     root: &wosy_syntax::SourceIdentity,
     requested: &BTreeMap<String, String>,
 ) -> Result<LlvmPartition, String> {
+    let exports = resolved_wasm_root_exports(validation, root, requested)?;
+    if validation.prepared().project().modules.len() == 1 {
+        emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &exports, None)
+    } else {
+        emit_scalar_build_project_with_policy(
+            validation, EmissionPolicy::Prepared, PartitionMetadata::ExternsOnly, &exports, None,
+        )
+    }
+}
+
+pub(crate) fn validate_wasm_root_export_roster(
+    validation: &ScalarBuildValidation<'_>, root: &wosy_syntax::SourceIdentity,
+    requested: &BTreeMap<String, String>,
+) -> Result<(), String> {
+    resolved_wasm_root_exports(validation, root, requested).map(|_| ())
+}
+
+fn resolved_wasm_root_exports<'a>(
+    validation: &'a ScalarBuildValidation<'_>, root: &wosy_syntax::SourceIdentity,
+    requested: &'a BTreeMap<String, String>,
+) -> Result<Vec<WasmRootExport<'a>>, String> {
     let modules = &validation.prepared().project().modules;
     let singleton = modules.len() == 1;
     let root_module = modules.iter().find(|module| &module.source == root)
@@ -535,13 +556,7 @@ pub fn emit_scalar_build_wasm_root_exports_artifact_llvm(
             signature: &function.signature,
         });
     }
-    if singleton {
-        emit_scalar_build_single_module_with_metadata(validation, PartitionMetadata::ExternsOnly, &exports, None)
-    } else {
-        emit_scalar_build_project_with_policy(
-            validation, EmissionPolicy::Prepared, PartitionMetadata::ExternsOnly, &exports, None,
-        )
-    }
+    Ok(exports)
 }
 
 fn emit_wasm_root_export_wrappers<'ctx>(

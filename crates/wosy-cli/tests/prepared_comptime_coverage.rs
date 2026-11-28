@@ -1716,3 +1716,159 @@ u32 tied = first ^ second;
     assert_eq!(fs::read(&order).unwrap(), b"14\n10\n14\n10\n14\n10\n");
     assert_eq!(chosen().manifest_path(), current.manifest_path());
 }
+
+#[cfg(target_os = "linux")]
+#[test]
+#[ignore = "requires ordinary clang, wasm-ld, python3 and wasmtime on PATH"]
+fn ordinary_cli_specializes_only_the_concrete_wasm_export_roots() {
+    use std::process::Command;
+    use wosy_project::SelectedArtifactGeneration;
+
+    let fixture = Scratch::new();
+    let project = &fixture.0;
+    let manifest = MANIFEST.replace("output = \"native\"", "output = \"wasm-wasip1\"")
+        .replace(r#""fixture-must-not-build""#, r#""python3", "ordinary_wasip1_pair.py", "artifact-build-exported""#)
+        .replace(r#""fixture-must-not-run""#, r#""python3", "ordinary_wasip1_pair.py", "artifact-run""#)
+        + r#"
+[targets.app.artifacts.main.profiles.dev.exports]
+west = "first"
+south = "again"
+north = "other"
+mirror = "first"
+[targets.app.artifacts.main.profiles.subset]
+backend = "llvm"
+output = "wasm-wasip1"
+builder = "nominal"
+run_runner = "nominal"
+[targets.app.artifacts.main.profiles.subset.exports]
+north = "other"
+[targets.app.profiles.subset]
+main_artifact = "main"
+comptime_builder = "pair"
+comptime_runner = "pair"
+build_permissions = []
+build_mounts = []
+[builders.pair]
+command = ["python3", "ordinary_wasip1_pair.py", "build"]
+toolchain_identity = "ordinary exported WASI fixture"
+[runners.pair]
+command = ["python3", "ordinary_wasip1_pair.py", "ordered-run"]
+[comptime.calculate]
+watch = ["watch.txt"]
+"#;
+    let manifest = manifest.replace("[targets.app.profiles.dev]", r#"
+[targets.app.profiles.dev]
+comptime_builder = "pair"
+comptime_runner = "pair"
+build_permissions = []
+build_mounts = []
+"#);
+    let manifest_path = project.join("wosy.toml");
+    fs::write(&manifest_path, &manifest).unwrap();
+    fs::write(project.join("ordinary_wasip1_pair.py"), include_str!("fixtures/ordinary_wasip1_pair.py")).unwrap();
+    let watch = project.join("watch.txt");
+    fs::write(&watch, b"first watched contents").unwrap();
+    let source = r#"%%start
+u32(u32, u32) solve = fn(left, right) { comptime calculate { right ^ left } };
+u32() first = fn { solve(7, 37) };
+u32() again = fn { solve(7, 37) };
+u32() other = fn { solve(7, 13) };
+u32() hidden = fn { solve(21, 34) };
+u32() nonliteral = fn { 5 };
+u32() unknown = fn { solve(nonliteral(), 1) };
+%%end
+"#;
+    fs::write(project.join("main.w"), source).unwrap();
+    let configuration = wosy_project::ProjectConfiguration::load(project).unwrap();
+    let (_, _, artifact_profile, _) = configuration.artifact_profile("app", "dev").unwrap();
+    let parsed = wosy_syntax::parse_with_snapshot(
+        wosy_syntax::SourceIdentity::new(project.to_string_lossy().into_owned(), "app".into(), "main.w".into(), "authored".into()),
+        source.to_owned(), &["WHY".into()],
+    );
+    let typed_plan = wosy_compiler::prepare_exported_pair_wasip1(
+        &parsed, artifact_profile.exports.as_ref().unwrap(), usize::MAX,
+    ).expect("expected the exact selected ordinary compatibility boundary to admit both tuples");
+    assert_eq!(typed_plan.tuples().len(), 2);
+
+    let order = project.join("evaluator-order");
+    let command = |verb: &str, profile: &str| Command::new(env!("CARGO_BIN_EXE_wosy"))
+        .current_dir(project).env("WOSY_INCREMENTAL", "1").args([verb, "app", "--profile", profile])
+        .output().unwrap();
+    let checked = |verb: &str, profile: &str| {
+        let output = command(verb, profile);
+        assert!(output.status.success(), "{verb}/{profile}: {}", String::from_utf8_lossy(&output.stderr));
+    };
+    let chosen = |profile: &str| SelectedArtifactGeneration::open(
+        &project.join(format!(".wosy/artifacts/app/{profile}/main/incremental")),
+    ).unwrap().unwrap();
+    let read_ir = |choice: &SelectedArtifactGeneration| fs::read_to_string(
+        choice.manifest_path().parent().unwrap().join("partition.ll"),
+    ).unwrap();
+
+    let invoke = |generation: &SelectedArtifactGeneration, export: &str| Command::new("wasmtime")
+        .args(["run", "-C", "cache=n", "--invoke", export])
+        .arg(&generation.manifest().executable).output().unwrap();
+    let check_export = |generation: &SelectedArtifactGeneration, export: &str, expected: &str| {
+        let output = invoke(generation, export);
+        assert!(output.status.success(), "{export}: {}", String::from_utf8_lossy(&output.stderr));
+        assert_eq!(String::from_utf8_lossy(&output.stdout).trim(), expected);
+    };
+    checked("build", "dev");
+    checked("run", "dev");
+    let first = chosen("dev");
+    let original_wasm = fs::read(&first.manifest().executable).unwrap();
+    let observation = first.manifest().comptime.as_ref().unwrap();
+    assert_eq!(observation.site, "calculate");
+    for (export, expected) in [("west", "34"), ("south", "34"), ("north", "10"), ("mirror", "34")] {
+        check_export(&first, export, expected);
+    }
+    assert!(!invoke(&first, "hidden").status.success());
+    assert_eq!(fs::read(&order).unwrap(), b"34\n10\n", "three wrappers and one alias, only two evaluated tuples");
+    let ir = read_ir(&first);
+    for selected in ["west", "south", "north", "mirror"] {
+        assert!(ir.contains(&format!("@{selected}(")), "{ir}");
+    }
+    for removed in ["solve", "hidden", "unknown", "nonliteral"] {
+        assert!(!ir.contains(&format!("@{removed}(")), "{ir}");
+    }
+
+    checked("build", "subset");
+    checked("run", "subset");
+    assert_eq!(fs::read(&order).unwrap(), b"34\n10\n10\n");
+    let subset = chosen("subset");
+    check_export(&subset, "north", "10");
+    assert!(!invoke(&subset, "west").status.success());
+    assert!(read_ir(&subset).contains("@north("));
+    assert!(!read_ir(&subset).contains("@west("));
+    assert_eq!(chosen("dev").manifest_path(), first.manifest_path());
+
+    // Watch changes invalidate both selected partitions before a runner.
+    fs::write(&watch, b"new watched contents").unwrap();
+    for profile in ["dev", "subset"] {
+        let stale = command("run", profile);
+        assert!(!stale.status.success());
+        assert!(String::from_utf8_lossy(&stale.stderr).contains("artifact comptime inputs are stale"));
+    }
+    let refuse = project.join("refuse-second-evaluator");
+    fs::write(&refuse, b"later evaluator fails").unwrap();
+    let failed = command("build", "dev");
+    assert!(!failed.status.success());
+    assert!(String::from_utf8_lossy(&failed.stderr).contains("selected comptime runner failed"));
+    assert_eq!(chosen("dev").manifest_path(), first.manifest_path());
+    fs::remove_file(refuse).unwrap();
+
+    checked("build", "dev");
+    checked("run", "dev");
+    let current = chosen("dev");
+    assert_ne!(current.manifest_path(), first.manifest_path());
+    assert_ne!(current.manifest().comptime.as_ref().unwrap().result_root, observation.result_root);
+    assert_eq!(fs::read(&first.manifest().executable).unwrap(), original_wasm);
+
+    // Making the unknown edge reachable rejects the complete plan before
+    // any selected evaluator or the final artifact builder is called.
+    let prior = fs::read(&order).unwrap();
+    fs::write(&manifest_path, manifest.replace("mirror = \"first\"", "mirror = \"unknown\"")).unwrap();
+    assert!(!command("build", "dev").status.success());
+    assert_eq!(fs::read(order).unwrap(), prior);
+    assert_eq!(chosen("dev").manifest_path(), current.manifest_path());
+}

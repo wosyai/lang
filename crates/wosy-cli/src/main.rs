@@ -19,7 +19,7 @@ use wosy_compiler::{
     parse_source_with_snapshot, prepare_scalar_project, publication, serialize_publication,
     LlvmPartition, ParseOutput, ScalarArtifactEmission, ScalarNamespaceBinding, ScalarPreparationInputs, ScalarTargetLayout,
 };
-use wosy_cli::artifact_inputs::{compiler_identity, expected_artifact_compiler_identity, llvm_identity, pending_builder_inputs,
+use wosy_cli::artifact_inputs::{expected_artifact_compiler_identity, llvm_identity, pending_builder_inputs,
     project_configuration_identity, BuilderInputPaths, PendingBuilderInputs};
 use wosy_project::{
     artifact_manifest_path, discover_root, load_artifact_manifest, publish_artifact,

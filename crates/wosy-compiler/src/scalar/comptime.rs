@@ -21,6 +21,7 @@ pub use stdout::{
     prepare_wasip1_comptime_continuation, ComptimeStdoutError,
     PreparedComptimeStdout, PreparedComptimeStdoutEvaluator, PreparedWasip1ComptimeContinuation,
 };
+pub use direct::{prepare_exported_pair_wasip1, ExportedPairWasip1};
 pub use direct::{
     derive_direct_function_comptime_fragment, derive_direct_pair_startup_comptime_plan,
     derive_direct_startup_comptime_plan, derive_forwarded_pair_startup_comptime_plan,

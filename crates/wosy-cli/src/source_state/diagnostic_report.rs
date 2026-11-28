@@ -680,6 +680,27 @@ fn bind_builder_inputs(
 }
 
 #[cfg(target_os = "linux")]
+fn prepare_comptime_builder_inputs(
+    source: AcknowledgedSourceGeneration, observed: Option<ObservedBuilderBasis>, target: &str, profile: &str,
+    output: &Path, observation: wosy_project::ArtifactComptimeObservation, emitted: wosy_daemon::SelectedPairComptimeEmission,
+    deadline: Instant,
+) -> Result<Option<SelectedPairOrdinaryInputs>> {
+    require_diagnostic_time(deadline)?;
+    let observed = observed.ok_or("selected comptime artifact has no live builder inputs")?;
+    let (_, artifact, profile_config, _) = observed.configuration.artifact_profile(target, profile)?;
+    let runtime = wosy_compiler::core_runtime(&profile_config.backend, &profile_config.output)?;
+    let mut partition = Vec::new();
+    emitted.partition.write_text(&mut partition)?;
+    let mut inputs = pending_builder_inputs(
+        &observed.configuration, observed.configuration_identity, target, profile, artifact, profile_config,
+        observed.source, blake3::hash(&partition).to_hex().to_string(), output,
+    )?;
+    inputs.manifest.identity.compiler_identity = expected_artifact_compiler_identity(Some(&observation));
+    inputs.manifest.comptime = Some(observation);
+    Ok(Some(SelectedPairOrdinaryInputs { source, result_root: emitted.result_root, inputs, partition, runtime }))
+}
+
+#[cfg(target_os = "linux")]
 impl SqliteSourceState {
     /// Execute only the acknowledged selected plan and prepare its ordinary
     /// builder inputs. The real compiler result and all declared inputs are
@@ -745,6 +766,53 @@ impl SqliteSourceState {
             additional_sites: Vec::new(),
         });
         Ok(Some(SelectedPairOrdinaryInputs { source, result_root: emitted.result_root, inputs, partition, runtime }))
+    }
+
+    /// Execute only the distinct concrete tuples in the verified explicit
+    /// artifact export set, and publish only normal builder inputs.
+    pub fn prepare_selected_exports_ordinary_inputs(
+        &mut self, owner: &wosy_daemon::SelectedExportedComptimeOwner<'_>,
+        private_parent: &Path, output: &Path, budget: SelectedPairToolBudget,
+        cancelled: impl Fn() -> bool,
+    ) -> Result<Option<SelectedPairOrdinaryInputs>> {
+        use wosy_project::{packages::{ComptimeExecutionAttempt, LocalComptimeInputScope}, ArtifactComptimeObservation};
+        let Some(plan) = owner.plan() else { return Ok(None); };
+        let deadline = llvm_deadline(plan.profile(), budget.timeout)?;
+        let Ok(initial) = self.capture_live(plan.target(), plan.profile(), deadline, usize::MAX, true)? else { return Ok(None); };
+        let source = initial.captured.source;
+        if source.selection().root != plan.source_root() || source.selection().project != plan.project()
+            || self.project != Path::new(plan.project()) || initial.builder.is_none() || cancelled()
+        {
+            return Ok(None);
+        }
+        let configuration_inputs = owner.configuration_inputs().0;
+        let execution = crate::comptime_fragment::execute_selected_concrete_wasip1(
+            plan.evaluators(), &self.project, LocalComptimeInputScope {
+                target: plan.target(), profile: plan.profile(), site: plan.id(), watch_limits: budget.watch_limits,
+            }, configuration_inputs, ComptimeExecutionAttempt {
+                seal: owner.execution_seal().clone(), root: plan.source_root().0,
+                generation: source.generation(), authored_cst: plan.authored_cst().0,
+            }, private_parent, budget.evaluator_ir_bytes, budget.evaluator_module_bytes,
+            wosy_compiler::OrderedClosedWasip1::MAX_STDOUT, deadline.into_std(), &cancelled,
+        )?;
+        let Some(emitted) = owner.emit_owned_results(source.generation(), &execution)? else { return Ok(None); };
+        let Ok(current) = self.capture_live(plan.target(), plan.profile(), deadline, usize::MAX, true)? else { return Ok(None); };
+        if current.captured.selection() != source.selection()
+            || current.captured.source.generation() != source.generation()
+            || emitted.source_root != source.selection().root || cancelled()
+        {
+            return Ok(None);
+        }
+        let observation = ArtifactComptimeObservation {
+            source_root: emitted.source_root.0, result_root: emitted.result_root.identity().0, configuration_inputs,
+            site: plan.id().to_owned(), watches: execution.observed().watches().to_vec(), additional_sites: Vec::new(),
+        };
+        if !observation.matches_current(&self.project, plan.target(), plan.profile())
+            || !current.captured.is_current(self)? || owner.plan().is_none()
+        {
+            return Ok(None);
+        }
+        prepare_comptime_builder_inputs(source, current.builder, plan.target(), plan.profile(), output, observation, emitted, deadline)
     }
 
     /// Execute all closed sites before one ordinary continuation. Observe
@@ -818,19 +886,7 @@ impl SqliteSourceState {
         {
             return Ok(None);
         }
-        require_diagnostic_time(deadline)?;
-        let observed = current.builder.ok_or("selected comptime artifact has no live builder inputs")?;
-        let (_, artifact, profile, _) = observed.configuration.artifact_profile(plan.target(), plan.profile())?;
-        let runtime = wosy_compiler::core_runtime(&profile.backend, &profile.output)?;
-        let mut partition = Vec::new();
-        emitted.partition.write_text(&mut partition)?;
-        let mut inputs = pending_builder_inputs(
-            &observed.configuration, observed.configuration_identity, plan.target(), plan.profile(), artifact, profile,
-            observed.source, blake3::hash(&partition).to_hex().to_string(), output,
-        )?;
-        inputs.manifest.identity.compiler_identity = expected_artifact_compiler_identity(Some(&observation));
-        inputs.manifest.comptime = Some(observation);
-        Ok(Some(SelectedPairOrdinaryInputs { source, result_root: emitted.result_root, inputs, partition, runtime }))
+        prepare_comptime_builder_inputs(source, current.builder, plan.target(), plan.profile(), output, observation, emitted, deadline)
     }
 
     /// Reobserve exact ordinary inputs while the caller holds its artifact

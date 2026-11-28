@@ -63,12 +63,18 @@ pub struct StagedPendingPairWasip1Evaluator<'a> {
 fn stage_pair_evaluators(
     plan: &BoundedPairStartupWasip1Output, private_parent: &Path, max_ir_bytes: usize,
 ) -> io::Result<Vec<EvaluatorFiles>> {
-    if plan.ir_bytes() > max_ir_bytes.min(1 << 20) {
-        return Err(io::Error::other("closed comptime evaluator IR exceeds byte budget"));
-    }
-    let mut files = Vec::with_capacity(plan.evaluators().len());
-    for evaluator in plan.evaluators() {
+    stage_concrete_evaluators(plan.evaluators(), private_parent, max_ir_bytes.min(1 << 20))
+}
+
+fn stage_concrete_evaluators(
+    evaluators: &[BoundedStartupWasip1Evaluator], private_parent: &Path, max_ir_bytes: usize,
+) -> io::Result<Vec<EvaluatorFiles>> {
+    let mut remaining = max_ir_bytes;
+    let mut files = Vec::with_capacity(evaluators.len());
+    for evaluator in evaluators {
         let ir = evaluator.bytes();
+        remaining = remaining.checked_sub(ir.len())
+            .ok_or_else(|| io::Error::other("selected comptime evaluator IR exceeds requested budget"))?;
         let own = EvaluatorFiles::create(private_parent, |file| {
             file.write_all(ir)?;
             Ok(StagedEvaluatorIr { bytes: ir.len(), blake3: blake3::hash(ir) })
@@ -99,14 +105,25 @@ pub(crate) fn execute_selected_pair_wasip1(
     private_parent: &Path, max_ir_bytes: usize, max_module_bytes: u64,
     deadline: std::time::Instant, cancelled: &impl Fn() -> bool,
 ) -> io::Result<wosy_project::packages::OwnedLocalComptimeExecution> {
+    execute_selected_concrete_wasip1(plan.evaluators(), project, scope, expected_config, attempt,
+        private_parent, max_ir_bytes.min(1 << 20), max_module_bytes, plan.max_stdout(), deadline, cancelled)
+}
+
+pub(crate) fn execute_selected_concrete_wasip1(
+    evaluators: &[BoundedStartupWasip1Evaluator], project: &Path,
+    scope: wosy_project::packages::LocalComptimeInputScope<'_>,
+    expected_config: [u8; 32], attempt: wosy_project::packages::ComptimeExecutionAttempt,
+    private_parent: &Path, max_ir_bytes: usize, max_module_bytes: u64, max_stdout: usize,
+    deadline: std::time::Instant, cancelled: &impl Fn() -> bool,
+) -> io::Result<wosy_project::packages::OwnedLocalComptimeExecution> {
     use wosy_project::packages::{execute_observed_comptime_set, observe_owned_local_comptime_inputs, LocalComptimeInputScope};
     let staged = observe_owned_local_comptime_inputs(project, LocalComptimeInputScope {
         target: scope.target, profile: scope.profile, site: scope.site, watch_limits: scope.watch_limits,
     }, expected_config).map_err(io::Error::other)?;
     require_no_parameters(!staged.declarations().parameters().is_empty())?;
-    let files = stage_pair_evaluators(plan, private_parent, max_ir_bytes)?;
+    let files = stage_concrete_evaluators(evaluators, private_parent, max_ir_bytes)?;
     execute_observed_comptime_set(project, scope, expected_config, attempt, staged.watches(),
-        &evaluator_stages(&files, max_module_bytes, plan.max_stdout()), deadline, cancelled)
+        &evaluator_stages(&files, max_module_bytes, max_stdout), deadline, cancelled)
 }
 
 /// Run exactly the selected closed site's one evaluator using the same

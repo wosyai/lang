@@ -163,6 +163,10 @@ pub(super) fn try_selected_comptime(
                 admitted = true;
                 state.prepare_selected_ordered_ordinary_inputs(&owner, &store_path, &paths.output, budget, || false)?
             }
+            SelectedComptimePreparation::Exports(owner) => {
+                admitted = true;
+                state.prepare_selected_exports_ordinary_inputs(&owner, &store_path, &paths.output, budget, || false)?
+            }
             SelectedComptimePreparation::Refused(_) => return Ok(None),
         };
         Ok::<_, BoxError>(result.map(|result| (state, result)))

@@ -84,7 +84,38 @@ impl SelectedPairComptimeOwner<'_> {
 pub enum SelectedComptimePreparation<'a> {
     Pair(SelectedPairComptimeOwner<'a>),
     Ordered(SelectedOrderedComptimeOwner<'a>),
+    Exports(SelectedExportedComptimeOwner<'a>),
     Refused(super::RootedClosedComptimeRefusal),
+}
+
+#[cfg(target_os = "linux")]
+pub struct SelectedExportedComptimeOwner<'a> {
+    lease: &'a SourceLease,
+    configuration_inputs: NodeId,
+    plan: super::RootedExportedComptime,
+    execution_seal: wosy_project::packages::PreparedComptimeExecutionSeal,
+}
+
+#[cfg(target_os = "linux")]
+impl SelectedExportedComptimeOwner<'_> {
+    pub fn configuration_inputs(&self) -> NodeId { self.configuration_inputs }
+    pub fn execution_seal(&self) -> &wosy_project::packages::PreparedComptimeExecutionSeal { &self.execution_seal }
+    pub fn plan(&self) -> Option<&super::RootedExportedComptime> {
+        self.lease.finish_current(|| &self.plan)
+    }
+    pub fn emit_owned_results(
+        &self, generation: i64, executed: &wosy_project::packages::OwnedLocalComptimeExecution,
+    ) -> Result<Option<SelectedPairComptimeEmission>> {
+        let Some(plan) = self.plan() else { return Ok(None); };
+        let decoded = super::source_proposal::decode_owned_exported_results(
+            plan, self.configuration_inputs, generation, &self.execution_seal, executed,
+        )?;
+        let partition = plan.evaluator.emit(&decoded.values)
+            .map_err(|error| format!("selected comptime export continuation rejected: {error:?}"))?;
+        Ok(self.lease.finish_current(|| SelectedPairComptimeEmission {
+            source_root: plan.source_root(), result_root: decoded.root, partition,
+        }))
+    }
 }
 
 #[cfg(target_os = "linux")]
@@ -386,6 +417,9 @@ impl BuildDiagnosticSession<'_> {
                         lease: self.lease.as_ref(), configuration_inputs, plan, execution_seal,
                     }),
                     RootedSelectedComptime::Ordered(plan) => SelectedComptimePreparation::Ordered(SelectedOrderedComptimeOwner {
+                        lease: self.lease.as_ref(), configuration_inputs, plan, execution_seal,
+                    }),
+                    RootedSelectedComptime::Exports(plan) => SelectedComptimePreparation::Exports(SelectedExportedComptimeOwner {
                         lease: self.lease.as_ref(), configuration_inputs, plan, execution_seal,
                     }),
                 }

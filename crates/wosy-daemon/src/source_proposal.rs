@@ -386,26 +386,72 @@ pub(super) fn decode_owned_pair_results(
     seal: &wosy_project::packages::PreparedComptimeExecutionSeal,
     executed: &wosy_project::packages::OwnedLocalComptimeExecution,
 ) -> Result<PairDecodedResults> {
+    let output = plan.wasip1_output().ok_or("expected a selected WASIp1 plan")?;
+    let expected = pair_evaluator_shapes(plan).ok_or("incomplete selected evaluator plan")?;
+    decode_owned_concrete_results(OwnedConcreteComptimeScope {
+        project, root: plan.source_root(), authored_cst: plan.authored_cst(),
+        compiler_image: plan.compiler_image(), id: plan.id(), target: plan.target(), profile: plan.profile(),
+        configuration_inputs, generation: expected_generation, seal, max_stdout: output.max_stdout(),
+    }, output.evaluators(), &expected, executed)
+}
+
+#[cfg(target_os = "linux")]
+pub(super) fn decode_owned_exported_results(
+    plan: &super::RootedExportedComptime, configuration_inputs: NodeId, generation: i64,
+    seal: &wosy_project::packages::PreparedComptimeExecutionSeal,
+    executed: &wosy_project::packages::OwnedLocalComptimeExecution,
+) -> Result<PairDecodedResults> {
+    let expected = plan.evaluators().iter().zip(plan.evaluator.tuples()).map(|(evaluator, values)| {
+        PreparedPairEvaluatorShape {
+            fragment_ir: NodeId(*blake3::hash(evaluator.bytes()).as_bytes()),
+            concrete_values: values.map(scalar_argument),
+            result_type: evaluator.result_type().clone(),
+        }
+    }).collect::<Vec<_>>();
+    decode_owned_concrete_results(OwnedConcreteComptimeScope {
+        project: std::path::Path::new(plan.project()), root: plan.source_root(), authored_cst: plan.authored_cst(),
+        compiler_image: plan.compiler_image(), id: plan.id(), target: plan.target(), profile: plan.profile(),
+        configuration_inputs, generation, seal, max_stdout: wosy_compiler::OrderedClosedWasip1::MAX_STDOUT,
+    }, plan.evaluators(), &expected, executed)
+}
+
+#[cfg(target_os = "linux")]
+struct OwnedConcreteComptimeScope<'a> {
+    project: &'a std::path::Path,
+    root: NodeId,
+    authored_cst: NodeId,
+    compiler_image: NodeId,
+    id: &'a str,
+    target: &'a str,
+    profile: &'a str,
+    configuration_inputs: NodeId,
+    generation: i64,
+    seal: &'a wosy_project::packages::PreparedComptimeExecutionSeal,
+    max_stdout: usize,
+}
+
+#[cfg(target_os = "linux")]
+fn decode_owned_concrete_results(
+    selected: OwnedConcreteComptimeScope<'_>, evaluators: &[wosy_compiler::BoundedStartupWasip1Evaluator],
+    expected: &[PreparedPairEvaluatorShape], executed: &wosy_project::packages::OwnedLocalComptimeExecution,
+) -> Result<PairDecodedResults> {
     use wosy_project::packages::WatchRoot;
     use wosy_protocol::{ComptimeInputs, ComptimeResultRoot, ComptimeValue, ComptimeWatchIdentity};
-
-    let output = plan.wasip1_output().ok_or("expected a selected WASIp1 plan")?;
-    let evaluators = pair_evaluator_shapes(plan).ok_or("incomplete selected evaluator plan")?;
     let observed = executed.observed();
     let executions = executed.pairs();
     let attempt = executed.attempt();
-    if !seal.same_owner(&attempt.seal) || attempt.root != plan.source_root().0 || attempt.generation != expected_generation
-        || attempt.authored_cst != plan.authored_cst().0
+    if !selected.seal.same_owner(&attempt.seal) || attempt.root != selected.root.0 || attempt.generation != selected.generation
+        || attempt.authored_cst != selected.authored_cst.0
     {
         return Err("owned comptime execution belongs to a different prepared attempt".into());
     }
     let scope = observed.declarations();
     let tools = scope.tools();
-    if observed.project() != project
-        || observed.site() != plan.id() || tools.target() != plan.target() || tools.profile() != plan.profile()
-        || observed.configuration_identity() != configuration_inputs.0
+    if observed.project() != selected.project
+        || observed.site() != selected.id || tools.target() != selected.target || tools.profile() != selected.profile
+        || observed.configuration_identity() != selected.configuration_inputs.0
         || !scope.parameters().is_empty()
-        || executions.len() != evaluators.len()
+        || executions.len() != evaluators.len() || evaluators.len() != expected.len()
     {
         return Err("executed comptime result does not match the full prepared scope".into());
     }
@@ -423,28 +469,28 @@ pub(super) fn decode_owned_pair_results(
     let builder_id = comptime_digest("Wosy declared comptime builder v1", &tools.builder())?;
     let runner_id = comptime_digest("Wosy declared comptime runner v1", &tools.runner())?;
     let toolchain = comptime_digest("Wosy declared comptime toolchain v1", &builder.toolchain_identity)?;
-    let function = comptime_digest("Wosy authored comptime function v1", &(plan.authored_cst(), plan.id()))?;
+    let function = comptime_digest("Wosy authored comptime function v1", &(selected.authored_cst, selected.id))?;
     let no_parameters = comptime_digest("Wosy empty comptime parameters v1", &())?;
     let no_permissions = comptime_digest("Wosy empty comptime permissions v1", &())?;
 
     let mut results = Vec::with_capacity(executions.len());
     let mut values = Vec::with_capacity(executions.len());
     let mut modules = Vec::with_capacity(executions.len());
-    for ((expected, evaluator), receipt) in evaluators.iter().zip(output.evaluators()).zip(executions) {
+    for ((expected, evaluator), receipt) in expected.iter().zip(evaluators).zip(executions) {
         if expected.fragment_ir.0 != *receipt.ir().as_bytes()
             || !matches_owned_comptime_tool(observed.project(), receipt.builder(), &builder.command, &builder.args, 3)
             || !matches_owned_comptime_tool(observed.project(), receipt.runner(), &runner.command, &runner.args, 1)
         {
             return Err("owned comptime terminal differs from the selected evaluator or invocation".into());
         }
-        let decoded = evaluator.parse_stdout(receipt.runner().stdout(), output.max_stdout())
+        let decoded = evaluator.parse_stdout(receipt.runner().stdout(), selected.max_stdout)
             .map_err(|error| format!("owned comptime stdout failed typed decoding: {error:?}"))?;
         let (type_name, value) = canonical_comptime_scalar(&expected.result_type, &decoded)?;
         let specialization = comptime_digest("Wosy concrete comptime specialization v1", &expected.concrete_values)?;
         let key = ComptimeInputs {
             fragment_ir: expected.fragment_ir, function, specialization,
             concrete_values: expected.concrete_values.iter().cloned().map(ComptimeValue::Scalar).collect(),
-            target: plan.target().to_owned(), profile: plan.profile().to_owned(), compiler_image: plan.compiler_image(),
+            target: selected.target.to_owned(), profile: selected.profile.to_owned(), compiler_image: selected.compiler_image,
             builder: builder_id, runner: runner_id, toolchain, params: no_parameters, permissions: no_permissions,
             watches: watches.clone(),
         }.key()?;
@@ -454,7 +500,7 @@ pub(super) fn decode_owned_pair_results(
         values.push(decoded);
         modules.push(NodeId(*receipt.module().as_bytes()));
     }
-    let root = ComptimeResultRoot::identify(plan.source_root(), plan.target(), plan.profile(), results)?;
+    let root = ComptimeResultRoot::identify(selected.root, selected.target, selected.profile, results)?;
     Ok(PairDecodedResults { root, values, modules })
 }
 

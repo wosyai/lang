@@ -2552,6 +2552,7 @@ pub fn derive_scalar_program_from_cst_with_layout(
 
 mod declarations;
 mod comptime;
+pub use comptime::{prepare_exported_pair_wasip1, ExportedPairWasip1};
 pub use comptime::{prepare_ordered_closed_wasip1, OrderedClosedWasip1, OrderedClosedWasip1Site};
 pub use comptime::{
     prepare_comptime_stdout, prepare_comptime_stdout_evaluator, prepare_comptime_wasip1_stdout_evaluator,
