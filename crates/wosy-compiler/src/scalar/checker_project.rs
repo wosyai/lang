@@ -1092,7 +1092,9 @@ fn check_package_symbolic_roots<const COLLECT: bool, const ENTRY_EVIDENCE: bool,
 ) -> Result<bool, ProjectCheck> {
     let (project, calls) = prepared.parts();
     let dormant = &project.modules[startup_count..];
-    let CheckedInitialization { visits, reached, ordinals, mut had_obligations, .. } = initialization;
+    let CheckedInitialization { visits, mut reached, ordinals, mut had_obligations, .. } = initialization;
+    // An intended external entry remains independent of any actual startup call.
+    reached.retain(|target| !prepared.independent_entries().contains(target));
     let mut ordinary_local_callers = HashSet::new();
     let mut ordered_roots = if COLLECT {
         close_ordered_symbolic_roots(std::mem::take(&mut authored_roots), || {
@@ -6374,17 +6376,34 @@ mod prepared {
     pub(in crate::scalar) struct PreparedCheckerProject {
         project: ScalarProject,
         calls: ProjectCallSiteResults,
+        independent_entries: HashSet<PreparedCallable>,
     }
 
     impl PreparedCheckerProject {
         #[cfg(feature = "internal-checker")]
         pub(super) fn from_contextual_transport(prepared: super::super::PreparedScalarProject) -> Self {
             let (project, calls) = prepared.into_contextual_parts();
-            Self { project, calls }
+            Self { project, calls, independent_entries: HashSet::new() }
         }
 
         pub(in crate::scalar) fn parts(&self) -> (&ScalarProject, &ProjectCallSiteResults) {
             (&self.project, &self.calls)
+        }
+
+        pub(super) fn independent_entries(&self) -> &HashSet<PreparedCallable> {
+            &self.independent_entries
+        }
+
+        #[cfg(feature = "internal-checker")]
+        pub(super) fn add_wasm_entries(
+            &mut self, root: &SourceIdentity, requested: &std::collections::BTreeMap<String, String>,
+        ) -> Result<(), ProjectCheck> {
+            let ordinal = self.project.modules.iter().position(|module| &module.source == root)
+                .ok_or(ProjectCheck::MissingRoot)?;
+            let entries = crate::scalar::wasm_root_exports::resolve_wasm_root_exports(&self.project, root, requested)
+                .map_err(|_| ProjectCheck::Unsupported)?;
+            self.independent_entries.extend(entries.into_iter().map(|entry| (ordinal, entry.declaration_item())));
+            Ok(())
         }
 
         #[cfg(feature = "internal-checker")]
@@ -6523,7 +6542,7 @@ mod prepared {
                 queries,
             ))
             .map_err(|rejected| ProjectCheck::Invalid(rejected.into_inspection().diagnostics))?;
-        Ok(PreparedCheckerProject { project, calls })
+        Ok(PreparedCheckerProject { project, calls, independent_entries: HashSet::new() })
     }
 }
 
@@ -11790,6 +11809,22 @@ pub struct PreparedScalarOrderedCheck {
 
 #[cfg(feature = "internal-checker")]
 impl PreparedScalarOrderedCheck {
+    /// Add positive wrapper identities from the exact selected artifact.
+    /// A builder can still omit these or expose others; absence is not evidence.
+    #[doc(hidden)]
+    pub fn with_selected_wasm_entries(
+        mut self, root: &SourceIdentity, requested: &std::collections::BTreeMap<String, String>,
+    ) -> Result<Self, ScalarOrderedCheckerOutcome> {
+        if self.scope == ScalarCheckerScope::CurrentPackage && !requested.is_empty() {
+            let owner = match &mut self.owner {
+                PreparedConfiguredCheck::Plain { owner, .. } | PreparedConfiguredCheck::Contextual { owner, .. } => owner,
+                PreparedConfiguredCheck::Mixed { owner, .. } | PreparedConfiguredCheck::Named { owner, .. } => &mut owner.prepared,
+            };
+            owner.add_wasm_entries(root, requested).map_err(configured_ordered_error)?;
+        }
+        Ok(self)
+    }
+
     /// Executes the single checked owner captured by preparation.
     pub fn run(self) -> Result<MainFlowProofReceipt, ScalarOrderedCheckerOutcome> {
         run_configured_ordered_check::<true>(self.owner, self.scope).map_err(configured_ordered_error)
@@ -12170,7 +12205,8 @@ fn plan_closed_authored_roots(
             return Err(ProjectCheck::Unsupported);
         }
         let body = calls.function_body(module, item, None).ok_or(ProjectCheck::Unsupported)?;
-        if allow_startup_scalars && startup_count == 1 && module == 0 && closed_startup_scalar_history(body) {
+        if allow_startup_scalars && startup_count == 1 && module == 0
+            && !owner.independent_entries().contains(&(module, item)) && closed_startup_scalar_history(body) {
             let ScalarItem::Function(function) = source.items.get(item).ok_or(ProjectCheck::Unsupported)?
                 else { return Err(ProjectCheck::Unsupported); };
             mandatory_startup_scalars.push((item, function.name_span));
@@ -13012,7 +13048,7 @@ fn run_startup_authored_path_with_binary(
             if proof_free_scalars.is_some_and(|required| required.iter().any(|target| !initialization.reached.contains(target))) {
                 return Err(ProjectCheck::Unsupported);
             }
-            collect_unreached_authored_paths(project, calls, count, &initialization, callable_roots,
+            collect_unreached_authored_paths(project, calls, owner.independent_entries(), count, &initialization, callable_roots,
                 &mut search, &mut effects)?
         },
         Err(ProjectCheck::StartupAuthoredLimitReached) if search.remaining() == 0 => (StartupAuthoredCompletion::LimitReached, true),
@@ -13034,7 +13070,7 @@ fn run_startup_authored_path_with_binary(
 
 #[cfg(feature = "internal-checker")]
 fn collect_unreached_authored_paths(
-    project: &ScalarProject, calls: &ProjectCallSiteResults, count: usize,
+    project: &ScalarProject, calls: &ProjectCallSiteResults, independent_entries: &HashSet<PreparedCallable>, count: usize,
     initialization: &CheckedInitialization<'_>, callable_roots: &[PreparedCallable],
     search: &mut failure_search::StartUpSearch, effects: &mut OrderedFailures,
 ) -> Result<(StartupAuthoredCompletion, bool), ProjectCheck> {
@@ -13044,7 +13080,7 @@ fn collect_unreached_authored_paths(
     let selected = RefCell::new((search, effects));
     use super::checker_flow::CallableHistoryCompletion;
     for &(ordinal, item) in callable_roots {
-        if initialization.reached.contains(&(ordinal, item)) { continue; }
+        if initialization.reached.contains(&(ordinal, item)) && !independent_entries.contains(&(ordinal, item)) { continue; }
         let expected = if ordinal < count { InitializationVisit::Completed } else { InitializationVisit::Unseen };
         if initialization.visits.get(ordinal) != Some(&expected) {
             return Err(ProjectCheck::Unsupported);
@@ -13276,7 +13312,7 @@ fn run_private_contextual_startup(
             if refuted || callable_roots.is_empty() {
                 StartupAuthoredCompletion::Exhausted
             } else {
-                collect_unreached_authored_paths(project, calls, startup_count, &initialization, &callable_roots,
+                collect_unreached_authored_paths(project, calls, prepared.independent_entries(), startup_count, &initialization, &callable_roots,
                     &mut search, &mut effects)?.0
             }
         }
@@ -23614,6 +23650,35 @@ i32(i32) transform=fn(x) { x };
             let first = reports.into_iter().next().unwrap();
             assert_eq!(main_only, [first]);
             assert_eq!(check_package_roots(&prepared), Err(main_only.into_iter().next().unwrap()));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn selected_wasm_wrapper_retains_independent_entry_after_actual_startup() {
+        let app = source("src/main.w", "selected-wasm-independent-entry");
+        let text = format!(r#"%%start
+            unit(i32) checked = fn(value) {{ core.require(value < 4, {OUTPUT}); }};
+            unit((unit(i32)),i32) dispatch = fn(callback, input) {{ callback(input); }};
+            dispatch(checked, 1);
+        %%end"#);
+        let requested = std::collections::BTreeMap::from([("browser_entry".into(), "checked".into())]);
+        for scope in [ScalarCheckerScope::MainFlowOnly, ScalarCheckerScope::CurrentPackage] {
+            let prepare = || prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app, &text), Vec::new())], [], vec![app.clone()],
+                ScalarPreparationInputs { target_layout: ScalarTargetLayout::WASM32 }, scope, Vec::new(),
+            ).unwrap();
+            assert!(prepare().run().unwrap().directives.is_empty());
+            let with_wrapper = || prepare().with_selected_wasm_entries(&app, &requested).unwrap();
+            let ordinary = with_wrapper().run().unwrap();
+            let (first, _) = with_wrapper().run_private_authored_root(std::num::NonZeroUsize::MIN).unwrap();
+            assert_eq!(ordinary.directives, first.directives);
+            assert_eq!(first.directives.len(), usize::from(scope == ScalarCheckerScope::CurrentPackage));
+            if let [failure] = first.directives.as_slice() {
+                let lo = BigInt::from(4);
+                let hi = BigInt::from(i32::MAX);
+                assert!(failure.witness.intervals_at(0, 0).unwrap().eq([(&lo, &hi)]));
+            }
         }
     }
 

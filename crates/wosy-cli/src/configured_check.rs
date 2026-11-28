@@ -276,7 +276,7 @@ fn prepare_target_from_manifest(
             ProjectContext::declared_package_source_root(manifest.as_table()).map_err(LoadError::PackageSourceRoot)?,
         ),
     };
-    prepare_configured_proof_scope(&project, configuration, layout, scope, selection, None)
+    prepare_configured_proof_scope(&project, configuration, layout, scope, selection, None, artifact.exports.as_ref())
 }
 
 pub(crate) fn check_target_with_dependencies(
@@ -420,7 +420,7 @@ fn prepare_resolved_dependency_primary(
 ) -> Result<PreparedConfiguredCheckReceipt, ConfiguredCheckLoadError> {
     prepare_configured_proof_scope(
         &selection.project, &selection.configuration, selection.layout, ScalarCheckerScope::CurrentPackage,
-        DormantSelection::DeclaredPackage(selection.source_directory.clone()), selection.git_checkout.as_ref(),
+        DormantSelection::DeclaredPackage(selection.source_directory.clone()), selection.git_checkout.as_ref(), None,
     )
 }
 
@@ -428,6 +428,7 @@ fn prepare_configured_proof_scope(
     project: &ProjectContext, configuration: &ProjectConfiguration, layout: wosy_project::TargetLayout,
     scope: ScalarCheckerScope, selection: DormantSelection<'_>,
     checkout: Option<&wosy_project::packages::GitDirectory>,
+    exports: Option<&BTreeMap<String, String>>,
 ) -> Result<PreparedConfiguredCheckReceipt, ConfiguredCheckLoadError> {
     use ConfiguredCheckLoadError as LoadError;
     let root = project.root.as_path();
@@ -460,10 +461,14 @@ fn prepare_configured_proof_scope(
     }
     let dormant = load_explicit_dormant_proof_sources(root, project, configuration, paths, &mut loaded.texts, checkout)
         .map_err(LoadError::Dormant)?;
+    let selected_root = loaded.graph.nodes.first().map(|entry| crate::compiler_source_identity(&entry.source, &entry.content_revision));
     let check = prepare_loaded_scalar_ordered_local_proof_contexts(
         loaded.declarations, loaded.proofs.into_values(), loaded.initialization_order,
         ScalarPreparationInputs { target_layout }, scope, dormant,
-    );
+    ).and_then(|prepared| match (selected_root.as_ref(), exports) {
+        (Some(selected_root), Some(exports)) => prepared.with_selected_wasm_entries(selected_root, exports),
+        _ => Ok(prepared),
+    });
     Ok(PreparedConfiguredCheckReceipt { root: root.to_owned(), check, texts: loaded.texts })
 }
 

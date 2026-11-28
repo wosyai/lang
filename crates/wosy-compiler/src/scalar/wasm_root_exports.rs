@@ -1,4 +1,4 @@
-use super::{PreparedScalarProject, ScalarFunction, ScalarItem, ScalarModule, ScalarTargetLayout, ScalarType};
+use super::{PreparedScalarProject, ScalarFunction, ScalarItem, ScalarModule, ScalarProject, ScalarTargetLayout, ScalarType};
 use std::collections::BTreeMap;
 use wosy_syntax::SourceIdentity;
 
@@ -20,8 +20,8 @@ impl<'project, 'manifest> PreparedWasmRootExport<'project, 'manifest> {
         &self.module.source
     }
 
-    #[cfg(test)]
-    fn declaration_item(&self) -> usize {
+    #[cfg(any(test, feature = "internal-checker"))]
+    pub(crate) fn declaration_item(&self) -> usize {
         self.item
     }
 
@@ -38,7 +38,15 @@ pub(crate) fn resolve_prepared_wasm_root_exports<'project, 'manifest>(
     root: &SourceIdentity,
     requested: &'manifest BTreeMap<String, String>,
 ) -> Result<Vec<PreparedWasmRootExport<'project, 'manifest>>, String> {
-    let module = prepared.project().modules.iter().find(|module| &module.source == root)
+    resolve_wasm_root_exports(prepared.project(), root, requested)
+}
+
+pub(crate) fn resolve_wasm_root_exports<'project, 'manifest>(
+    project: &'project ScalarProject,
+    root: &SourceIdentity,
+    requested: &'manifest BTreeMap<String, String>,
+) -> Result<Vec<PreparedWasmRootExport<'project, 'manifest>>, String> {
+    let module = project.modules.iter().find(|module| &module.source == root)
         .ok_or_else(|| format!("missing selected Wasm export root {}", root.path))?;
     if module.target_layout != ScalarTargetLayout::WASM32 {
         return Err("Wasm root exports require a Wasm artifact".into());
