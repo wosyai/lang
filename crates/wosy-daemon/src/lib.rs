@@ -61,6 +61,8 @@ mod pins;
 mod project_declarations;
 mod prepared_project;
 mod rooted_comptime;
+mod main_flow_input;
+pub use main_flow_input::{MainFlowInputPreparation, MainFlowInputRefusal, MainFlowSourceInput};
 mod rooted_llvm;
 mod retention_plan;
 mod rooted_llvm_receipts;

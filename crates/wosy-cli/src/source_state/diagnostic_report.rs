@@ -23,6 +23,9 @@ use wosy_protocol::{
     ORDINARY_LLVM_PROJECTION_VERSION,
 };
 use wosy_syntax::SourceIdentity;
+#[path = "main_flow_input.rs"]
+mod main_flow_input;
+pub use main_flow_input::{SelectedMainFlowInput, SelectedMainFlowPreparation};
 
 pub enum ProjectDiagnosticExchange {
     StaleSelection,

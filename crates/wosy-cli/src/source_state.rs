@@ -33,6 +33,7 @@ pub use diagnostic_report::{
 #[cfg(target_os = "linux")]
 pub use diagnostic_report::{SelectedComptimePartitionReceipt, SelectedPairOrdinaryInputs, SelectedPairToolBudget};
 pub use current_view::PinnedEntryCst;
+pub use diagnostic_report::{SelectedMainFlowInput, SelectedMainFlowPreparation};
 pub use pins::{LocalSourcePin, PinnedSourceReplay};
 pub use pin_reconciliation::{PinIntentPage, PinIntentPageRead, PinPage, PinPageItem, PinPageResult, PinScanCursor, PinSyncStatus};
 
