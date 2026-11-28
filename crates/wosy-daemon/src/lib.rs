@@ -220,6 +220,33 @@ impl SourceStore {
         }
     }
 
+    /// True only if every authored file in this retained view has a
+    /// verified exact grammar evidence explicitly excluding compile time.
+    pub fn ordinary_view_has_no_comptime(&self, view: &SourceView) -> Result<bool> {
+        if view.files.is_empty() { return Ok(false); }
+        let config = view.source_config()?;
+        for (key, file) in &view.files {
+            match self.grammar_receipts.authored_comptime(file) {
+                Some(true) => return Ok(false),
+                Some(false) => continue,
+                None => {}
+            }
+            // Receipt memory is per process. On a reopened store, verify
+            // the exact authored tree before relying on its absence proof.
+            let authored = view.authored(key)?;
+            let fresh = wosy_syntax::parse_with_snapshot(
+                file_source(file)?, authored.cst.root.text().to_string(), &config.parser.categories,
+            );
+            let parsed = fresh.result();
+            if !parsed.is_valid() || parsed.comments != authored.comments
+                || source_proposal::same_cst(&authored.cst.root, &parsed.canonical_cst().root) != Some(false)
+            {
+                return Ok(false);
+            }
+        }
+        Ok(true)
+    }
+
     pub fn snapshot(&self, root: NodeId) -> Result<Option<SourceView>> {
         let Some((tx, read)) = self.begin_source_read(root)? else { return Ok(None); };
         self.snapshot_with_read(root, tx, read)
@@ -901,6 +928,11 @@ impl SourceView {
     fn configured(self) -> Result<ConfiguredSourceView> {
         let config = self.source_config()?;
         Ok(ConfiguredSourceView { source: self, config })
+    }
+
+    /// Content-addressed source and dependency inputs from this same retained view.
+    pub fn ordinary_artifact_roots(&self) -> Result<(NodeId, NodeId, NodeId)> {
+        Ok((self.root, self.dependencies, self.source_config()?.inputs))
     }
 
     /// Describe the exact lock and patch selections of this rooted view,

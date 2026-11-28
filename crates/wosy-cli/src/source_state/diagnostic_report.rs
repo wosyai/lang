@@ -344,6 +344,58 @@ impl SqliteSourceState {
         ).await
     }
 
+    /// Compare the ordinary authored partition against the selected daemon
+    /// result. A cache miss or an unverified source is not a build error.
+    /// The caller owns the peer transport; the image digest is a consistency
+    /// check and does not authenticate a network peer.
+    pub async fn compare_selected_ordinary_llvm<Open, Opening, Stream>(
+        &mut self,
+        target: &str,
+        profile: &str,
+        timeout: Duration,
+        max_authored_source_bytes: usize,
+        max_partition_bytes: usize,
+        expected_peer: &AuthorizedOrdinaryBuilderPeer,
+        ordinary: &PendingBuilderInputs,
+        open: Open,
+    ) -> Result<Option<AcknowledgedSourceGeneration>>
+    where
+        Open: FnMut(BuildSourceSelection, Option<SourceReplay>) -> Opening,
+        Opening: Future<Output = Result<Stream>>,
+        Stream: AsyncRead + AsyncWrite + Unpin + 'static,
+    {
+        let deadline = llvm_deadline(profile, timeout)?;
+        let Ok(initial) = self.capture_live(target, profile, deadline, max_authored_source_bytes, true)? else {
+            return Ok(None);
+        };
+        if !matches_ordinary_builder(initial.builder, target, profile, ordinary)? {
+            return Ok(None);
+        }
+        let answer = self.live_partition_for_capture(
+            initial.captured, deadline, max_partition_bytes, OrdinaryLlvmMode::Projection,
+            open, |captured, projection| Ok(AcknowledgedLlvmPartition { captured, projection }),
+        ).await?;
+        let AcknowledgedOrdinaryLlvm::Partition(partition) = answer else {
+            return Ok(None);
+        };
+        let projected = partition.projection();
+        if projected.compiler_image != expected_peer.0
+            || projected.digest.hex() != ordinary.manifest.identity.llvm_input_identity
+        {
+            return Ok(None);
+        }
+        let Ok(current) = self.capture_live(target, profile, deadline, max_authored_source_bytes, true)? else {
+            return Ok(None);
+        };
+        if current.captured.source.generation() != partition.captured.generation()
+            || current.captured.selection() != partition.captured.selection()
+            || !matches_ordinary_builder(current.builder, target, profile, ordinary)?
+        {
+            return Ok(None);
+        }
+        Ok(Some(partition.captured))
+    }
+
     /// Plan the exact ordinary builder inputs without writing, invoking or
     /// caching artifacts. The trusted local activator binds the dedicated
     /// stream to the executable it independently expects. The image
@@ -541,6 +593,19 @@ fn llvm_deadline(profile: &str, timeout: Duration) -> Result<Instant> {
     diagnostic_deadline(timeout)
 }
 
+fn matches_ordinary_builder(
+    observed: Option<ObservedBuilderBasis>, target: &str, profile: &str, ordinary: &PendingBuilderInputs,
+) -> Result<bool> {
+    let Some(observed) = observed else { return Ok(false); };
+    let (_, artifact, profile_config, _) = observed.configuration.artifact_profile(target, profile)?;
+    let output = ordinary.manifest.executable.parent().ok_or("ordinary builder output has no directory")?;
+    let recomputed = pending_builder_inputs(
+        &observed.configuration, observed.configuration_identity, target, profile,
+        artifact, profile_config, observed.source, ordinary.manifest.identity.llvm_input_identity.clone(), output,
+    )?;
+    Ok(recomputed.manifest == ordinary.manifest && recomputed.builder == ordinary.builder)
+}
+
 fn bind_builder_inputs(
     source: AcknowledgedSourceGeneration, observed: ObservedBuilderBasis, projection: OrdinaryLlvmProjection,
     expected_peer_image: NodeId, output: PathBuf,
@@ -572,6 +637,54 @@ fn bind_builder_inputs(
 
 #[cfg(target_os = "linux")]
 impl SqliteSourceState {
+    /// Reobserve exact ordinary inputs while the caller holds its artifact
+    /// writer reservation. This does not exclude non-participating editors.
+    pub fn revalidate_ordinary_build_inputs(
+        &mut self, source: &AcknowledgedSourceGeneration, profile: &str,
+        ordinary: &PendingBuilderInputs, timeout: Duration,
+    ) -> Result<bool> {
+        let deadline = llvm_deadline(profile, timeout)?;
+        let selection = source.selection();
+        let Ok(live) = self.capture_live(&selection.target, profile, deadline, usize::MAX, true)? else {
+            return Ok(false);
+        };
+        Ok(live.captured.selection() == selection && live.captured.source.generation() == source.generation()
+            && matches_ordinary_builder(live.builder, &selection.target, profile, ordinary)?)
+    }
+
+    /// Publish the completed ordinary builder in a new generation, without
+    /// invoking a driver or moving the prior reader's artifact. The caller
+    /// owns the selected local store and its ordinary builder invocation.
+    pub fn publish_ordinary_build_generation(
+        &mut self,
+        source: &AcknowledgedSourceGeneration,
+        profile: &str,
+        ordinary: &PendingBuilderInputs,
+        stage: wosy_project::StagedArtifactGeneration,
+        timeout: Duration,
+        max_authored_source_bytes: usize,
+    ) -> Result<Option<PathBuf>> {
+        let deadline = llvm_deadline(profile, timeout)?;
+        let selection = source.selection();
+        if ordinary.manifest.executable != stage.output_dir().join("main")
+            || !stage.is_workspace_subdirectory(&self.project)?
+        {
+            return Ok(None);
+        }
+        let prepared = stage.prepare(&ordinary.manifest)?;
+        let Ok(live) = self.capture_live(&selection.target, profile, deadline, max_authored_source_bytes, true)? else {
+            return Ok(None);
+        };
+        if live.captured.selection() != selection || live.captured.source.generation() != source.generation()
+            || !matches_ordinary_builder(live.builder, &selection.target, profile, ordinary)?
+        {
+            return Ok(None);
+        }
+        let Some(_held) = self.hold_publication_selection(source)? else { return Ok(None); };
+        require_diagnostic_time(deadline)?;
+        Ok(Some(prepared.publish()?))
+    }
+
     /// Local storage completion only. The caller must already own a
     /// verified controlled driver, output custody and workspace write
     /// coordination. The receipt alone cannot grant any of those.

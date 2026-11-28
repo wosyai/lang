@@ -14,12 +14,16 @@ use std::{
 
 const MANIFEST: &str = "artifact-manifest.json";
 const OUTPUT: &str = "main";
-const STAGE_FILES: [&str; 5] = [
+const CACHE_RECEIPT: &str = "artifact-cache-v1";
+const COMPILER_PARTITION: &str = "compiler-partition-v1";
+const STAGE_FILES: [&str; 7] = [
     "partition.ll",
     "runtime.ll",
     "artifact-manifest.pending.json",
     OUTPUT,
     MANIFEST,
+    CACHE_RECEIPT,
+    COMPILER_PARTITION,
 ];
 
 #[doc(hidden)]
@@ -32,6 +36,8 @@ pub struct StagedArtifactGeneration {
     parent_path: PathBuf,
     name: PathBuf,
     published: bool,
+    recorded_cache_receipt: bool,
+    recorded_compiler_partition: bool,
     pending_pointer: Option<PathBuf>,
 }
 
@@ -92,6 +98,52 @@ impl SelectedArtifactGeneration {
         }))
     }
 
+    /// Reuse compiler-owned LLVM only if its exact selection key and bytes
+    /// match. This method never admits the generated executable to reuse.
+    pub fn retained_compiler_partition(&self, key: &blake3::Hash) -> io::Result<Option<Vec<u8>>> {
+        let Some(mut key_file) = self._directory.source(Path::new(COMPILER_PARTITION)).map_err(io::Error::other)? else {
+            return Ok(None);
+        };
+        let meta = key_file.metadata()?;
+        if meta.uid() != owner() || meta.nlink() != 1 || meta.len() != 32 { return Ok(None); }
+        let mut observed_key = [0; 32];
+        key_file.read_exact(&mut observed_key)?;
+        if &observed_key != key.as_bytes() { return Ok(None); }
+        let Some(mut partition) = self._directory.source(Path::new("partition.ll")).map_err(io::Error::other)? else {
+            return Ok(None);
+        };
+        let meta = partition.metadata()?;
+        if meta.uid() != owner() || meta.nlink() != 1 { return Ok(None); }
+        let mut bytes = Vec::new();
+        partition.read_to_end(&mut bytes)?;
+        if blake3::hash(&bytes).to_hex().as_str() != self.manifest.identity.llvm_input_identity {
+            return Ok(None);
+        }
+        Ok(Some(bytes))
+    }
+
+    /// A stored receipt is evidence only when both the input key and the
+    /// exact local executable bytes still match. No receipt means no reuse.
+    pub fn matches_cache_receipt(&self, key: &blake3::Hash) -> io::Result<bool> {
+        let Some(mut receipt) = self._directory.source(Path::new(CACHE_RECEIPT)).map_err(io::Error::other)? else {
+            return Ok(false);
+        };
+        let metadata = receipt.metadata()?;
+        if metadata.uid() != owner() || metadata.nlink() != 1 || metadata.len() != 64 {
+            return Ok(false);
+        }
+        let mut bytes = [0; 64];
+        receipt.read_exact(&mut bytes)?;
+        if &bytes[..32] != key.as_bytes() { return Ok(false); }
+        let Some(binary) = self._directory.source(Path::new(OUTPUT)).map_err(io::Error::other)? else {
+            return Ok(false);
+        };
+        let metadata = binary.metadata()?;
+        if metadata.uid() != owner() || metadata.nlink() != 1 { return Ok(false); }
+        let digest = blake3::Hasher::new().update_reader(binary)?.finalize();
+        Ok(&bytes[32..] == digest.as_bytes())
+    }
+
     pub fn manifest_path(&self) -> &Path { &self.manifest_path }
 
     pub fn manifest(&self) -> &ArtifactManifest { &self.manifest }
@@ -122,7 +174,7 @@ impl StagedArtifactGeneration {
         };
         let stage = Self {
             parent, _writer: writer, dir, descriptor, parent_descriptor,
-            parent_path: parent_path.to_owned(), name, published: false, pending_pointer: None,
+            parent_path: parent_path.to_owned(), name, published: false, recorded_cache_receipt: false, recorded_compiler_partition: false, pending_pointer: None,
         };
         require_private(&fs::metadata(&stage.descriptor)?)?;
         Ok(stage)
@@ -154,6 +206,43 @@ impl StagedArtifactGeneration {
         write_new(&self.descriptor.join("runtime.ll"), runtime)
     }
 
+    /// Record a compiler-owned result key, only after the external builder
+    /// has returned. The caller verifies the source cut and the input bytes.
+    pub fn record_compiler_partition(
+        &mut self, key: &blake3::Hash, expected: &str,
+    ) -> io::Result<bool> {
+        let Some(file) = self.dir.source(Path::new("partition.ll")).map_err(io::Error::other)? else {
+            return Ok(false);
+        };
+        let meta = file.metadata()?;
+        if meta.uid() != owner() || meta.nlink() != 1
+            || blake3::Hasher::new().update_reader(file)?.finalize().to_hex().as_str() != expected
+        {
+            return Ok(false);
+        }
+        write_new(&self.descriptor.join(COMPILER_PARTITION), key.as_bytes())?;
+        self.recorded_compiler_partition = true;
+        Ok(true)
+    }
+
+    /// Bind the already returned local builder output to the selected input
+    /// key. Only the builder's caller can establish that input provenance.
+    pub fn record_cache_receipt(&mut self, key: &blake3::Hash) -> io::Result<()> {
+        let binary = self.dir.source(Path::new(OUTPUT)).map_err(io::Error::other)?
+            .ok_or_else(|| io::Error::new(io::ErrorKind::NotFound, "artifact generation has no executable"))?;
+        let metadata = binary.metadata()?;
+        if metadata.uid() != owner() || metadata.nlink() != 1 {
+            return Err(io::Error::other("expected an artifact owned only by this generation"));
+        }
+        let digest = blake3::Hasher::new().update_reader(binary)?.finalize();
+        let mut bytes = [0; 64];
+        bytes[..32].copy_from_slice(key.as_bytes());
+        bytes[32..].copy_from_slice(digest.as_bytes());
+        write_new(&self.descriptor.join(CACHE_RECEIPT), &bytes)?;
+        self.recorded_cache_receipt = true;
+        Ok(())
+    }
+
     /// Prepare pointer bytes after the controlled driver relinquishes output.
     /// Validate file ownership, not executable contents or driver authority.
     pub fn prepare(mut self, manifest: &ArtifactManifest) -> io::Result<PreparedArtifactGeneration> {
@@ -167,6 +256,20 @@ impl StagedArtifactGeneration {
             return Err(io::Error::other("expected an artifact owned only by this generation"));
         }
 
+        if !self.recorded_cache_receipt {
+            match fs::remove_file(self.descriptor.join(CACHE_RECEIPT)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
+        if !self.recorded_compiler_partition {
+            match fs::remove_file(self.descriptor.join(COMPILER_PARTITION)) {
+                Ok(()) => {}
+                Err(error) if error.kind() == io::ErrorKind::NotFound => {}
+                Err(error) => return Err(error),
+            }
+        }
         let bytes = serde_json::to_vec_pretty(manifest).map_err(io::Error::other)?;
         write_new(&self.descriptor.join(MANIFEST), &bytes)?;
         let pointer = self.parent_descriptor.join(self.name.with_extension("manifest"));

@@ -818,7 +818,7 @@ fn trace(
     Ok(done)
 }
 
-fn same_cst(expected: &CstNode, actual: &CstNode) -> Option<bool> {
+pub(super) fn same_cst(expected: &CstNode, actual: &CstNode) -> Option<bool> {
     let mut authored_comptime = false;
     let mut wanted = expected.preorder_with_tokens();
     let mut observed = actual.preorder_with_tokens();

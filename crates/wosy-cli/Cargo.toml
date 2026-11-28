@@ -12,6 +12,7 @@ name = "native_known_diagnostics_client"
 required-features = ["native-diagnostics"]
 
 [dependencies]
+wosy-daemon = { path = "../wosy-daemon" }
 rowan.workspace = true
 rusqlite = { version = "=0.43.0", default-features = false, features = ["bundled"] }
 wosy-protocol = { path = "../wosy-protocol" }
@@ -20,7 +21,7 @@ clap.workspace = true
 codespan-reporting.workspace = true
 serde.workspace = true
 serde_json.workspace = true
-tokio = { version = "1", features = ["io-util", "macros", "time"] }
+tokio = { version = "1", features = ["io-util", "macros", "rt", "time"] }
 wosy-compiler.workspace = true
 wosy-project.workspace = true
 wosy-syntax.workspace = true
@@ -30,6 +31,5 @@ name = "wosy"
 path = "src/main.rs"
 
 [dev-dependencies]
-wosy-daemon = { path = "../wosy-daemon" }
 tokio = { version = "1", features = ["io-std", "macros", "rt-multi-thread", "time"] }
 toml_edit.workspace = true

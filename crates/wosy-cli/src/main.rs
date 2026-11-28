@@ -34,6 +34,10 @@ use wosy_syntax::SourceIdentity;
 #[path = "main_tests/native_executable_inputs.rs"]
 mod native_executable_inputs;
 
+#[cfg(target_os = "linux")]
+#[path = "ordinary_incremental.rs"]
+mod ordinary_incremental;
+
 #[derive(Parser)]
 #[command(name = "wosy")]
 struct Arguments {
@@ -208,6 +212,15 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
     let target_layout = artifact_profile.target_layout().map(scalar_target_layout)?;
     let configuration_identity = project_configuration_identity(document.raw().as_bytes(), &configuration)?;
     drop(document);
+    let artifact_name = &target_profile.main_artifact;
+    let paths = BuilderInputPaths::new(root.join(".wosy/artifacts")
+        .join(&target_name).join(profile).join(artifact_name));
+    #[cfg(target_os = "linux")]
+    if ordinary_incremental::enabled() && ordinary_incremental::try_retained_partition(
+        &root, &target_name, profile, &paths, &configuration, &configuration_identity, artifact, artifact_profile,
+    )? {
+        return Ok(());
+    }
     let (llvm, source_observations) = compile_project(
         &root,
         &project,
@@ -215,9 +228,13 @@ fn build_command(target: Option<&str>, profile: &str) -> Result<(), String> {
         target_layout,
         artifact_profile.exports.as_ref(),
     )?;
-    let artifact_name = &target_profile.main_artifact;
-    let paths = BuilderInputPaths::new(root.join(".wosy/artifacts")
-        .join(&target_name).join(profile).join(artifact_name));
+    #[cfg(target_os = "linux")]
+    if ordinary_incremental::enabled() && ordinary_incremental::build(
+        &root, &target_name, profile, &paths, &configuration, &configuration_identity, artifact,
+        artifact_profile, &source_observations, &llvm,
+    )? {
+        return Ok(());
+    }
     fs::create_dir_all(&paths.output).map_err(|error| error.to_string())?;
     let llvm_input_identity = write_llvm_partition(&paths.partition, &llvm)?;
     drop(llvm);
@@ -295,6 +312,10 @@ fn run_command(target: Option<&str>, profile: &str, arguments: &[String]) -> Res
     drop(document);
     let manifest_path =
         artifact_manifest_path(&root, &target_name, profile, &target_profile.main_artifact);
+    #[cfg(target_os = "linux")]
+    let selected = ordinary_incremental::select_for_run(&manifest_path)?;
+    #[cfg(target_os = "linux")]
+    let manifest_path = selected.as_ref().map_or(manifest_path.as_path(), |selected| selected.manifest_path());
     let runner = validate_run_manifest(
         &manifest_path, &configuration, &configuration_identity, &target_name, profile, artifact, artifact_profile,
     )?;

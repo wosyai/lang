@@ -308,7 +308,7 @@ impl SqliteSourceState {
         self.replay_acknowledged_at(captured, None)
     }
 
-    fn replay_acknowledged_at(
+    pub(crate) fn replay_acknowledged_at(
         &mut self, captured: &wosy_protocol::BuildSourceSelection, epoch: Option<i64>,
     ) -> Result<Option<SourceReplay>> {
         if self.project.to_str() != Some(captured.project.as_str()) { return Ok(None); }
