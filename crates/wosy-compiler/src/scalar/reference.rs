@@ -1756,7 +1756,14 @@ impl<'a> ReferenceFlowBuilder<'a> {
         read_mode: ExpressionReadMode,
     ) -> Result<ReferenceValue, ReferenceAnalysisError> {
         let before = self.cursor;
-        let value = self.evaluate_expression(expression, scope, ordinal, read_mode)?;
+        // Nested arms must not retain a general expression frame, which
+        // also reserves stack for unrelated call/aggregate cases.
+        let value = match expression {
+            ScalarExpression::If { .. } | ScalarExpression::UnitIf { .. } => {
+                self.evaluate_conditional_expression(expression, scope, ordinal, read_mode)
+            }
+            _ => self.evaluate_expression(expression, scope, ordinal, read_mode),
+        }?;
         if self.capture_call_points && self.cursor != before {
             if let Some(point) = self.cursor {
                 self.proof_points.evaluations.insert(ordinal, point);
@@ -1874,7 +1881,7 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Some((ordinal, side, comparison_formal))
     }
 
-    fn evaluate_expression(
+    fn evaluate_conditional_expression(
         &mut self,
         expression: &ScalarExpression,
         scope: ReferenceScopeId,
@@ -1882,7 +1889,6 @@ impl<'a> ReferenceFlowBuilder<'a> {
         read_mode: ExpressionReadMode,
     ) -> Result<ReferenceValue, ReferenceAnalysisError> {
         let span = expression_span(expression);
-        let parent = OccurrenceParent::Expression(ordinal);
         let calls = self.call_sites;
         match expression {
             ScalarExpression::If {
@@ -1938,6 +1944,23 @@ impl<'a> ReferenceFlowBuilder<'a> {
                 self.conditional(condition, then_branch, None, span, scope, region,
                     ordinal, false, false, false, literal_unit)
             }
+            _ => unreachable!("only typed value and unit conditionals use the conditional evaluator"),
+        }
+    }
+
+    fn evaluate_expression(
+        &mut self,
+        expression: &ScalarExpression,
+        scope: ReferenceScopeId,
+        ordinal: OccurrenceOrdinal,
+        read_mode: ExpressionReadMode,
+    ) -> Result<ReferenceValue, ReferenceAnalysisError> {
+        let span = expression_span(expression);
+        let parent = OccurrenceParent::Expression(ordinal);
+        let calls = self.call_sites;
+        match expression {
+            ScalarExpression::If { .. } | ScalarExpression::UnitIf { .. } =>
+                unreachable!("conditionals dispatched outside the general evaluator"),
             ScalarExpression::Block(block) => {
                 let result = self.block_result(block, self.block_ordinal(parent, OccurrenceEdge::BlockBody), false)?;
                 let checked_terminal = match result.output_points.as_slice() {
