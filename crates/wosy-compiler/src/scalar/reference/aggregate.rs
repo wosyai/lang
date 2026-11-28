@@ -3698,10 +3698,6 @@ impl StructuredOwnerReturn {
     }
 }
 
-// Exact source-ordered scalar companions around a unique whole owner move.
-// Used by both local receipt seeding and prepared owning-formal hops.
-const MAX_OWNING_CALL_ARGUMENTS: usize = 4;
-
 pub(super) struct MultiFormalForwardShape {
     call: CfgPointId,
     // Exact whole move -> (source formal slot, destination call slot).
@@ -3711,7 +3707,7 @@ pub(super) struct MultiFormalForwardShape {
 pub(super) fn exact_multi_formal_forward(
     points: &[ReferenceFlowPoint], sites: &FunctionCallSites, facts: &AggregateFlowFacts,
 ) -> Option<Box<MultiFormalForwardShape>> {
-    if !(2..=MAX_OWNING_CALL_ARGUMENTS).contains(&facts.formals.len())
+    if facts.formals.len() < 2
         || !facts.raw_formals.is_empty() || !ordinary_formal_outputs(&sites.boundary.root_outputs)
         || facts.input_moves.len() != 1
     {
@@ -3726,8 +3722,7 @@ pub(super) fn exact_multi_formal_forward(
     let call_point = points.get(call.0)?;
     let CfgPointKind::Call { argument_points, .. } = &call_point.kind else { return None };
     let signature = sites.checked_call_signatures.get(&ordinal)?;
-    if signature.parameters.len() > MAX_OWNING_CALL_ARGUMENTS
-        || sites.declared_unsafe_calls.contains(&ordinal.0)
+    if sites.declared_unsafe_calls.contains(&ordinal.0)
         || signature.outputs.outputs.len() != 1
         || &signature.outputs.outputs[0].ty != &sites.boundary.root_outputs.first()?.ty
     {
@@ -3735,24 +3730,26 @@ pub(super) fn exact_multi_formal_forward(
     }
     let next = |id| linear_successor(points, id).and_then(|next| points.get(next.0));
     let mut point = points.get(argument_points.first()?.0)?;
-    let mut heads = [CfgPointId(0); MAX_OWNING_CALL_ARGUMENTS];
+    let mut heads = Vec::with_capacity(signature.parameters.len());
     let mut lanes = BTreeMap::new();
-    let mut seen = [false; MAX_OWNING_CALL_ARGUMENTS];
+    let mut remaining = HashMap::with_capacity(facts.formals.len());
+    for (&formal, binding) in &facts.formals {
+        if remaining.insert(binding, formal).is_some() { return None; }
+    }
     for (slot, parameter) in signature.parameters.iter().enumerate() {
         let plain = exact_call_argument_head(sites, ordinal, slot, parameter, point, call_point.scope)?;
-        heads[slot] = point.id;
+        heads.push(point.id);
         if let Some(&ArgumentProvenance::WholeMove(expected)) = moves.get(&slot) {
             let Some(PlainNameIdentity::Lexical(holder)) = plain else { return None };
-            let (index, (&formal, _)) = facts.formals.iter().enumerate().find(|(_, (_, binding))| *binding == holder)?;
+            let formal = remaining.remove(holder)?;
             let declared = sites.boundary.parameters.get(formal)?;
             let moved = next(point.id)?;
-            if seen[index] || declared.ty != *parameter || moved.id != expected
+            if declared.ty != *parameter || moved.id != expected
                 || !exact_call_argument_move(point, moved, holder, parameter)
             {
                 return None;
             }
-            seen[index] = true;
-            lanes.insert(moved.id, (formal, slot));
+            if lanes.insert(moved.id, (formal, slot)).is_some() { return None; }
             point = next(moved.id)?;
         } else {
             if moves.contains_key(&slot) || !exact_pure_call_companion(&point.kind, plain) || !ordinary_value(parameter) {
@@ -3761,8 +3758,8 @@ pub(super) fn exact_multi_formal_forward(
             point = next(point.id)?;
         }
     }
-    if point.id != call || lanes.len() != facts.formals.len()
-        || !exact_direct_call(point, &heads[..signature.parameters.len()])
+    if point.id != call || !remaining.is_empty()
+        || !exact_direct_call(point, &heads)
         || !matches!(&next(call)?.kind, CfgPointKind::ReturnOutput { output: 0, value_point, checked: false } if *value_point == call)
     {
         return None;
@@ -3813,27 +3810,27 @@ pub(super) fn exact_owning_call_arguments<'a>(
     sites: &FunctionCallSites, ordinal: OccurrenceOrdinal, parameters: &[ScalarType],
     holder: &ReferenceBindingId, holder_type: &ScalarType,
 ) -> Option<(&'a ReferenceFlowPoint, usize, CfgPointId)> {
-    let (call, Some((slot, moved))) = exact_bounded_call_arguments(
+    let (call, Some((slot, moved))) = exact_ordered_call_arguments(
         points, first, scope, sites, ordinal, parameters, Some((holder, holder_type)),
     )? else { return None };
     Some((call, slot, moved))
 }
 
-fn exact_bounded_call_arguments<'a>(
+fn exact_ordered_call_arguments<'a>(
     points: &'a [ReferenceFlowPoint], first: &'a ReferenceFlowPoint, scope: ReferenceScopeId,
     sites: &FunctionCallSites, ordinal: OccurrenceOrdinal, parameters: &[ScalarType],
     owner: Option<(&ReferenceBindingId, &ScalarType)>,
 ) -> Option<(&'a ReferenceFlowPoint, Option<(usize, CfgPointId)>)> {
     let next = |id| linear_successor(points, id).and_then(|next| points.get(next.0));
-    if parameters.len() > MAX_OWNING_CALL_ARGUMENTS || sites.declared_unsafe_calls.contains(&ordinal.0) {
+    if sites.declared_unsafe_calls.contains(&ordinal.0) {
         return None;
     }
-    let mut argument_points = [CfgPointId(0); MAX_OWNING_CALL_ARGUMENTS];
+    let mut argument_points = Vec::with_capacity(parameters.len());
     let mut owned = None;
     let mut consumer = first;
     for (slot, parameter) in parameters.iter().enumerate() {
         let plain = exact_call_argument_head(sites, ordinal, slot, parameter, consumer, scope)?;
-        argument_points[slot] = consumer.id;
+        argument_points.push(consumer.id);
         if let Some((holder, _)) = owner.filter(|(_, holder_type)| parameter == *holder_type) {
             let moved = next(consumer.id)?;
             if owned.is_some()
@@ -3850,7 +3847,7 @@ fn exact_bounded_call_arguments<'a>(
             consumer = next(consumer.id)?;
         }
     }
-    if !exact_direct_call(consumer, &argument_points[..parameters.len()]) {
+    if !exact_direct_call(consumer, &argument_points) {
         return None;
     }
     Some((consumer, owned))
@@ -4185,7 +4182,6 @@ impl Body<'_> {
                 let owner_consumer = (|| {
                     if sibling_choices.is_empty() && conditional.is_none() { return None; }
                     let signature = self.sites.checked_call_signatures.get(&call_expression)?;
-                    if signature.parameters.len() > MAX_OWNING_CALL_ARGUMENTS { return None; }
                     let (slot, ty) = signature.parameters.iter().enumerate()
                         .find(|(_, ty)| matches!(ty, ScalarType::Struct(_)))?;
                     let OccurrenceNode::Expression(argument) = *structure.edges.get(&(
@@ -4321,7 +4317,7 @@ impl Body<'_> {
                 { return None; }
                 if signature.parameters.iter().all(ordinary_value) {
                     if siblings.len() == MAX_SIBLING_RECEIPTS { return None; }
-                    let (call, None) = exact_bounded_call_arguments(
+                    let (call, None) = exact_ordered_call_arguments(
                         points, read, scope, self.sites, step_init.primary, &signature.parameters, None,
                     )? else { return None };
                     let installed = next(call.id)?;
@@ -4735,7 +4731,7 @@ impl Body<'_> {
                     }
                     if independent.is_some() {
                         let signature = self.sites.checked_call_signatures.get(&output.expression)?;
-                        let (call, None) = exact_bounded_call_arguments(
+                        let (call, None) = exact_ordered_call_arguments(
                             points, next(entry.id)?, entry.scope, self.sites, output.expression, &signature.parameters, None,
                         )? else { return None };
                         if call.id != id { return None; }
@@ -5051,7 +5047,7 @@ impl Body<'_> {
         let facts = self.facts?;
         let [output] = self.sites.boundary.root_outputs.as_slice() else { return None };
         let parameters = &self.sites.boundary.parameters;
-        if !self.is_monomorphic || parameters.len() > MAX_OWNING_CALL_ARGUMENTS || output.output != 0
+        if !self.is_monomorphic || output.output != 0
             || !matches!(output.ty, ScalarType::Struct(_))
         { return None; }
         let slot = parameters.iter().position(|parameter| parameter.ty == output.ty)?;
@@ -5067,16 +5063,18 @@ impl Body<'_> {
         Some((slot, parameter, formal))
     }
 
-    fn is_identity_parameter(&self, binding: &ReferenceBindingId, formal: &ReferenceBindingId) -> bool {
+    fn is_identity_parameter(binding: &ReferenceBindingId, formal: &ReferenceBindingId, parameters: &HashSet<ByteSpan>) -> bool {
         binding.kind == ReferenceBindingKind::Declared && binding.source == formal.source
             && binding.function_span == formal.function_span && binding.block_span == formal.block_span
-            && self.sites.boundary.parameters.iter().any(|parameter| parameter.span == binding.declaration_span)
+            && parameters.contains(&binding.declaration_span)
     }
 
     pub(super) fn exact_identity_relay_slot(&self) -> Option<usize> {
         let (slot, parameter, formal) = self.exact_identity_formal()?;
         if !self.return_owners().eq([Some(OwnerSource::Formal(slot))]) { return None; }
-        let is_companion = |binding: &ReferenceBindingId| binding != formal && self.is_identity_parameter(binding, formal);
+        let parameters = self.sites.boundary.parameters.iter().map(|parameter| parameter.span).collect();
+        let is_companion = |binding: &ReferenceBindingId|
+            binding != formal && Self::is_identity_parameter(binding, formal, &parameters);
         let mut read = None;
         let mut moved = false;
         let mut returned = false;
@@ -5120,13 +5118,20 @@ impl Body<'_> {
         let scope = points.first()?.scope;
         let next = |id| points.get(linear_successor(points, id)?.0).filter(|point| point.scope == scope);
         let mut first = points.first()?;
-        // Skip only function/scope prologue and the exact declared parameters.
-        // Cap the prefix independently of the body size.
-        for _ in 0..=MAX_OWNING_CALL_ARGUMENTS + 2 {
-            if !matches!(&first.kind, CfgPointKind::Entry | CfgPointKind::ScopeEnter)
-                && !matches!(&first.kind, CfgPointKind::Bind { binding } if self.is_identity_parameter(binding, formal))
-            { break; }
-            first = next(first.id)?;
+        // Traverse the authored prologue, not a fixed arity budget. A
+        // repeated or foreign binder cannot authenticate a formal.
+        let parameters = self.sites.boundary.parameters.iter().map(|parameter| parameter.span).collect();
+        let mut declared = HashSet::new();
+        loop {
+            match &first.kind {
+                CfgPointKind::Entry | CfgPointKind::ScopeEnter => {}
+                CfgPointKind::Bind { binding } if Self::is_identity_parameter(binding, formal, &parameters) =>
+                    if !declared.insert(binding.declaration_span) { return None; },
+                _ => break,
+            }
+            let successor = next(first.id)?;
+            if successor.id <= first.id { return None; }
+            first = successor;
         }
         let (call, target_slot, moved) = exact_owning_call_arguments(
             points, first, scope, self.sites, output.expression, &signature.parameters, formal, &parameter.ty,
@@ -11809,6 +11814,70 @@ mod tests {
         assert!(!could_call_fresh_recursive_array(Some(&row(ScalarType::U16, 3, ScalarType::U64, other_site)), &candidates));
         assert!(!could_call_fresh_recursive_array(Some(&row(ScalarType::U8, 2, ScalarType::U64, other_site)), &candidates));
         assert!(!could_call_fresh_recursive_array(Some(&row(ScalarType::U8, 3, ScalarType::Bool, other_site)), &candidates));
+    }
+
+    #[test]
+    fn owning_call_preparation_uses_typed_arity_and_exact_forwarding_slots() {
+        let text = "%%start
+struct Parcel { u64 stamp; }
+Parcel(u64, Parcel, u64, u64, u64, u64) identity = fn(a, owner, b, c, d, e) {
+    a; b; c; d; e; owner
+};
+Parcel(Parcel, u64, u64, u64, u64, u64) forward = fn(owner, a, b, c, d, e) {
+    identity(e, owner, d, c, b, a)
+};
+Parcel(Parcel, u64, u64, u64, u64, u64) changed = fn(owner, a, b, c, d, e) {
+    identity(e + 1, owner, d, c, b, a)
+};
+u64(Parcel, Parcel, u64, Parcel, Parcel, Parcel) sink = fn(a, b, key, c, d, e) {
+    a.stamp + b.stamp + c.stamp + d.stamp + e.stamp + key
+};
+u64(Parcel, Parcel, Parcel, u64, Parcel, Parcel) wide = fn(a, b, c, key, d, e) {
+    sink(e, a, key, d, c, b)
+};
+u64(Parcel, Parcel, Parcel, u64, Parcel, Parcel) wide_changed = fn(a, b, c, key, d, e) {
+    sink(e, a, key + 1, d, c, b)
+};
+%%end";
+        for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
+            let source = SourceIdentity::new("project".into(), "workbench".into(), "src/owning_arity.w".into(), "r1".into());
+            let parsed = crate::parse_source(source.clone(), text.to_owned(), &[]);
+            assert!(parsed.diagnostics.is_empty(), "{:?}", parsed.diagnostics);
+            let prepared = prepare_scalar_project(
+                vec![(derive_scalar_declarations_from_cst(parsed.result.canonical_cst()), Vec::new())],
+                vec![source.clone()], ScalarPreparationInputs { target_layout },
+            ).unwrap_or_else(|failure| panic!("{:?}", failure.diagnostics));
+            let module = &prepared.project().modules[0];
+            for (item, value) in module.items.iter().enumerate() {
+                let ScalarItem::Function(function) = value else { continue };
+                let sites = prepared.function_calls(0, item);
+                let mut errors = Vec::new();
+                let result = derive_function_reference_result(
+                    &source, function, &HashSet::new(), sites, &module.structs, &module.enums,
+                    None, ReferenceCapture { call_points: true, ..Default::default() }, &mut errors,
+                );
+                assert!(errors.is_empty(), "{errors:?}");
+                let body = Body { facts: Some(&result.aggregate), cfg: &result.cfg, sites, source: &source,
+                    is_monomorphic: true, supports_input_result: false };
+                match function.name.as_str() {
+                    "identity" => assert_eq!(body.exact_identity_relay_slot(), Some(1)),
+                    "forward" => {
+                        let (source, call, destination) = body.exact_identity_relay_dependency().expect("wide exact relay");
+                        assert_eq!((source, destination), (0, 1));
+                        assert!(matches!(&result.cfg.points[call.0].kind,
+                            CfgPointKind::Call { argument_points, .. } if argument_points.len() == 6));
+                    }
+                    "changed" => assert!(body.exact_identity_relay_dependency().is_none()),
+                    "wide" => {
+                        let destinations: BTreeMap<_, _> = result.aggregate.multi_formal_forward.iter()
+                            .map(|(&(_, _, destination), &source)| (destination, source)).collect();
+                        assert_eq!(destinations, BTreeMap::from([(0, 5), (1, 0), (3, 4), (4, 2), (5, 1)]));
+                    }
+                    "wide_changed" => assert!(result.aggregate.multi_formal_forward.is_empty()),
+                    _ => {}
+                }
+            }
+        }
     }
 
     #[test]
