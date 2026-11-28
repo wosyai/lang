@@ -21515,7 +21515,7 @@ i32(i32) transform=fn(x) { x };
             assert_eq!(snippet(pending.declaration.range), "mesh");
             assert!(snippet(pending.call.range).starts_with("host.mesh("));
             assert_eq!(pending.pending_arguments.len(), 4);
-            assert_eq!(pending.verified_prefix, [wosy_syntax::SourceSpan::new(source.clone(), required)]);
+            assert!(pending.verified_prefix.spans().eq([wosy_syntax::SourceSpan::new(source.clone(), required)]));
 
             let observed=stateful_provider::take_requirement_results();
             assert_eq!(observed,vec![(wosy_syntax::SourceSpan::new(source.clone(),required),true)]);
@@ -26380,7 +26380,7 @@ unit(u8) parent = fn(a) {
             assert!(call.starts_with("bridge.indexed("));
             assert_eq!(pending.signature.parameters.len(), 7);
             assert_eq!(pending.pending_arguments.len(), 7);
-            assert_eq!(pending.verified_prefix, [authored.clone()]);
+            assert!(pending.verified_prefix.spans().eq([authored.clone()]));
             assert!(pending.invocation.iter().any(|site| site.source == app
                 && passing[site.range.start as usize..site.range.end as usize].starts_with("packing.transmit(")));
             assert!(matches!(prepare(&text).search_startup_authored_path(NonZeroUsize::new(2).unwrap()),Err(ProjectCheck::Unsupported)));

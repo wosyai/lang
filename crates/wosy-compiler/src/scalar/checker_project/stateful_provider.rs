@@ -5,6 +5,7 @@ use super::ordered_float_prefix::{self,ExactValue,ObservedStep,ObservedTrace};
 use super::super::checker_flow::{ProjectedStorage,apply_observed_integer_operator,charge_call_work,observed_f32_array};
 use super::super::reference::{BlockOrdinal,OccurrenceEdge,OccurrenceNode,OccurrenceParent,PlainNameIdentity};
 use super::super::control::AssignmentReplacement;
+use std::collections::BTreeMap;
 use wosy_syntax::SourceSpan;
 
 #[derive(Clone)]
@@ -352,7 +353,31 @@ pub(super) struct PendingExternalCall {
     pub(super) pending_arguments: Vec<SourceSpan>,
     // Actual requirements proved on this single observed prefix. These are
     // not entry summaries and say nothing about post-call state.
-    pub(super) verified_prefix: Vec<SourceSpan>,
+    pub(super) verified_prefix: VerifiedRequirePrefix,
+}
+
+#[derive(Debug, Default, PartialEq)]
+pub(super) struct VerifiedRequirePrefix {
+    owners: BTreeMap<usize, SourceIdentity>,
+    // Repeated evaluations are distinct events; do not deduplicate them.
+    events: Vec<(usize, ByteSpan)>,
+}
+
+impl VerifiedRequirePrefix {
+    fn seal(project: &ScalarProject, events: Vec<(usize, ByteSpan)>) -> Option<Self> {
+        let mut owners = BTreeMap::new();
+        for &(owner, _) in &events {
+            if let std::collections::btree_map::Entry::Vacant(slot) = owners.entry(owner) {
+                slot.insert(project.modules.get(owner)?.source.clone());
+            }
+        }
+        Some(Self { owners, events })
+    }
+
+    #[cfg(test)]
+    pub(super) fn spans(&self) -> impl Iterator<Item = SourceSpan> + '_ {
+        self.events.iter().map(|(owner, range)| SourceSpan::new(self.owners[owner].clone(), *range))
+    }
 }
 
 fn pending_external_call(
@@ -381,7 +406,7 @@ fn pending_external_call(
         signature: signature.clone(),
         invocation: Vec::new(),
         pending_arguments,
-        verified_prefix: Vec::new(),
+        verified_prefix: VerifiedRequirePrefix::default(),
     })
 }
 
@@ -581,7 +606,7 @@ pub(super) fn run<'a>(
                 )) {
                     if let Some(mut pending) = pending_external_call(body, owner, *block) {
                         pending.invocation.extend(stack.iter().filter_map(|activation| activation.entered_at.clone()));
-                        pending.verified_prefix = verified_prefix;
+                        pending.verified_prefix = VerifiedRequirePrefix::seal(project, verified_prefix)?;
                         dispatch.pending_external_call = Some(pending);
                         return None;
                     }
@@ -710,7 +735,7 @@ pub(super) fn run<'a>(
                     REQUIREMENT_RESULTS.with(|log| log.borrow_mut().push((authored,accepted)));
                 }
                 if accepted {
-                    verified_prefix.push(span(site)?);
+                    verified_prefix.push((frame.target.0, body.occurrences.get(site.0)?.span));
                     // Require is not a scope-narrowing operation. Its valid
                     // actual state simply follows the next prepared item.
                     values.push(ResultValue::Unit);
