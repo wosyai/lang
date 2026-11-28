@@ -5953,6 +5953,1326 @@ impl<'a> ReferenceFlowBuilder<'a> {
         Ok(self.block_result(block, ordinal, false)?.scalar)
     }
 
+    fn prepare_block_binding(
+        &mut self,
+        block: &ScalarBlock,
+        position: BlockPosition,
+        scope: ReferenceScopeId,
+        binding: &ScalarBinding,
+        binding_region: &BindingRegion,
+        declared: &mut Vec<(String, ReferenceBindingId, Option<ReferenceBindingId>)>,
+        declares_guarded_owner: &mut bool,
+        ordinary_root_eligible: bool,
+    ) -> Result<(), ReferenceAnalysisError> {
+        let calls = self.call_sites;
+        let BlockPosition { block: ordinal, item: item_index } = position;
+        let region = &calls.structure.blocks[ordinal.0];
+        let receiver = &binding_region.receivers()[0];
+        let outputs = match &binding_region.initialization {
+            BindingInitialization::Outputs(outputs) => outputs,
+            BindingInitialization::Allocation { .. } => {
+                &calls.query_allocation_outputs[&(ordinal, item_index)]
+            }
+        };
+        let primary = &binding.value;
+        let primary_ordinal = outputs.primary;
+        let position = BlockPosition {
+            block: ordinal,
+            item: item_index,
+        };
+        let (raw_null, prepared_raw_null) = match primary {
+            ScalarExpression::Name { name, span }
+                if matches!(receiver.ty, ScalarType::RawPointer(_)) =>
+            {
+                match self.prepared_name_identity(primary_ordinal, *span)? {
+                    Some(PlainNameIdentity::Null) => (true, true),
+                    Some(_) => (false, false),
+                    None => (name == "null", false),
+                }
+            }
+            _ => (false, false),
+        };
+        let widened_join = outputs.secondary.is_empty() && !binding.is_allocation
+            && binding.fallible_assignment.is_none() && binding_region.receivers().len() == 1
+            && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
+            && self.widened_join_inputs(primary, &receiver.ty, primary_ordinal, scope).is_some_and(|arms| {
+                self.aggregate_result.widened_join_arms.extend(arms);
+                self.aggregate_result.widened_join_receivers.insert((receiver.span.start, receiver.span.end));
+                true
+            });
+        let alias_owner = self.prepared_fallible_alias(binding, primary, primary_ordinal, scope, &receiver.ty);
+        let widened_receiver_source = if !binding.is_allocation && binding.fallible_assignment.is_none()
+            && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
+            && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
+            && !self.names.contains_key(&receiver.name)
+        {
+            self.widened_owning_argument(primary, primary_ordinal, block.span)
+                .filter(|source| self.binding_types.get(source).is_some_and(|ty|
+                    aggregate::same_runtime_array_type(ty, &receiver.ty)))
+                .map(|source| source.declaration_span)
+        } else { None };
+        let fixed_copy_receiver = (|| {
+            if binding.is_allocation || binding.fallible_assignment.is_some()
+                || binding_region.receivers().len() != 1 || !outputs.secondary.is_empty()
+                || binding.output_origin != ScalarBindingOutputOrigin::SingleExpression
+                || !self.generic_parameters.is_empty() || self.names.contains_key(&receiver.name)
+                || calls.declared_unsafe_calls.contains(&primary_ordinal.0)
+            { return None; }
+            let ScalarExpression::Call { arguments, .. } = primary else { return None; };
+            let [ScalarExpression::Name { span, .. }] = arguments.as_slice() else { return None; };
+            let signature = calls.checked_call_signatures.get(&primary_ordinal)?;
+            if !aggregate::neutral_array_signature(&signature.parameters, &signature.outputs)
+                || !aggregate::same_runtime_array_type(&signature.parameters[0], &receiver.ty)
+                || !matches!(self.call_target(primary, primary_ordinal),
+                    Ok(ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }))
+            { return None; }
+            let OccurrenceNode::Expression(argument) = calls.structure.edges.get(&(
+                OccurrenceParent::Expression(primary_ordinal), OccurrenceEdge::CallArgument(0)))? else { return None; };
+            let PlainNameIdentity::Lexical(source) = self.prepared_name_identity(*argument, *span).ok().flatten()?
+            else { return None; };
+            let (_, count) = self.binding_types.get(source).and_then(|ty|
+                super::fixed_copy_to_runtime(&signature.parameters[0], ty))?;
+            Some((source.declaration_span, count))
+        })();
+        // Count expressions have their own prepared occurrence edge.
+        // Evaluate it before the allocation placeholder and owner
+        // Bind; the same ordered scalar proof is used for ordinary RHS.
+        let checked_count = (|| {
+            if block.unsafe_context || !self.generic_parameters.is_empty()
+                || !matches!(&receiver.ty, ScalarType::RuntimeArray { element, .. } if aggregate::ordinary_value(element))
+            { return None; }
+            let BindingInitialization::Allocation { lengths } = &binding_region.initialization else { return None; };
+            let [length] = lengths.as_slice() else { return None; };
+            let value = binding.receivers[0].allocation_length.as_ref()?;
+            if !matches!(value, ScalarExpression::Call { .. })
+                && !calls.candidate_fallible_composite(value, length.expression)
+            { return None; }
+            let exact_call = !matches!(value, ScalarExpression::Call { .. }) || matches!(
+                calls.allocation_length_call_targets.get(&length.expression),
+                Some(ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }));
+            (length.position == 0 && exact_call
+                && calls.structure.checked_types.expressions.get(&length.expression) == Some(&ScalarType::U64))
+                .then_some((value, length.expression))
+        })();
+        if let Some((value, length)) = checked_count {
+            let previous = self.capture_call_points;
+            self.capture_call_points = true;
+            let evaluated = self.expression(value, scope, length);
+            self.capture_call_points = previous;
+            evaluated?;
+            if let Some(proof) = self.guarded_numeric_expression(value, length, &ScalarType::U64) {
+                self.aggregate_result.ordinary_fallible_expressions.push((None, vec![proof]));
+            }
+        }
+        let before = self.cursor;
+        // SystemPanic terminates execution, not the current
+        // lexical scope via an unwind. Existing local owners
+        // retain their normal lexical release on success.
+        let ordinary_root_binding = ordinary_root_eligible
+            && binding.fallible_assignment.is_none() && !binding.is_allocation
+            && (matches!(receiver.ty, ScalarType::U64 | ScalarType::I32)
+                || (receiver.ty == ScalarType::Bool && matches!(primary, ScalarExpression::Unary {
+                    operator: UnaryOperator::LogicalNot, .. })))
+            && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
+            && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
+            && (matches!(primary, ScalarExpression::Call { .. }) || calls.candidate_fallible_composite(primary, primary_ordinal))
+            && calls.structure.edges.get(&(
+                OccurrenceParent::Block(calls.structure.root),
+                OccurrenceEdge::BindingRoot { item: position.item, output: 0 },
+            )) == Some(&OccurrenceNode::Expression(primary_ordinal));
+        let ordinary_aggregate = !block.unsafe_context && self.generic_parameters.is_empty()
+            && binding.fallible_assignment.is_none() && !binding.is_allocation
+            && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
+            && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
+            && (matches!((&receiver.ty, primary),
+                (ScalarType::Struct(_), ScalarExpression::StructLiteral { .. })
+                | (ScalarType::Array { .. }, ScalarExpression::ArrayLiteral { .. }))
+                || super::widened_local_literal(binding).is_some_and(|(_, _, _)|
+                    calls.structure.checked_types.expressions.get(&primary_ordinal)
+                        .and_then(|actual| super::fixed_copy_to_runtime(&receiver.ty, actual)).is_some()))
+            && calls.structure.edges.get(&(
+                OccurrenceParent::Block(ordinal),
+                OccurrenceEdge::BindingRoot { item: position.item, output: 0 },
+            )) == Some(&OccurrenceNode::Expression(primary_ordinal));
+        let runtime_returned = binding.fallible_assignment.is_some()
+            && matches!(receiver.ty, ScalarType::RuntimeArray { .. })
+            && super::typecheck::guarded_runtime_rhs(primary);
+        let ordinary_runtime_receive = !block.unsafe_context && self.generic_parameters.is_empty()
+            && !binding.is_allocation && binding.fallible_assignment.is_none()
+            && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
+            && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
+            && matches!(&receiver.ty, ScalarType::RuntimeArray { element, .. } if aggregate::ordinary_value(element))
+            && super::typecheck::guarded_runtime_rhs(primary);
+        let walk_fallible_expression = !runtime_returned && !ordinary_runtime_receive
+            && (binding.fallible_assignment.is_some() || ordinary_root_binding)
+            && (calls.candidate_fallible_composite(primary, primary_ordinal)
+                || matches!(primary, ScalarExpression::Call { .. }
+                    if receiver.ty == ScalarType::Bool || calls.structure.callful_arguments.contains(&primary_ordinal)));
+        let value = if let Some((owner, count)) = fixed_copy_receiver {
+            self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::FixedCopyOwningArgument(owner, count))?
+        } else if let Some(owner) = widened_receiver_source {
+            self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::WidenedOwningRoundtrip(owner))?
+        } else if alias_owner.is_some() {
+            self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::FallibleAliasInitializer)?
+        } else if raw_null {
+            self.point(
+                CfgPointKind::Evaluate(primary.clone()),
+                expression_span(primary),
+                scope,
+                BTreeSet::new(),
+            );
+            ReferenceValue::Other
+        } else if binding.fallible_assignment.is_some()
+            && matches!(primary, ScalarExpression::StructLiteral { .. } | ScalarExpression::ArrayLiteral { .. })
+            && matches!(receiver.ty, ScalarType::Struct(_) | ScalarType::Array { .. } | ScalarType::RuntimeArray { .. })
+        {
+            self.expression_with_read_mode(
+                primary,
+                scope,
+                primary_ordinal,
+                ExpressionReadMode::GuardedScalarAggregateInitializer,
+            )?
+        } else if ordinary_aggregate {
+            self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::OrdinaryScalarAggregateInitializer)?
+        } else if walk_fallible_expression || runtime_returned || ordinary_runtime_receive {
+            let previous = self.capture_call_points;
+            self.capture_call_points = true;
+            let result = self.expression(primary, scope, primary_ordinal);
+            self.capture_call_points = previous;
+            result?
+        } else {
+            self.expression(primary, scope, primary_ordinal)?
+        };
+        if walk_fallible_expression {
+            let expression = self.guarded_numeric_expression(primary, primary_ordinal, &receiver.ty).filter(|_|
+                self.generic_parameters.is_empty() && binding_region.receivers().len() == 1
+                && outputs.secondary.is_empty());
+            match (binding.fallible_assignment, expression) {
+                (Some(_), Some(proof)) => self.aggregate_result.fallible_call_expressions.push(proof),
+                (None, Some(proof)) => self.aggregate_result.ordinary_fallible_expressions.push((None, vec![proof])),
+                (Some(_), None) => return Err(self.missing_context(expression_span(primary),
+                    ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer)),
+                (None, None) => {}
+            }
+        }
+        let call_producer = if binding.output_origin
+            == ScalarBindingOutputOrigin::SingleExpression
+            && matches!(primary, ScalarExpression::Call { .. })
+        {
+            Some(self.cursor.expect("evaluated binding call"))
+        } else {
+            None
+        };
+        if let (None, ScalarExpression::Call { arguments, type_arguments, .. }, Some(point)) =
+            (binding.fallible_assignment, primary, call_producer)
+        {
+            if ordinary_root_binding
+                && type_arguments.is_empty() && !calls.declared_unsafe_calls.contains(&primary_ordinal.0)
+                && matches!(arguments.as_slice(), [argument]
+                    if matches!(argument, ScalarExpression::Name { .. }) || aggregate::pure_widened_element(argument))
+                && calls.checked_call_signatures.get(&primary_ordinal).is_some_and(|signature|
+                    signature.parameters.as_slice() == [ScalarType::U64]
+                        && matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == receiver.ty))
+                && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Call { output: 0,
+                    target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. })
+            {
+                self.aggregate_result.ordinary_fallible_call_candidates.push(primary_ordinal);
+            }
+        }
+        if runtime_returned {
+            let paths = (!block.unsafe_context && self.generic_parameters.is_empty()
+                && binding_region.receivers().len() == 1 && outputs.secondary.is_empty())
+                .then(|| self.guarded_runtime_call_paths(primary, primary_ordinal, &receiver.ty)).flatten()
+                .ok_or_else(|| self.missing_context(expression_span(primary),
+                    ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer))?;
+            self.aggregate_result.guarded_array_returns.push((primary_ordinal, paths));
+        }
+        if let (Some(_), ScalarExpression::Call { arguments, .. }, false) =
+            (binding.fallible_assignment, primary, walk_fallible_expression || runtime_returned)
+        {
+            // Allocation-free callee evidence does not cover its
+            // caller-side argument evaluation.
+            let eligible = call_producer.filter(|point| self.generic_parameters.is_empty()
+                && arguments.iter().all(|argument| matches!(argument, ScalarExpression::Name { .. })
+                    || aggregate::pure_widened_element(argument))
+                && is_integer_type(&receiver.ty) && binding_region.receivers().len() == 1
+                && outputs.secondary.is_empty()
+                && !calls.declared_unsafe_calls.contains(&primary_ordinal.0)
+                && calls.checked_call_signatures.get(&primary_ordinal).is_some_and(|signature|
+                    signature.parameters.iter().all(aggregate::ordinary_value)
+                        && matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == receiver.ty))
+                && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Call { output: 0,
+                    target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. }));
+            let Some(point) = eligible else {
+                return Err(self.missing_context(expression_span(primary),
+                    ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer));
+            };
+            self.aggregate_result.fallible_call_initializers.push((point, primary_ordinal));
+        }
+        if let ([head, tail], Some(point)) = (binding_region.receivers(), call_producer) {
+            if aggregate::mixed_owner_result_lanes(&head.ty, &tail.ty).is_some()
+                && outputs.secondary.as_slice() == [BindingOutput::ProjectPrimary { output: 1 }]
+                && self.aggregate_facts.calls.contains_key(&point)
+                && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Call {
+                    target: ResolvedCallTarget::ModuleCallable {
+                        concrete: ConcreteCallSelection::Declaration, ..
+                    }, ..
+                })
+                && calls.checked_call_signatures.get(&primary_ordinal).is_some_and(|signature|
+                    matches!(signature.outputs.outputs.as_slice(), [first, second]
+                        if first.ty == head.ty && second.ty == tail.ty))
+            {
+                self.aggregate_result.mixed_result_bindings.insert(point);
+            }
+        }
+        if let Some(point) = call_producer {
+            let receivers = binding_region.receivers();
+            if let Some(&(ordinal, width)) = self.aggregate_facts.multi_owner_calls.get(&point) {
+                let signature = &calls.checked_call_signatures[&ordinal];
+                if !receivers.is_empty() && receivers.len() <= width
+                    && outputs.secondary.len() + 1 == receivers.len()
+                    && receivers.iter().zip(&signature.outputs.outputs).all(|(receiver, output)| receiver.ty == output.ty)
+                    && outputs.secondary.iter().enumerate().all(|(index, output)|
+                        *output == (BindingOutput::ProjectPrimary { output: index + 1 }))
+                {
+                    self.aggregate_result.multi_result_bindings.insert(point,
+                        receivers.iter().map(|receiver| ReferenceBindingId {
+                            source: self.source.clone(), function_span: self.function_span,
+                            declaration_span: receiver.span, block_span: block.span,
+                            kind: ReferenceBindingKind::Declared,
+                        }).collect());
+                }
+            }
+        }
+        let initializer = self.cursor.filter(|_| self.cursor != before);
+        if prepared_raw_null
+            && (self.aggregate_facts.local_array_copy_allocation.is_some()
+                || (scope == ReferenceScopeId(0) && calls.call_occurrences.len() == 2
+                    && matches!(self.proof_points.backing_descriptor_install,
+                        ScalarDescriptorCandidates::One(..))))
+        {
+            self.aggregate_facts.checked_raw_null_initializers.insert(
+                initializer.expect("prepared raw null evaluation"),
+            );
+        }
+        if self.capture_call_points && raw_null {
+            self.proof_points
+                .evaluations
+                .insert(primary_ordinal, initializer.expect("raw null evaluation"));
+        }
+        let guarded_move = (|| {
+            if binding.is_allocation || binding.fallible_assignment.is_some() || block.unsafe_context
+                || !self.generic_parameters.is_empty() || binding_region.receivers().len() != 1
+                || !outputs.secondary.is_empty()
+            { return None; }
+            let ScalarExpression::Name { span, .. } = primary else { return None; };
+            let Some(PlainNameIdentity::Lexical(source)) = self.prepared_name_identity(primary_ordinal, *span).ok().flatten()
+            else { return None; };
+            let site = self.proof_points.fallible_allocation_bindings.as_ref()?.get(source)?;
+            aggregate::same_runtime_array_type(&site.ty, &receiver.ty).then(|| source.clone())
+        })();
+        let ordinary_array_receive = ordinary_runtime_receive
+            .then(|| self.guarded_runtime_call_paths(primary, primary_ordinal, &receiver.ty))
+            .flatten();
+        let widened_move = outputs.secondary.is_empty()
+            && self.exact_widened_binding_move(binding, primary, primary_ordinal, block.span);
+        self.move_value_with_widened_receipt(primary, scope, primary_ordinal, widened_move)?;
+        let id = ReferenceBindingId {
+            source: self.source.clone(),
+            function_span: self.function_span,
+            declaration_span: receiver.span,
+            block_span: block.span,
+            kind: ReferenceBindingKind::Declared,
+        };
+        self.binding_types.record(id.clone(), receiver.ty.clone(), self.deferred_local_reborrow.then_some(scope));
+        if let Some(paths) = ordinary_array_receive {
+            self.proof_points.ordinary_array_receivers.insert(id.clone(), primary_ordinal);
+            self.aggregate_result.ordinary_array_receivers.push((
+                primary_ordinal, aggregate::OrdinaryArrayDestination::Declaration(receiver.span), paths,
+            ));
+        }
+        if let Some(source) = guarded_move {
+            *declares_guarded_owner = true;
+            let read = initializer.ok_or_else(|| self.missing_context(expression_span(primary),
+                ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer))?;
+            let moved = self.cursor.filter(|point| *point != read)
+                .ok_or_else(|| self.missing_context(expression_span(primary),
+                    ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer))?;
+            self.cfg.allocations.insert(id.clone());
+            self.proof_points.guarded_runtime_receivers.insert(id.clone());
+            self.proof_points.guarded_runtime_moves.insert(read, GuardedRuntimeMove {
+                source, target: id.clone(), target_ty: receiver.ty.clone(), rhs: primary_ordinal.0, replacement: None, moved, scope,
+            });
+        }
+        if let Some(owner) = alias_owner {
+            self.proof_points.fallible_aliases.insert(id.clone(), owner);
+        }
+        if let Some(owner) = widened_receiver_source {
+            let point = call_producer.filter(|point| self.aggregate_facts.array_calls.get(point)
+                .is_some_and(|(actual, _, source)| *actual == primary_ordinal && source.declaration_span == owner))
+                .ok_or_else(|| self.missing_context(expression_span(primary),
+                    ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer))?;
+            self.aggregate_result.widened_owning_receives.push((point, primary_ordinal, owner, receiver.span, None));
+        }
+        let widened_fixed_copy = if let Some((_, count)) = calls.structure.checked_types.expressions.get(&primary_ordinal)
+            .and_then(|actual| super::widened_fixed_copy(binding, actual))
+        {
+            let ScalarExpression::Name { span, .. } = primary else { unreachable!() };
+            let exact = self.prepared_name_identity(primary_ordinal, *span)?;
+            let Some(PlainNameIdentity::Lexical(source)) = exact.filter(|identity|
+                self.generic_parameters.is_empty()
+                    && matches!(identity, PlainNameIdentity::Lexical(source)
+                        if self.binding_types.get(source).and_then(|ty| super::widened_fixed_copy(binding, ty))
+                            .is_some_and(|(_, actual)| actual == count)))
+            else {
+                return Err(self.missing_context(*span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
+            };
+            self.aggregate_result.widened_fixed_copies.insert((receiver.span.start, receiver.span.end),
+                (source.declaration_span, count));
+            true
+        } else { false };
+        if let Some((owner, count)) = fixed_copy_receiver {
+            let point = call_producer.ok_or_else(|| self.missing_context(expression_span(primary),
+                ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer))?;
+            let CfgPointKind::Call { argument_points, .. } = &self.cfg.points[point.0].kind
+            else { return Err(self.missing_context(expression_span(primary), ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer)); };
+            if !matches!(argument_points.as_slice(), [argument]
+                if matches!(&self.cfg.points[argument.0].kind, CfgPointKind::Read { binding } if binding.declaration_span == owner))
+            { return Err(self.missing_context(expression_span(primary), ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer)); }
+            self.aggregate_result.fixed_copy_owning_arguments.insert(primary_ordinal.0, count);
+            self.aggregate_result.widened_owning_receives.push((point, primary_ordinal, owner, receiver.span, None));
+        }
+        let widened = widened_join || widened_move || widened_receiver_source.is_some()
+            || fixed_copy_receiver.is_some() || widened_fixed_copy
+            || super::widened_local_literal(binding).is_some();
+        if widened {
+            self.widened_arrays.get_or_insert_with(HashSet::new).insert(id.clone());
+        }
+        let runtime_generated = (super::generated_runtime_scalar_binding(binding)
+            || (matches!(receiver.ty, ScalarType::RuntimeArray { .. })
+                && super::anonymous_callable::candidate_generated_callable(binding).is_some()))
+            && calls.structure.checked_types.expressions.get(&primary_ordinal) == Some(&receiver.ty);
+        if binding.is_allocation || widened || runtime_generated {
+            self.cfg.allocations.insert(id.clone());
+        }
+        let runtime_literal_length = super::guarded_runtime_literal(binding).and_then(|(_, values, _)| {
+            let (_, length) = super::fixed_copy_to_runtime(&receiver.ty,
+                calls.structure.checked_types.expressions.get(&primary_ordinal)?)?;
+            (length == values.len() as u64).then_some(length)
+        });
+        if binding.fallible_assignment.is_some()
+            && (runtime_returned || runtime_literal_length.is_some() || is_integer_type(&receiver.ty)
+                || matches!(receiver.ty, ScalarType::Struct(_) | ScalarType::Array { .. } | ScalarType::Bool))
+        {
+            *declares_guarded_owner = true;
+            let whole_copy = matches!(&receiver.ty, ScalarType::Struct(_))
+                && matches!(copy_policy(&receiver.ty, self.structs, self.enums, &self.generic_parameters),
+                    Ok(CopyPolicy::Copy));
+            self.proof_points.fallible_allocation_bindings.get_or_insert_with(HashMap::new).insert(
+                id.clone(), super::control::GuardedAllocationBinding {
+                    scope, ty: receiver.ty.clone(), whole_copy, runtime_literal_length, runtime_returned,
+                },
+            );
+            self.local_borrow = None;
+        }
+        let origins = match value {
+            ReferenceValue::Checked(origins) => Some(origins),
+            ReferenceValue::Other
+                if matches!(receiver.ty, ScalarType::CheckedReference { .. }) =>
+            {
+                return Err(self.missing_origin(
+                    receiver.span,
+                    id,
+                    ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                ));
+            }
+            ReferenceValue::Other => None,
+            ReferenceValue::Uncomputed
+                if matches!(receiver.ty, ScalarType::CheckedReference { .. }) =>
+            {
+                self.checked.insert(id.clone());
+                self.origins.remove(&id);
+                self.uncomputed_point(
+                    CfgPointKind::Bind {
+                        binding: id.clone(),
+                    },
+                    receiver.span,
+                    scope,
+                );
+                self.record_binding_definition(
+                    position,
+                    0,
+                    binding.is_allocation,
+                    initializer,
+                );
+                let old = self.names.insert(receiver.name.clone(), id.clone());
+                declared.push((receiver.name.clone(), id, old));
+                self.additional_receivers(
+                    binding,
+                    block,
+                    scope,
+                    declared,
+                    call_producer,
+                    binding_region.receivers(),
+                    outputs.primary,
+                    &outputs.secondary,
+                    position,
+                )?;
+                return Ok(());
+            }
+            ReferenceValue::Uncomputed => None,
+        };
+        let old = self.names.insert(receiver.name.clone(), id.clone());
+        if let Some(origins) = origins {
+            self.checked.insert(id.clone());
+            self.origins.insert(id.clone(), origins.clone());
+            self.point(
+                CfgPointKind::Bind {
+                    binding: id.clone(),
+                },
+                receiver.span,
+                scope,
+                origins,
+            );
+        } else {
+            self.point(
+                CfgPointKind::Bind {
+                    binding: id.clone(),
+                },
+                receiver.span,
+                scope,
+                BTreeSet::new(),
+            );
+        }
+        let widened_factory = (|| {
+            if scope != ReferenceScopeId(0) || !self.generic_parameters.is_empty()
+                || item_index != 0 || !calls.boundary.parameters.is_empty()
+                || !outputs.secondary.is_empty() || block.unsafe_context
+                || !matches!(&calls.named_place_roots, NamedPlaceRootFacts::Prepared(_))
+            { return None; }
+            let [RootOutputType { output: 0, ty }] = calls.boundary.root_outputs.as_slice()
+            else { return None };
+            let [_, BlockItem { kind: BlockItemKind::FinalOutput(output), .. }] =
+                region.items.as_slice() else { return None };
+            let [_, ScalarBlockItem::Expression(ScalarExpression::Name { name, .. })] =
+                block.items.as_slice() else { return None };
+            if output.output != 0 || *name != receiver.name
+                || !aggregate::same_runtime_array_type(&receiver.ty, ty)
+            { return None; }
+            Some((output.expression, Self::pure_widened_literal_count(binding)?, initializer?))
+        })();
+        self.record_binding_definition(position, 0,
+            binding.is_allocation || widened_factory.is_some() || runtime_generated, initializer);
+        if let Some((output, count, placeholder)) = widened_factory {
+            let bind = self.cursor.expect("widened array definition");
+            self.aggregate_facts.literal_array_bind = Some(aggregate::LiteralArrayBind {
+                bind, placeholder, position, length_occurrence: primary_ordinal,
+                extent: aggregate::FreshArrayExtent::Literal(count),
+            });
+            self.aggregate_facts.widened_literal_factory = true;
+            self.aggregate_result.widened_literal_factory = Some((receiver.span, output));
+        }
+        // The existing birth observer is selected while still at
+        // the allocation, before the write or final result is visited.
+        // Use the prepared final-output role to opt in only the new
+        // exact three-item scalar observation corridor.
+        let returned_extent_tail = scope == ReferenceScopeId(0)
+            && matches!(calls.boundary.root_outputs.as_slice(),
+                [RootOutputType { output: 0, ty: ScalarType::U64 }])
+            && matches!((region.items.as_slice(), block.items.as_slice()),
+                ([_, BlockItem { kind: BlockItemKind::Assignment { .. }, .. },
+                    BlockItem { kind: BlockItemKind::FinalOutput(slot), .. }],
+                 [_, _, ScalarBlockItem::Expression(expression)])
+                    if slot.output == 0
+                        && matches!(expression, ScalarExpression::Call { .. })
+                        && matches!(self.call_target(expression, slot.expression),
+                            Ok(ResolvedCallTarget::Core(CoreOperationId::ArrayLen))));
+        let returned_index_tail = scope == ReferenceScopeId(0)
+            && matches!(calls.boundary.root_outputs.as_slice(), [output] if aggregate::ordinary_value(&output.ty))
+            && matches!((region.items.as_slice(), block.items.as_slice()),
+                ([_, item, BlockItem { kind: BlockItemKind::FinalOutput(slot), .. }],
+                 [_, authored, ScalarBlockItem::Expression(ScalarExpression::IndexedRead { place, .. })])
+                    if slot.output == 0 && matches!((&item.kind, authored),
+                        (BlockItemKind::Assignment { .. }, ScalarBlockItem::Assignment(_)) |
+                        (BlockItemKind::Evaluation { .. }, ScalarBlockItem::Expression(
+                            ScalarExpression::If { .. } | ScalarExpression::UnitIf { .. })))
+                        && matches!(place, ScalarPlace::Index { base, index, .. }
+                        if matches!(base.as_ref(), ScalarPlace::Name { .. })
+                            && Self::returned_array_index_selector_syntax(index)));
+        if binding.is_allocation
+            && (returned_extent_tail || returned_index_tail || (region.items.len() == 2
+                && matches!(calls.boundary.root_outputs.as_slice(),
+                    [] | [RootOutputType { output: 0, ty: ScalarType::RuntimeArray { .. } }])))
+        {
+            self.observe_literal_array_bind(
+                position, scope, binding, &binding_region.initialization, initializer,
+            );
+        }
+        declared.push((receiver.name.clone(), id, old));
+        self.additional_receivers(
+            binding,
+            block,
+            scope,
+            declared,
+            call_producer,
+            binding_region.receivers(),
+            outputs.primary,
+            &outputs.secondary,
+            position,
+        )?;
+        Ok(())
+    }
+
+    fn prepare_block_assignment(
+        &mut self,
+        block: &ScalarBlock,
+        position: BlockPosition,
+        scope: ReferenceScopeId,
+        assignment: &ScalarAssignment,
+        key: &BlockPosition,
+        declared: &mut Vec<(String, ReferenceBindingId, Option<ReferenceBindingId>)>,
+    ) -> Result<usize, ReferenceAnalysisError> {
+        let BlockPosition { block: ordinal, item: item_index } = position;
+        let calls = self.call_sites;
+        let region = &calls.structure.blocks[ordinal.0];
+        let group = &calls.assignments[&(key.block, key.item)];
+        let output_types = self.assignment_output_types(group)?;
+        let guarded_replacement = (|| {
+            if block.unsafe_context || !self.generic_parameters.is_empty() { return None; }
+            let ([target], [ScalarExpression::Name { span, .. }]) =
+                (assignment.targets.as_slice(), assignment.values.as_slice()) else { return None; };
+            if !matches!(target.place, ScalarPlace::Name { .. }) { return None; }
+            let rhs = group.rhs_evaluations().next()?.expression;
+            let destination = group.destinations().next()?.destination;
+            let PlainNameIdentity::Lexical(source) = self.prepared_name_identity(rhs, *span).ok().flatten()?
+            else { return None; };
+            let DirectDestinationIdentity::Existing(target) = calls.prepared_direct_destination(destination)?
+            else { return None; };
+            let source_site = self.proof_points.fallible_allocation_bindings.as_ref()?.get(source)?;
+            let ty = self.binding_types.get(target)?;
+            (target.block_span == block.span
+                && self.proof_points.guarded_runtime_receivers.contains(target)
+                && aggregate::same_runtime_array_type(&source_site.ty, ty))
+                .then(|| (source.clone(), target.clone(), ty.clone(), rhs, destination))
+        })();
+        let widened_rebind = (|| {
+            let owners = self.widened_arrays.as_ref()?;
+            if scope != ReferenceScopeId(0) || !self.generic_parameters.is_empty() { return None; }
+            let ([target], [ScalarExpression::Name { span, .. }]) =
+                (assignment.targets.as_slice(), assignment.values.as_slice())
+            else { return None };
+            if !matches!(target.place, ScalarPlace::Name { .. }) { return None; }
+            let evaluation = group.rhs_evaluations().next()?;
+            let destination = group.destinations().next()?.destination;
+            let Some(PlainNameIdentity::Lexical(source)) =
+                self.prepared_name_identity(evaluation.expression, *span).ok().flatten()
+            else { return None };
+            let Some(DirectDestinationIdentity::Existing(target)) = calls.prepared_direct_destination(destination)
+            else { return None };
+            (source != target && source.block_span == block.span && target.block_span == block.span
+                && owners.contains(source) && owners.contains(target)
+                && self.binding_types.get(source).zip(self.binding_types.get(target))
+                    .is_some_and(|(source, target)| aggregate::same_runtime_array_type(source, target)))
+                .then_some((destination, source.declaration_span, target.declaration_span))
+        })();
+        let widened_roundtrip = (|| {
+            if scope != ReferenceScopeId(0) || !self.generic_parameters.is_empty()
+                || item_index != 1 || region.items.len() != 3
+                || !matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
+            { return None; }
+            let [_, _, BlockItem { kind: BlockItemKind::FinalOutput(observe), .. }] =
+                region.items.as_slice() else { return None };
+            let [_, _, ScalarBlockItem::Expression(observation)] = block.items.as_slice() else { return None };
+            if !matches!(self.call_target(observation, observe.expression),
+                Ok(ResolvedCallTarget::Core(CoreOperationId::ArrayLen))) { return None; }
+            let ([target], [value]) = (assignment.targets.as_slice(), assignment.values.as_slice())
+            else { return None; };
+            if !matches!(target.place, ScalarPlace::Name { .. }) { return None; }
+            let occurrence = group.rhs_evaluations().next()?.expression;
+            let source = self.widened_owning_argument(value, occurrence, block.span)?;
+            let destination = group.destinations().next()?.destination;
+            let DirectDestinationIdentity::Existing(binding) = calls.prepared_direct_destination(destination)?
+            else { return None; };
+            (source == binding).then_some((occurrence, destination, binding.declaration_span))
+        })();
+        let widened_owning_replace = (|| {
+            if scope != ReferenceScopeId(0) { return None; }
+            let owners = self.widened_arrays.as_ref()?;
+            let ([target], [value]) = (assignment.targets.as_slice(), assignment.values.as_slice())
+            else { return None; };
+            if !matches!(target.place, ScalarPlace::Name { .. }) { return None; }
+            let call = group.rhs_evaluations().next()?.expression;
+            let source = self.widened_owning_argument(value, call, block.span)?;
+            let destination = group.destinations().next()?.destination;
+            let DirectDestinationIdentity::Existing(target) = calls.prepared_direct_destination(destination)?
+            else { return None; };
+            (source != target && owners.contains(target) && target.block_span == block.span
+                && self.binding_types.get(source).zip(self.binding_types.get(target))
+                    .is_some_and(|(a, b)| aggregate::same_runtime_array_type(a, b)))
+                .then_some((call, destination, source.declaration_span, target.declaration_span))
+        })();
+        let widened_join_replace = (|| {
+            let owners = self.widened_arrays.as_ref()?;
+            let ([target], [value @ ScalarExpression::If { .. }]) =
+                (assignment.targets.as_slice(), assignment.values.as_slice()) else { return None; };
+            if !matches!(target.place, ScalarPlace::Name { .. }) { return None; }
+            let evaluation = group.rhs_evaluations().next()?.expression;
+            let destination = group.destinations().next()?.destination;
+            let DirectDestinationIdentity::Existing(target) = calls.prepared_direct_destination(destination)?
+            else { return None; };
+            if target.block_span != block.span || !owners.contains(target) { return None; }
+            let ty = self.binding_types.get(target)?;
+            let arms = self.widened_join_inputs(value, ty, evaluation, scope)?;
+            Some((destination, evaluation, target.declaration_span, arms))
+        })();
+        if let Some((_, _, _, arms)) = widened_join_replace {
+            self.aggregate_result.widened_join_arms.extend(arms);
+        }
+        let descriptor_replace = (|| {
+            if block.unsafe_context || !self.generic_parameters.is_empty()
+                || group.projected_outputs().len() != 0 { return None; }
+            let ([target], [value]) = (assignment.targets.as_slice(), assignment.values.as_slice())
+            else { return None; };
+            if !matches!(target.place, ScalarPlace::Name { .. })
+                || !super::typecheck::guarded_runtime_rhs(value) { return None; }
+            let rhs = group.rhs_evaluations().next()?.expression;
+            let destination = group.destinations().next()?.destination;
+            let DirectDestinationIdentity::Existing(owner) = calls.prepared_direct_destination(destination)?
+            else { return None; };
+            if owner.block_span != block.span
+                || !self.widened_arrays.as_ref()?.contains(owner)
+            { return None; }
+            let ty = self.binding_types.get(owner)?;
+            matches!(ty, ScalarType::RuntimeArray { element, .. } if aggregate::ordinary_value(element))
+                .then(|| (destination, rhs, owner.declaration_span, ty.clone()))
+        })();
+        let mut descriptor_paths = None;
+        let ordinary_aggregate_replacement = (|| {
+            if block.unsafe_context || !self.generic_parameters.is_empty()
+                || group.projected_outputs().len() != 0
+            { return None; }
+            let ([target], [value]) =
+                (assignment.targets.as_slice(), assignment.values.as_slice()) else { return None; };
+            if !matches!(target.place, ScalarPlace::Name { .. })
+                || !matches!(value, ScalarExpression::StructLiteral { .. } | ScalarExpression::ArrayLiteral { .. })
+            { return None; }
+            let evaluation = group.rhs_evaluations().next()?;
+            let destination = group.destinations().next()?.destination;
+            let DirectDestinationIdentity::Existing(binding) = calls.prepared_direct_destination(destination)?
+            else { return None; };
+            let ty = self.binding_types.get(binding)?;
+            (matches!((ty, value),
+                (ScalarType::Struct(_), ScalarExpression::StructLiteral { .. })
+                | (ScalarType::Array { .. }, ScalarExpression::ArrayLiteral { .. }))
+                && calls.structure.checked_types.expressions.get(&evaluation.expression) == Some(ty))
+                .then_some(evaluation.expression)
+        })();
+        let scalar_rhs_eligible = !block.unsafe_context && self.generic_parameters.is_empty()
+            && group.projected_outputs().len() == 0;
+        let mut scalar_rhs = Some(Vec::new());
+        let mut values = Vec::new();
+        for evaluation in group.rhs_evaluations() {
+            let value = &assignment.values[evaluation.position];
+            let ordinary_payload = if scalar_rhs_eligible && scalar_rhs.is_some()
+                && (matches!(value, ScalarExpression::Call { .. }) || calls.candidate_fallible_composite(value, evaluation.expression))
+            {
+                group.destinations().as_slice().get(evaluation.position).and_then(|slot| {
+                    let AssignmentReplacement::Resolved(ty @ (ScalarType::U64 | ScalarType::I32 | ScalarType::Bool)) = &slot.replacement
+                    else { return None; };
+                    let target = &assignment.targets[slot.position].place;
+                    let exact = match target {
+                        ScalarPlace::Name { .. } => matches!(calls.prepared_direct_destination(slot.destination),
+                            Some(DirectDestinationIdentity::Existing(_))),
+                        ScalarPlace::Index { .. } => {
+                            let root = self.place_root(target, slot.destination);
+                            matches!(root.place, ScalarPlace::Name { span, .. }
+                                if matches!(self.prepared_place_root(root.ordinal, *span),
+                                    Ok(Some(PreparedPlaceRoot::Lexical(_)))))
+                        }
+                        _ => false,
+                    };
+                    (exact && calls.structure.checked_types.expressions.get(&evaluation.expression) == Some(ty)).then_some(ty)
+                })
+            } else { None };
+            let exact_move = widened_roundtrip.map(|(call, _, owner)| (call, owner))
+                .or(widened_owning_replace.map(|(call, _, owner, _)| (call, owner)));
+            let mode = match exact_move {
+                Some((call, owner)) if call == evaluation.expression => ExpressionReadMode::WidenedOwningRoundtrip(owner),
+                _ if ordinary_aggregate_replacement == Some(evaluation.expression) =>
+                    ExpressionReadMode::OrdinaryScalarAggregateInitializer,
+                _ => ExpressionReadMode::Ordinary,
+            };
+            let capture = self.capture_call_points;
+            let descriptor_type = descriptor_replace.as_ref().filter(|(_, rhs, _, _)| *rhs == evaluation.expression)
+                .map(|(_, _, _, ty)| ty);
+            self.capture_call_points |= ordinary_payload.is_some() || descriptor_type.is_some();
+            let result = self.expression_with_read_mode(value, scope, evaluation.expression, mode);
+            self.capture_call_points = capture;
+            let result = result?;
+            if let Some(ty) = descriptor_type {
+                descriptor_paths = self.guarded_runtime_call_paths(value, evaluation.expression, ty);
+            }
+            if let Some(ty) = ordinary_payload {
+                if let Some(proof) = self.guarded_numeric_expression(value, evaluation.expression, ty) {
+                    scalar_rhs.as_mut().expect("eligible ordinary RHS group").push(proof);
+                } else {
+                    // Do not partially enroll a group whose other
+                    // candidate requires an unsupported expression.
+                    scalar_rhs = None;
+                }
+            }
+            let rhs_point = self.cursor.expect("evaluated assignment output");
+            self.move_value_with_widened_receipt(value, scope, evaluation.expression, widened_rebind.is_some())?;
+            if let Some((source, target, ty, rhs, destination)) = &guarded_replacement {
+                let moved = self.cursor.filter(|point| *point != rhs_point)
+                    .ok_or_else(|| self.missing_context(expression_span(value),
+                        ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer))?;
+                self.proof_points.guarded_runtime_moves.insert(rhs_point, GuardedRuntimeMove {
+                    source: source.clone(), target: target.clone(), target_ty: ty.clone(), rhs: rhs.0,
+                    replacement: Some(destination.0), moved, scope,
+                });
+            }
+            values.push((result, rhs_point));
+        }
+        if let Some(proofs) = scalar_rhs.filter(|proofs| !proofs.is_empty()) {
+            self.aggregate_result.ordinary_fallible_expressions.push((None, proofs));
+        }
+        for projection in group.projected_outputs() {
+            let producer = values[projection.producer.position].1;
+            let rhs_point = self.project_call_output(producer, projection.producer.expression, projection.output);
+            values.push((ReferenceValue::Uncomputed, rhs_point));
+        }
+        let destinations = group
+            .destinations()
+            .zip(&values)
+            .map(|(slot, _)| {
+                self.assignment_destination(
+                    &assignment.targets[slot.position],
+                    scope,
+                    slot.destination,
+                )
+            })
+            .collect::<Result<Vec<_>, _>>()?;
+        let capture = if group.previous_observations().len() > 1 {
+            self.proof_points.has_grouped_assignment_capture = Some(true);
+            Some(self.point(
+                CfgPointKind::CaptureAssignmentPrevious { writes: Vec::new() },
+                group.span,
+                scope,
+                BTreeSet::new(),
+            ))
+        } else {
+            None
+        };
+        let mut array_rebind = None;
+        let primary_array_producer = group
+            .rhs_evaluations()
+            .next()
+            .filter(|evaluation| assignment.values.len() == 1 && evaluation.position == 0)
+            .map(|evaluation| evaluation.expression);
+        let mut simple_destinations = primary_array_producer.is_some();
+        for ((slot, (value, rhs_point)), destination) in
+            group.installs().zip(values).zip(destinations)
+        {
+            let existing_prepared = matches!(&destination, ReferenceAssignmentDestination::PreparedName(DirectDestinationIdentity::Existing(_)));
+            simple_destinations &= existing_prepared;
+            let prepared_local_introduction = matches!(&destination,
+                ReferenceAssignmentDestination::PreparedName(DirectDestinationIdentity::Introduce { .. }));
+            let position = slot.position;
+            let target = &assignment.targets[position];
+            if matches!(&destination,
+                    ReferenceAssignmentDestination::PreparedName(DirectDestinationIdentity::Module(_))
+                    | ReferenceAssignmentDestination::EvaluationOnly
+                    | ReferenceAssignmentDestination::RawName)
+            {
+                self.proof_points.has_nonlexical_install = true;
+                if self.aggregate_facts.local_array_copy_allocation.is_some() {
+                    self.aggregate_facts.checked_producer_nonlocal_installs.insert(rhs_point);
+                }
+            }
+            let emitted = if let ScalarPlace::Name { name, span } = &target.place {
+                let lexical = match destination {
+                    ReferenceAssignmentDestination::PreparedName(identity) => {
+                        match identity {
+                            DirectDestinationIdentity::Existing(binding) => {
+                                Some((binding.clone(), None))
+                            }
+                            DirectDestinationIdentity::Introduce { binding, name } => {
+                                Some((binding.clone(), Some(name.as_str())))
+                            }
+                            DirectDestinationIdentity::Module(_) => None,
+                        }
+                    }
+                    ReferenceAssignmentDestination::RawName => {
+                        match self.names.get(name) {
+                            Some(binding) => Some((binding.clone(), None)),
+                            None if self.module_names.contains(name) => None,
+                            None => Some((
+                                ReferenceBindingId {
+                                    source: self.source.clone(),
+                                    function_span: self.function_span,
+                                    declaration_span: target.target_span,
+                                    block_span: block.span,
+                                    kind: ReferenceBindingKind::Declared,
+                                },
+                                Some(name.as_str()),
+                            )),
+                        }
+                    }
+                    _ => unreachable!("staged direct assignment destination"),
+                };
+                let Some((id, introduction)) = lexical else {
+                    if matches!(value, ReferenceValue::Checked(_)) {
+                        return Err(self.missing_context(
+                            *span,
+                            ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
+                        ));
+                    }
+                    let install = self.point(
+                        CfgPointKind::Evaluate(ScalarExpression::Name {
+                            name: name.clone(),
+                            span: *span,
+                        }),
+                        *span,
+                        scope,
+                        BTreeSet::new(),
+                    );
+                    self.record_frozen_install(slot.destination, FrozenInstall { rhs: rhs_point, install });
+                    continue;
+                };
+                if let Some(name) = introduction {
+                    self.names.insert(name.to_owned(), id.clone());
+                    let ty = output_types.get(position).ok_or_else(|| {
+                        self.missing_context(
+                            target.target_span,
+                            ReferenceAnalysisErrorReason::MissingResolvedBinding,
+                        )
+                    })?;
+                    self.binding_types.record(id.clone(), ty.clone(), (prepared_local_introduction && self.deferred_local_reborrow).then_some(scope));
+                    declared.push((name.to_owned(), id.clone(), None));
+                }
+                let target_place =
+                    self.reference_place(&target.place, id.clone(), None);
+                let previous_origins =
+                    self.origins.get(&id).cloned().unwrap_or_default();
+                let previous_loans = previous_origins
+                    .iter()
+                    .filter_map(|origin| match &self.cfg.facts[origin.0] {
+                        ReferenceOrigin::Fresh { loan, .. }
+                        | ReferenceOrigin::BorrowedFrom { loan, .. } => {
+                            Some(loan.clone())
+                        }
+                        ReferenceOrigin::Null { .. }
+                        | ReferenceOrigin::Invalid { .. } => None,
+                    })
+                    .collect();
+                let assign = CfgPointKind::Assign {
+                    target: target_place,
+                    rhs_point,
+                    previous_origins,
+                    previous_loans,
+                };
+                let widened_rebind = widened_rebind.filter(|(destination, _, target)|
+                    *destination == slot.destination && *target == id.declaration_span);
+                let widened_roundtrip = widened_roundtrip.filter(|(_, destination, owner)|
+                    *destination == slot.destination && *owner == id.declaration_span);
+                let widened_owning_replace = widened_owning_replace.filter(|(_, destination, _, target)|
+                    *destination == slot.destination && *target == id.declaration_span);
+                let widened_join_replace = widened_join_replace.filter(|(destination, _, target, _)|
+                    *destination == slot.destination && *target == id.declaration_span && capture.is_none());
+                let descriptor_replace = descriptor_replace.as_ref()
+                    .filter(|(destination, _, target, _)| *destination == slot.destination
+                        && *target == id.declaration_span && capture.is_none())
+                    .zip(descriptor_paths.take());
+                if widened_rebind.is_none() && widened_roundtrip.is_none() && widened_owning_replace.is_none()
+                    && widened_join_replace.is_none() && descriptor_replace.is_none()
+                    && self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(&id))
+                    && matches!(&assign, CfgPointKind::Assign { target, .. } if target.projections.is_empty())
+                {
+                    return Err(self.missing_context(*span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
+                }
+                let guarded_install = guarded_replacement.as_ref()
+                    .is_some_and(|(_, owner, _, _, destination)| owner == &id && *destination == slot.destination && capture.is_none());
+                if !guarded_install && self.proof_points.guarded_runtime_receivers.contains(&id)
+                    && matches!(&assign, CfgPointKind::Assign { target, .. } if target.projections.is_empty())
+                {
+                    return Err(self.missing_origin(*span, id, ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess));
+                }
+                let emitted = self.emit_direct_assignment(id, assign, rhs_point, value, *span, scope)?;
+                if guarded_install {
+                    self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
+                }
+                if let Some((destination, source, target)) = widened_rebind {
+                    self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
+                    self.aggregate_result.widened_rebinds.insert(destination.0,
+                        aggregate::ClosedWidenedRebind { point: emitted.install, source, target });
+                }
+                if let Some((call, _, owner)) = widened_roundtrip {
+                    self.aggregate_result.widened_owning_roundtrip = Some((call, emitted.install, owner));
+                }
+                if let Some((call, destination, source, target)) = widened_owning_replace {
+                    if !self.aggregate_facts.array_calls.get(&emitted.rhs)
+                        .is_some_and(|(actual, _, binding)| *actual == call && binding.declaration_span == source)
+                    {
+                        return Err(self.missing_context(*span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
+                    }
+                    self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
+                    self.aggregate_result.widened_owning_receives.push((emitted.rhs, call, source, target,
+                        Some((emitted.install, destination.0))));
+                }
+                if let Some((destination, rhs, target, _)) = widened_join_replace {
+                    self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
+                    self.aggregate_result.widened_join_replacements.insert(destination.0, (rhs.0, emitted.install, target));
+                }
+                if let Some(((destination, rhs, declaration, _), paths)) = descriptor_replace {
+                    self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
+                    self.aggregate_result.ordinary_array_receivers.push((*rhs,
+                        aggregate::OrdinaryArrayDestination::Replace {
+                            destination: *destination, install: emitted.install, declaration: *declaration,
+                        }, paths));
+                }
+                self.author_direct_assignment(emitted, existing_prepared && capture.is_none()
+                    && assignment.targets.len() == 1 && assignment.values.len() == 1);
+                emitted
+            } else {
+                if let ReferenceAssignmentDestination::Through(pointer_point) =
+                    destination
+                {
+                    if capture.is_none() && assignment.targets.len() == 1
+                        && assignment.values.len() == 1
+                        && aggregate::ordinary_value(&output_types[position])
+                        && self.call_sites.structure.checked_types.places.get(&slot.destination) == Some(&output_types[position])
+                    {
+                        if let Some(author) = &mut self.local_borrow {
+                            author.prepare_projected_write(CfgPointId(self.cfg.points.len()));
+                        }
+                    }
+                    let assign = CfgPointKind::AssignThrough {
+                        place: self.proof_place(&target.place, slot.destination).into_owned(),
+                        pointer_point,
+                        rhs_point,
+                        candidates: Vec::new(),
+                        previous_origins: BTreeSet::new(),
+                        previous_loans: Vec::new(),
+                    };
+                    match value {
+                        ReferenceValue::Checked(origins) => {
+                            self.point(assign, target.target_span, scope, origins);
+                        }
+                        ReferenceValue::Uncomputed
+                            if matches!(
+                                output_types[position],
+                                ScalarType::CheckedReference { .. }
+                            ) =>
+                        {
+                            self.uncomputed_point(assign, target.target_span, scope);
+                        }
+                        _ => {
+                            self.point(
+                                assign,
+                                target.target_span,
+                                scope,
+                                BTreeSet::new(),
+                            );
+                        }
+                    }
+                    if capture.is_none()
+                        && (self.proof_points.pending_named_reborrow.is_some() || self.has_projected_child || self.has_joined_root_reborrow)
+                        && matches!(&self.cfg.points[pointer_point.0].kind,
+                            CfgPointKind::Read { binding } if matches!(self.binding_types.get(binding),
+                                Some(ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner })
+                                    if match &target.place {
+                                        ScalarPlace::Dereference { pointer, .. } => matches!(pointer.as_ref(),
+                                            ScalarExpression::Name { .. })
+                                            && aggregate::ordinary_value(inner) && **inner == output_types[position],
+                                        place @ ScalarPlace::Index { .. } => self.has_joined_root_reborrow
+                                            && self.exact_indexed_store_type(place, slot.destination, inner, &output_types[position]),
+                                        place => self.has_projected_child && aggregate::ordinary_value(&output_types[position])
+                                            && matches!(direct_checked_field_base(place),
+                                                Some((ScalarExpression::Name { .. }, ScalarFieldReference::Resolved(field)))
+                                                    if matches!(inner.as_ref(), ScalarType::Struct(id) if id == &field.structure)),
+                                    }))
+                    {
+                        self.proof_points.checked_named_scalar_stores
+                            .push(self.cursor.expect("typed scalar store"));
+                    }
+                } else {
+                    let target_place = match destination {
+                        ReferenceAssignmentDestination::EvaluationOnly => continue,
+                        ReferenceAssignmentDestination::Resolved(place) => place,
+                        ReferenceAssignmentDestination::RawName
+                        | ReferenceAssignmentDestination::PreparedName(_)
+                        | ReferenceAssignmentDestination::Through(_) => {
+                            unreachable!("staged projected assignment destination")
+                        }
+                    };
+                    let assign = CfgPointKind::Assign {
+                        target: target_place,
+                        rhs_point,
+                        previous_origins: BTreeSet::new(),
+                        previous_loans: Vec::new(),
+                    };
+                    match value {
+                        ReferenceValue::Checked(origins) => {
+                            self.point(assign, target.target_span, scope, origins);
+                        }
+                        ReferenceValue::Uncomputed
+                            if matches!(
+                                output_types[position],
+                                ScalarType::CheckedReference { .. }
+                            ) =>
+                        {
+                            self.uncomputed_point(assign, target.target_span, scope);
+                        }
+                        _ => {
+                            self.point(
+                                assign,
+                                target.target_span,
+                                scope,
+                                BTreeSet::new(),
+                            );
+                        }
+                    }
+                }
+                if self.local_borrow.is_some()
+                    && !(capture.is_none() && assignment.targets.len() == 1
+                        && assignment.values.len() == 1
+                        && aggregate::ordinary_value(&output_types[position])
+                        && self.call_sites.structure.checked_types.places.get(&slot.destination) == Some(&output_types[position])
+                        && match &self.cfg.points[self.cursor.expect("assignment install point").0].kind {
+                            CfgPointKind::Assign { target, .. } => local_borrow::direct_fixed_projection(target),
+                            CfgPointKind::AssignThrough { .. } => true, // already qualified by the author
+                            _ => false,
+                        })
+                {
+                    self.local_borrow = None;
+                }
+                FrozenInstall { rhs: rhs_point, install: self.cursor.expect("assignment install point") }
+            };
+            let FrozenInstall { rhs: rhs_point, install } = emitted;
+            if capture.is_none() && assignment.targets.len() == 1 && assignment.values.len() == 1
+                && position == 0 && block.terminated_items.get(item_index) == Some(&true)
+                && matches!(target.place, ScalarPlace::Field { .. })
+            {
+                let canonical = self.proof_place(&target.place, slot.destination).into_owned();
+                self.record_runtime_array_field_site(install, slot.destination, &canonical, None);
+            }
+            if let CfgPointKind::AssignThrough { pointer_point, .. } = self.cfg.points[install.0].kind {
+                let (index_place, field_store) = match &target.place {
+                    ScalarPlace::Field { base, .. } => (base.as_ref(), true),
+                    _ => (&target.place, false),
+                };
+                let runtime_writer = matches!(index_place, ScalarPlace::Index { base, .. }
+                    if matches!(base.as_ref(), ScalarPlace::Dereference { .. }))
+                    && matches!(&self.cfg.points[pointer_point.0].kind, CfgPointKind::Read { binding }
+                        if matches!(self.binding_types.get(binding),
+                            Some(ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner })
+                                if matches!(inner.as_ref(), ScalarType::RuntimeArray { .. })));
+                if runtime_writer {
+                    let ordinary_store = capture.is_none()
+                        && assignment.targets.len() == 1 && assignment.values.len() == 1 && position == 0;
+                    let local = !field_store && ordinary_store && block.terminated_items.get(item_index) == Some(&true)
+                        && group.projected_outputs().len() == 0
+                        && self.local_runtime_exclusive_place(&target.place, slot.destination).is_some();
+                    if let Some(site) = local.then(|| self.local_runtime_exclusive_site(pointer_point, slot.destination)).flatten() {
+                        self.cfg.runtime_array_exclusive_sites.insert(install, site);
+                    } else if let Some((prefix, field)) = (self.capture_private_runtime_reads && ordinary_store
+                        && (!field_store || (block.terminated_items.get(item_index) == Some(&true)
+                            && group.projected_outputs().len() == 0)))
+                        .then(|| {
+                            let canonical = self.proof_place(&target.place, slot.destination).into_owned();
+                            self.private_runtime_formal_store(&canonical, slot.destination, pointer_point, &output_types[position])
+                        }).flatten()
+                    {
+                        self.proof_points.private_runtime_formal_stores.insert(install, prefix);
+                        if let Some(field) = field {
+                            self.proof_points.private_runtime_formal_copy_stores.insert(install, (slot.destination, field));
+                        }
+                    } else {
+                        return Err(self.missing_context(target.target_span,
+                            ReferenceAnalysisErrorReason::MissingDereferencedArrayWriteExtent));
+                    }
+                }
+            }
+            if capture.is_none() && assignment.targets.len() == 1 && assignment.values.len() == 1
+                && position == 0 && aggregate::ordinary_value(&output_types[position])
+                && matches!(&slot.replacement, AssignmentReplacement::Resolved(ty) if ty == &output_types[position])
+            {
+                if let CfgPointKind::Assign { target, rhs_point: actual, .. } = &self.cfg.points[install.0].kind {
+                    if *actual == rhs_point
+                        && self.proof_points.fallible_allocation_bindings.as_ref()
+                            .and_then(|sites| sites.get(&target.binding))
+                            .and_then(|owner| self.exact_guarded_index(
+                                &assignment.targets[position].place, slot.destination, &target.binding, owner))
+                            == Some(&output_types[position])
+                    {
+                        self.proof_points.guarded_indexed_stores.insert(install);
+                    }
+                    if let (ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. },
+                        [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(projection))]) =
+                        (&target.place, target.projections.as_slice())
+                    {
+                        if let ScalarPlace::Name { span, .. } = base.as_ref() {
+                            let root = self.place_root(&target.place, slot.destination);
+                            if *actual == rhs_point && field == projection
+                                && matches!(self.binding_types.get(&target.binding),
+                                    Some(ScalarType::Struct(id)) if *id == field.structure)
+                                && matches!(self.prepared_place_root(root.ordinal, *span)?,
+                                    Some(PreparedPlaceRoot::Lexical(binding)) if binding == &target.binding)
+                            {
+                                if let Some(evaluation) = group.rhs_evaluations().next() {
+                                    self.aggregate_facts.receipt_scalar_field_writes.insert(
+                                        install, (evaluation.expression, slot.destination),
+                                    );
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            // Only the checked primary output can start same-array retention.
+            // Projected outputs have distinct points and do not inherit this proof.
+            if simple_destinations && position == 0
+                && self.aggregate_facts.array_calls.get(&rhs_point).is_some_and(|(producer, _, binding)| {
+                    Some(*producer) == primary_array_producer
+                        && matches!(&self.cfg.points[rhs_point.0].kind, CfgPointKind::Call { output: 0, .. })
+                        && matches!(&self.cfg.points[install.0].kind,
+                            CfgPointKind::Assign { target, rhs_point: actual, .. }
+                                if *actual == rhs_point && target.projections.is_empty() && target.binding == *binding)
+                })
+            {
+                array_rebind = Some((install, slot.destination));
+            }
+            self.record_frozen_install(slot.destination, emitted);
+            let other_writer = item_index == 0
+                && self.aggregate_facts.literal_array_other_writer == Some(ordinal);
+            let literal_writer = (scope == ReferenceScopeId(0) && item_index == 1)
+                || (item_index == 0 && self.aggregate_facts.literal_array_writer == Some(ordinal));
+            if (literal_writer || other_writer) && existing_prepared
+                && position == 0 && assignment.targets.len() == 1 && assignment.values.len() == 1
+                && self.aggregate_facts.literal_array_bind.is_some()
+                && matches!(output_types[position], ScalarType::RuntimeArray { .. })
+            {
+                if let Some(evaluation) = group.rhs_evaluations().next() {
+                    if let Some(argument) = self.literal_array_argument(evaluation.expression, rhs_point) {
+                        let write = Some(aggregate::LiteralArrayWrite {
+                            rhs: rhs_point,
+                            writer: install,
+                            producer: evaluation.expression,
+                            destination: slot.destination,
+                            argument,
+                        });
+                        if other_writer {
+                            self.aggregate_facts.literal_array_other_write = write;
+                        } else {
+                            self.aggregate_facts.literal_array_write = write;
+                        }
+                    }
+                }
+            }
+            if let Some(capture) = capture.filter(|_| {
+                self.capture_call_points && scope == ReferenceScopeId(0)
+                    && assignment.values.len() == 1
+                    && (!matches!(self.proof_points.scalar_descriptor_install, ScalarDescriptorCandidates::Multiple)
+                        || !matches!(self.proof_points.backing_descriptor_install, ScalarDescriptorCandidates::Multiple))
+                    && matches!(&calls.named_place_roots, NamedPlaceRootFacts::Prepared(_))
+            }) {
+                if let (
+                    ScalarType::CheckedReference { inner, .. },
+                    CfgPointKind::Assign { target, .. },
+                    CfgPointKind::Call { output, target: ResolvedCallTarget::ModuleCallable { .. }, .. },
+                    Some(evaluation),
+                ) = (
+                    &output_types[position],
+                    &self.cfg.points[install.0].kind,
+                    &self.cfg.points[rhs_point.0].kind,
+                    group.rhs_evaluations().next(),
+                ) {
+                    if let ScalarType::Struct(id) = inner.as_ref() {
+                        if target.projections.is_empty() && *output == position
+                            && calls.boundary.root_outputs.iter().all(|output| {
+                                aggregate::ordinary_value(&output.ty) || matches!(output.ty, ScalarType::Unit | ScalarType::Enum(_))
+                            })
+                        {
+                            let known = [&self.proof_points.scalar_descriptor_install, &self.proof_points.backing_descriptor_install]
+                                .into_iter().find_map(|candidate| match candidate {
+                                    ScalarDescriptorCandidates::One(_, marker) if &marker.structure == id => Some(marker.validate_backing),
+                                    _ => None,
+                                });
+                            let class = known.or_else(|| {
+                                let declaration = self.structs.iter().find(|declaration| &declaration.id == id)?;
+                                if declaration.fields.is_empty() {
+                                    return None;
+                                }
+                                let mut fields = 0;
+                                let supported = declaration.fields.iter().all(|field| match &field.ty {
+                                    ScalarType::RawPointer(_) => {
+                                        fields += 1;
+                                        fields == 1
+                                    }
+                                    ty => aggregate::ordinary_value(ty) || matches!(ty, ScalarType::Enum(_)),
+                                });
+                                (supported && (fields == 0 || *output == 0)).then_some(fields == 1)
+                            });
+                            if let Some(validate_backing) = class.filter(|class| !*class || *output == 0) {
+                                let candidate = if validate_backing {
+                                    &mut self.proof_points.backing_descriptor_install
+                                } else {
+                                    &mut self.proof_points.scalar_descriptor_install
+                                };
+                                match candidate {
+                                    ScalarDescriptorCandidates::Multiple => {}
+                                    ScalarDescriptorCandidates::One(previous, _) if *previous != slot.destination => {
+                                        *candidate = ScalarDescriptorCandidates::Multiple;
+                                    }
+                                    _ => {
+                                        let marker = ScalarDescriptorInstall {
+                                            validate_backing,
+                                            frozen: FrozenInstall { rhs: rhs_point, install },
+                                            capture,
+                                            binding: target.binding.clone(),
+                                            call: evaluation.expression,
+                                            output: *output,
+                                            structure: id.clone(),
+                                        };
+                                        if let ScalarDescriptorCandidates::One(_, previous) = candidate {
+                                            **previous = marker;
+                                        } else {
+                                            *candidate = ScalarDescriptorCandidates::One(slot.destination, Box::new(marker));
+                                        }
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+            if let Some(capture) = capture {
+                let install = self.cursor.expect("assignment install point");
+                let CfgPointKind::CaptureAssignmentPrevious { writes } =
+                    &mut self.cfg.points[capture.0].kind
+                else {
+                    unreachable!("assignment group capture")
+                };
+                writes.push(install);
+            }
+        }
+        if let Some((install, destination)) = array_rebind.filter(|_| simple_destinations) {
+            self.aggregate_facts.array_installs.insert(install, destination);
+        }
+        let continuation = group.continuation();
+        assert_eq!(
+            continuation,
+            BlockPosition {
+                block: ordinal,
+                item: item_index + 1
+            }
+        );
+        Ok(continuation.item)
+    }
+
+    // Plain recursive blocks retain the traversal, not the workspace for
+    // mutually exclusive binding and assignment preparation.
     fn block_result(
         &mut self,
         block: &ScalarBlock,
@@ -5998,558 +7318,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     ScalarBlockItem::LocalBinding(binding),
                     BlockItemKind::Binding(binding_region),
                 ) => {
-                    let receiver = &binding_region.receivers()[0];
-                    let outputs = match &binding_region.initialization {
-                        BindingInitialization::Outputs(outputs) => outputs,
-                        BindingInitialization::Allocation { .. } => {
-                            &calls.query_allocation_outputs[&(ordinal, item_index)]
-                        }
-                    };
-                    let primary = &binding.value;
-                    let primary_ordinal = outputs.primary;
-                    let position = BlockPosition {
-                        block: ordinal,
-                        item: item_index,
-                    };
-                    let (raw_null, prepared_raw_null) = match primary {
-                        ScalarExpression::Name { name, span }
-                            if matches!(receiver.ty, ScalarType::RawPointer(_)) =>
-                        {
-                            match self.prepared_name_identity(primary_ordinal, *span)? {
-                                Some(PlainNameIdentity::Null) => (true, true),
-                                Some(_) => (false, false),
-                                None => (name == "null", false),
-                            }
-                        }
-                        _ => (false, false),
-                    };
-                    let widened_join = outputs.secondary.is_empty() && !binding.is_allocation
-                        && binding.fallible_assignment.is_none() && binding_region.receivers().len() == 1
-                        && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
-                        && self.widened_join_inputs(primary, &receiver.ty, primary_ordinal, scope).is_some_and(|arms| {
-                            self.aggregate_result.widened_join_arms.extend(arms);
-                            self.aggregate_result.widened_join_receivers.insert((receiver.span.start, receiver.span.end));
-                            true
-                        });
-                    let alias_owner = self.prepared_fallible_alias(binding, primary, primary_ordinal, scope, &receiver.ty);
-                    let widened_receiver_source = if !binding.is_allocation && binding.fallible_assignment.is_none()
-                        && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
-                        && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
-                        && !self.names.contains_key(&receiver.name)
-                    {
-                        self.widened_owning_argument(primary, primary_ordinal, block.span)
-                            .filter(|source| self.binding_types.get(source).is_some_and(|ty|
-                                aggregate::same_runtime_array_type(ty, &receiver.ty)))
-                            .map(|source| source.declaration_span)
-                    } else { None };
-                    let fixed_copy_receiver = (|| {
-                        if binding.is_allocation || binding.fallible_assignment.is_some()
-                            || binding_region.receivers().len() != 1 || !outputs.secondary.is_empty()
-                            || binding.output_origin != ScalarBindingOutputOrigin::SingleExpression
-                            || !self.generic_parameters.is_empty() || self.names.contains_key(&receiver.name)
-                            || calls.declared_unsafe_calls.contains(&primary_ordinal.0)
-                        { return None; }
-                        let ScalarExpression::Call { arguments, .. } = primary else { return None; };
-                        let [ScalarExpression::Name { span, .. }] = arguments.as_slice() else { return None; };
-                        let signature = calls.checked_call_signatures.get(&primary_ordinal)?;
-                        if !aggregate::neutral_array_signature(&signature.parameters, &signature.outputs)
-                            || !aggregate::same_runtime_array_type(&signature.parameters[0], &receiver.ty)
-                            || !matches!(self.call_target(primary, primary_ordinal),
-                                Ok(ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }))
-                        { return None; }
-                        let OccurrenceNode::Expression(argument) = calls.structure.edges.get(&(
-                            OccurrenceParent::Expression(primary_ordinal), OccurrenceEdge::CallArgument(0)))? else { return None; };
-                        let PlainNameIdentity::Lexical(source) = self.prepared_name_identity(*argument, *span).ok().flatten()?
-                        else { return None; };
-                        let (_, count) = self.binding_types.get(source).and_then(|ty|
-                            super::fixed_copy_to_runtime(&signature.parameters[0], ty))?;
-                        Some((source.declaration_span, count))
-                    })();
-                    // Count expressions have their own prepared occurrence edge.
-                    // Evaluate it before the allocation placeholder and owner
-                    // Bind; the same ordered scalar proof is used for ordinary RHS.
-                    let checked_count = (|| {
-                        if block.unsafe_context || !self.generic_parameters.is_empty()
-                            || !matches!(&receiver.ty, ScalarType::RuntimeArray { element, .. } if aggregate::ordinary_value(element))
-                        { return None; }
-                        let BindingInitialization::Allocation { lengths } = &binding_region.initialization else { return None; };
-                        let [length] = lengths.as_slice() else { return None; };
-                        let value = binding.receivers[0].allocation_length.as_ref()?;
-                        if !matches!(value, ScalarExpression::Call { .. })
-                            && !calls.candidate_fallible_composite(value, length.expression)
-                        { return None; }
-                        let exact_call = !matches!(value, ScalarExpression::Call { .. }) || matches!(
-                            calls.allocation_length_call_targets.get(&length.expression),
-                            Some(ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }));
-                        (length.position == 0 && exact_call
-                            && calls.structure.checked_types.expressions.get(&length.expression) == Some(&ScalarType::U64))
-                            .then_some((value, length.expression))
-                    })();
-                    if let Some((value, length)) = checked_count {
-                        let previous = self.capture_call_points;
-                        self.capture_call_points = true;
-                        let evaluated = self.expression(value, scope, length);
-                        self.capture_call_points = previous;
-                        evaluated?;
-                        if let Some(proof) = self.guarded_numeric_expression(value, length, &ScalarType::U64) {
-                            self.aggregate_result.ordinary_fallible_expressions.push((None, vec![proof]));
-                        }
-                    }
-                    let before = self.cursor;
-                    // SystemPanic terminates execution, not the current
-                    // lexical scope via an unwind. Existing local owners
-                    // retain their normal lexical release on success.
-                    let ordinary_root_binding = ordinary_root_eligible
-                        && binding.fallible_assignment.is_none() && !binding.is_allocation
-                        && (matches!(receiver.ty, ScalarType::U64 | ScalarType::I32)
-                            || (receiver.ty == ScalarType::Bool && matches!(primary, ScalarExpression::Unary {
-                                operator: UnaryOperator::LogicalNot, .. })))
-                        && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
-                        && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
-                        && (matches!(primary, ScalarExpression::Call { .. }) || calls.candidate_fallible_composite(primary, primary_ordinal))
-                        && calls.structure.edges.get(&(
-                            OccurrenceParent::Block(calls.structure.root),
-                            OccurrenceEdge::BindingRoot { item: position.item, output: 0 },
-                        )) == Some(&OccurrenceNode::Expression(primary_ordinal));
-                    let ordinary_aggregate = !block.unsafe_context && self.generic_parameters.is_empty()
-                        && binding.fallible_assignment.is_none() && !binding.is_allocation
-                        && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
-                        && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
-                        && (matches!((&receiver.ty, primary),
-                            (ScalarType::Struct(_), ScalarExpression::StructLiteral { .. })
-                            | (ScalarType::Array { .. }, ScalarExpression::ArrayLiteral { .. }))
-                            || super::widened_local_literal(binding).is_some_and(|(_, _, _)|
-                                calls.structure.checked_types.expressions.get(&primary_ordinal)
-                                    .and_then(|actual| super::fixed_copy_to_runtime(&receiver.ty, actual)).is_some()))
-                        && calls.structure.edges.get(&(
-                            OccurrenceParent::Block(ordinal),
-                            OccurrenceEdge::BindingRoot { item: position.item, output: 0 },
-                        )) == Some(&OccurrenceNode::Expression(primary_ordinal));
-                    let runtime_returned = binding.fallible_assignment.is_some()
-                        && matches!(receiver.ty, ScalarType::RuntimeArray { .. })
-                        && super::typecheck::guarded_runtime_rhs(primary);
-                    let ordinary_runtime_receive = !block.unsafe_context && self.generic_parameters.is_empty()
-                        && !binding.is_allocation && binding.fallible_assignment.is_none()
-                        && binding_region.receivers().len() == 1 && outputs.secondary.is_empty()
-                        && binding.output_origin == ScalarBindingOutputOrigin::SingleExpression
-                        && matches!(&receiver.ty, ScalarType::RuntimeArray { element, .. } if aggregate::ordinary_value(element))
-                        && super::typecheck::guarded_runtime_rhs(primary);
-                    let walk_fallible_expression = !runtime_returned && !ordinary_runtime_receive
-                        && (binding.fallible_assignment.is_some() || ordinary_root_binding)
-                        && (calls.candidate_fallible_composite(primary, primary_ordinal)
-                            || matches!(primary, ScalarExpression::Call { .. }
-                                if receiver.ty == ScalarType::Bool || calls.structure.callful_arguments.contains(&primary_ordinal)));
-                    let value = if let Some((owner, count)) = fixed_copy_receiver {
-                        self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::FixedCopyOwningArgument(owner, count))?
-                    } else if let Some(owner) = widened_receiver_source {
-                        self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::WidenedOwningRoundtrip(owner))?
-                    } else if alias_owner.is_some() {
-                        self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::FallibleAliasInitializer)?
-                    } else if raw_null {
-                        self.point(
-                            CfgPointKind::Evaluate(primary.clone()),
-                            expression_span(primary),
-                            scope,
-                            BTreeSet::new(),
-                        );
-                        ReferenceValue::Other
-                    } else if binding.fallible_assignment.is_some()
-                        && matches!(primary, ScalarExpression::StructLiteral { .. } | ScalarExpression::ArrayLiteral { .. })
-                        && matches!(receiver.ty, ScalarType::Struct(_) | ScalarType::Array { .. } | ScalarType::RuntimeArray { .. })
-                    {
-                        self.expression_with_read_mode(
-                            primary,
-                            scope,
-                            primary_ordinal,
-                            ExpressionReadMode::GuardedScalarAggregateInitializer,
-                        )?
-                    } else if ordinary_aggregate {
-                        self.expression_with_read_mode(primary, scope, primary_ordinal, ExpressionReadMode::OrdinaryScalarAggregateInitializer)?
-                    } else if walk_fallible_expression || runtime_returned || ordinary_runtime_receive {
-                        let previous = self.capture_call_points;
-                        self.capture_call_points = true;
-                        let result = self.expression(primary, scope, primary_ordinal);
-                        self.capture_call_points = previous;
-                        result?
-                    } else {
-                        self.expression(primary, scope, primary_ordinal)?
-                    };
-                    if walk_fallible_expression {
-                        let expression = self.guarded_numeric_expression(primary, primary_ordinal, &receiver.ty).filter(|_|
-                            self.generic_parameters.is_empty() && binding_region.receivers().len() == 1
-                            && outputs.secondary.is_empty());
-                        match (binding.fallible_assignment, expression) {
-                            (Some(_), Some(proof)) => self.aggregate_result.fallible_call_expressions.push(proof),
-                            (None, Some(proof)) => self.aggregate_result.ordinary_fallible_expressions.push((None, vec![proof])),
-                            (Some(_), None) => return Err(self.missing_context(expression_span(primary),
-                                ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer)),
-                            (None, None) => {}
-                        }
-                    }
-                    let call_producer = if binding.output_origin
-                        == ScalarBindingOutputOrigin::SingleExpression
-                        && matches!(primary, ScalarExpression::Call { .. })
-                    {
-                        Some(self.cursor.expect("evaluated binding call"))
-                    } else {
-                        None
-                    };
-                    if let (None, ScalarExpression::Call { arguments, type_arguments, .. }, Some(point)) =
-                        (binding.fallible_assignment, primary, call_producer)
-                    {
-                        if ordinary_root_binding
-                            && type_arguments.is_empty() && !calls.declared_unsafe_calls.contains(&primary_ordinal.0)
-                            && matches!(arguments.as_slice(), [argument]
-                                if matches!(argument, ScalarExpression::Name { .. }) || aggregate::pure_widened_element(argument))
-                            && calls.checked_call_signatures.get(&primary_ordinal).is_some_and(|signature|
-                                signature.parameters.as_slice() == [ScalarType::U64]
-                                    && matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == receiver.ty))
-                            && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Call { output: 0,
-                                target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. })
-                        {
-                            self.aggregate_result.ordinary_fallible_call_candidates.push(primary_ordinal);
-                        }
-                    }
-                    if runtime_returned {
-                        let paths = (!block.unsafe_context && self.generic_parameters.is_empty()
-                            && binding_region.receivers().len() == 1 && outputs.secondary.is_empty())
-                            .then(|| self.guarded_runtime_call_paths(primary, primary_ordinal, &receiver.ty)).flatten()
-                            .ok_or_else(|| self.missing_context(expression_span(primary),
-                                ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer))?;
-                        self.aggregate_result.guarded_array_returns.push((primary_ordinal, paths));
-                    }
-                    if let (Some(_), ScalarExpression::Call { arguments, .. }, false) =
-                        (binding.fallible_assignment, primary, walk_fallible_expression || runtime_returned)
-                    {
-                        // Allocation-free callee evidence does not cover its
-                        // caller-side argument evaluation.
-                        let eligible = call_producer.filter(|point| self.generic_parameters.is_empty()
-                            && arguments.iter().all(|argument| matches!(argument, ScalarExpression::Name { .. })
-                                || aggregate::pure_widened_element(argument))
-                            && is_integer_type(&receiver.ty) && binding_region.receivers().len() == 1
-                            && outputs.secondary.is_empty()
-                            && !calls.declared_unsafe_calls.contains(&primary_ordinal.0)
-                            && calls.checked_call_signatures.get(&primary_ordinal).is_some_and(|signature|
-                                signature.parameters.iter().all(aggregate::ordinary_value)
-                                    && matches!(signature.outputs.outputs.as_slice(), [output] if output.ty == receiver.ty))
-                            && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Call { output: 0,
-                                target: ResolvedCallTarget::ModuleCallable { concrete: ConcreteCallSelection::Declaration, .. }, .. }));
-                        let Some(point) = eligible else {
-                            return Err(self.missing_context(expression_span(primary),
-                                ReferenceAnalysisErrorReason::UnprovedFallibleCallInitializer));
-                        };
-                        self.aggregate_result.fallible_call_initializers.push((point, primary_ordinal));
-                    }
-                    if let ([head, tail], Some(point)) = (binding_region.receivers(), call_producer) {
-                        if aggregate::mixed_owner_result_lanes(&head.ty, &tail.ty).is_some()
-                            && outputs.secondary.as_slice() == [BindingOutput::ProjectPrimary { output: 1 }]
-                            && self.aggregate_facts.calls.contains_key(&point)
-                            && matches!(&self.cfg.points[point.0].kind, CfgPointKind::Call {
-                                target: ResolvedCallTarget::ModuleCallable {
-                                    concrete: ConcreteCallSelection::Declaration, ..
-                                }, ..
-                            })
-                            && calls.checked_call_signatures.get(&primary_ordinal).is_some_and(|signature|
-                                matches!(signature.outputs.outputs.as_slice(), [first, second]
-                                    if first.ty == head.ty && second.ty == tail.ty))
-                        {
-                            self.aggregate_result.mixed_result_bindings.insert(point);
-                        }
-                    }
-                    if let Some(point) = call_producer {
-                        let receivers = binding_region.receivers();
-                        if let Some(&(ordinal, width)) = self.aggregate_facts.multi_owner_calls.get(&point) {
-                            let signature = &calls.checked_call_signatures[&ordinal];
-                            if !receivers.is_empty() && receivers.len() <= width
-                                && outputs.secondary.len() + 1 == receivers.len()
-                                && receivers.iter().zip(&signature.outputs.outputs).all(|(receiver, output)| receiver.ty == output.ty)
-                                && outputs.secondary.iter().enumerate().all(|(index, output)|
-                                    *output == (BindingOutput::ProjectPrimary { output: index + 1 }))
-                            {
-                                self.aggregate_result.multi_result_bindings.insert(point,
-                                    receivers.iter().map(|receiver| ReferenceBindingId {
-                                        source: self.source.clone(), function_span: self.function_span,
-                                        declaration_span: receiver.span, block_span: block.span,
-                                        kind: ReferenceBindingKind::Declared,
-                                    }).collect());
-                            }
-                        }
-                    }
-                    let initializer = self.cursor.filter(|_| self.cursor != before);
-                    if prepared_raw_null
-                        && (self.aggregate_facts.local_array_copy_allocation.is_some()
-                            || (scope == ReferenceScopeId(0) && calls.call_occurrences.len() == 2
-                                && matches!(self.proof_points.backing_descriptor_install,
-                                    ScalarDescriptorCandidates::One(..))))
-                    {
-                        self.aggregate_facts.checked_raw_null_initializers.insert(
-                            initializer.expect("prepared raw null evaluation"),
-                        );
-                    }
-                    if self.capture_call_points && raw_null {
-                        self.proof_points
-                            .evaluations
-                            .insert(primary_ordinal, initializer.expect("raw null evaluation"));
-                    }
-                    let guarded_move = (|| {
-                        if binding.is_allocation || binding.fallible_assignment.is_some() || block.unsafe_context
-                            || !self.generic_parameters.is_empty() || binding_region.receivers().len() != 1
-                            || !outputs.secondary.is_empty()
-                        { return None; }
-                        let ScalarExpression::Name { span, .. } = primary else { return None; };
-                        let Some(PlainNameIdentity::Lexical(source)) = self.prepared_name_identity(primary_ordinal, *span).ok().flatten()
-                        else { return None; };
-                        let site = self.proof_points.fallible_allocation_bindings.as_ref()?.get(source)?;
-                        aggregate::same_runtime_array_type(&site.ty, &receiver.ty).then(|| source.clone())
-                    })();
-                    let ordinary_array_receive = ordinary_runtime_receive
-                        .then(|| self.guarded_runtime_call_paths(primary, primary_ordinal, &receiver.ty))
-                        .flatten();
-                    let widened_move = outputs.secondary.is_empty()
-                        && self.exact_widened_binding_move(binding, primary, primary_ordinal, block.span);
-                    self.move_value_with_widened_receipt(primary, scope, primary_ordinal, widened_move)?;
-                    let id = ReferenceBindingId {
-                        source: self.source.clone(),
-                        function_span: self.function_span,
-                        declaration_span: receiver.span,
-                        block_span: block.span,
-                        kind: ReferenceBindingKind::Declared,
-                    };
-                    self.binding_types.record(id.clone(), receiver.ty.clone(), self.deferred_local_reborrow.then_some(scope));
-                    if let Some(paths) = ordinary_array_receive {
-                        self.proof_points.ordinary_array_receivers.insert(id.clone(), primary_ordinal);
-                        self.aggregate_result.ordinary_array_receivers.push((
-                            primary_ordinal, aggregate::OrdinaryArrayDestination::Declaration(receiver.span), paths,
-                        ));
-                    }
-                    if let Some(source) = guarded_move {
-                        declares_guarded_owner = true;
-                        let read = initializer.ok_or_else(|| self.missing_context(expression_span(primary),
-                            ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer))?;
-                        let moved = self.cursor.filter(|point| *point != read)
-                            .ok_or_else(|| self.missing_context(expression_span(primary),
-                                ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer))?;
-                        self.cfg.allocations.insert(id.clone());
-                        self.proof_points.guarded_runtime_receivers.insert(id.clone());
-                        self.proof_points.guarded_runtime_moves.insert(read, GuardedRuntimeMove {
-                            source, target: id.clone(), target_ty: receiver.ty.clone(), rhs: primary_ordinal.0, replacement: None, moved, scope,
-                        });
-                    }
-                    if let Some(owner) = alias_owner {
-                        self.proof_points.fallible_aliases.insert(id.clone(), owner);
-                    }
-                    if let Some(owner) = widened_receiver_source {
-                        let point = call_producer.filter(|point| self.aggregate_facts.array_calls.get(point)
-                            .is_some_and(|(actual, _, source)| *actual == primary_ordinal && source.declaration_span == owner))
-                            .ok_or_else(|| self.missing_context(expression_span(primary),
-                                ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer))?;
-                        self.aggregate_result.widened_owning_receives.push((point, primary_ordinal, owner, receiver.span, None));
-                    }
-                    let widened_fixed_copy = if let Some((_, count)) = calls.structure.checked_types.expressions.get(&primary_ordinal)
-                        .and_then(|actual| super::widened_fixed_copy(binding, actual))
-                    {
-                        let ScalarExpression::Name { span, .. } = primary else { unreachable!() };
-                        let exact = self.prepared_name_identity(primary_ordinal, *span)?;
-                        let Some(PlainNameIdentity::Lexical(source)) = exact.filter(|identity|
-                            self.generic_parameters.is_empty()
-                                && matches!(identity, PlainNameIdentity::Lexical(source)
-                                    if self.binding_types.get(source).and_then(|ty| super::widened_fixed_copy(binding, ty))
-                                        .is_some_and(|(_, actual)| actual == count)))
-                        else {
-                            return Err(self.missing_context(*span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
-                        };
-                        self.aggregate_result.widened_fixed_copies.insert((receiver.span.start, receiver.span.end),
-                            (source.declaration_span, count));
-                        true
-                    } else { false };
-                    if let Some((owner, count)) = fixed_copy_receiver {
-                        let point = call_producer.ok_or_else(|| self.missing_context(expression_span(primary),
-                            ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer))?;
-                        let CfgPointKind::Call { argument_points, .. } = &self.cfg.points[point.0].kind
-                        else { return Err(self.missing_context(expression_span(primary), ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer)); };
-                        if !matches!(argument_points.as_slice(), [argument]
-                            if matches!(&self.cfg.points[argument.0].kind, CfgPointKind::Read { binding } if binding.declaration_span == owner))
-                        { return Err(self.missing_context(expression_span(primary), ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer)); }
-                        self.aggregate_result.fixed_copy_owning_arguments.insert(primary_ordinal.0, count);
-                        self.aggregate_result.widened_owning_receives.push((point, primary_ordinal, owner, receiver.span, None));
-                    }
-                    let widened = widened_join || widened_move || widened_receiver_source.is_some()
-                        || fixed_copy_receiver.is_some() || widened_fixed_copy
-                        || super::widened_local_literal(binding).is_some();
-                    if widened {
-                        self.widened_arrays.get_or_insert_with(HashSet::new).insert(id.clone());
-                    }
-                    let runtime_generated = (super::generated_runtime_scalar_binding(binding)
-                        || (matches!(receiver.ty, ScalarType::RuntimeArray { .. })
-                            && super::anonymous_callable::candidate_generated_callable(binding).is_some()))
-                        && calls.structure.checked_types.expressions.get(&primary_ordinal) == Some(&receiver.ty);
-                    if binding.is_allocation || widened || runtime_generated {
-                        self.cfg.allocations.insert(id.clone());
-                    }
-                    let runtime_literal_length = super::guarded_runtime_literal(binding).and_then(|(_, values, _)| {
-                        let (_, length) = super::fixed_copy_to_runtime(&receiver.ty,
-                            calls.structure.checked_types.expressions.get(&primary_ordinal)?)?;
-                        (length == values.len() as u64).then_some(length)
-                    });
-                    if binding.fallible_assignment.is_some()
-                        && (runtime_returned || runtime_literal_length.is_some() || is_integer_type(&receiver.ty)
-                            || matches!(receiver.ty, ScalarType::Struct(_) | ScalarType::Array { .. } | ScalarType::Bool))
-                    {
-                        declares_guarded_owner = true;
-                        let whole_copy = matches!(&receiver.ty, ScalarType::Struct(_))
-                            && matches!(copy_policy(&receiver.ty, self.structs, self.enums, &self.generic_parameters),
-                                Ok(CopyPolicy::Copy));
-                        self.proof_points.fallible_allocation_bindings.get_or_insert_with(HashMap::new).insert(
-                            id.clone(), super::control::GuardedAllocationBinding {
-                                scope, ty: receiver.ty.clone(), whole_copy, runtime_literal_length, runtime_returned,
-                            },
-                        );
-                        self.local_borrow = None;
-                    }
-                    let origins = match value {
-                        ReferenceValue::Checked(origins) => Some(origins),
-                        ReferenceValue::Other
-                            if matches!(receiver.ty, ScalarType::CheckedReference { .. }) =>
-                        {
-                            return Err(self.missing_origin(
-                                receiver.span,
-                                id,
-                                ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
-                            ));
-                        }
-                        ReferenceValue::Other => None,
-                        ReferenceValue::Uncomputed
-                            if matches!(receiver.ty, ScalarType::CheckedReference { .. }) =>
-                        {
-                            self.checked.insert(id.clone());
-                            self.origins.remove(&id);
-                            self.uncomputed_point(
-                                CfgPointKind::Bind {
-                                    binding: id.clone(),
-                                },
-                                receiver.span,
-                                scope,
-                            );
-                            self.record_binding_definition(
-                                position,
-                                0,
-                                binding.is_allocation,
-                                initializer,
-                            );
-                            let old = self.names.insert(receiver.name.clone(), id.clone());
-                            declared.push((receiver.name.clone(), id, old));
-                            self.additional_receivers(
-                                binding,
-                                block,
-                                scope,
-                                &mut declared,
-                                call_producer,
-                                binding_region.receivers(),
-                                outputs.primary,
-                                &outputs.secondary,
-                                position,
-                            )?;
-                            continue;
-                        }
-                        ReferenceValue::Uncomputed => None,
-                    };
-                    let old = self.names.insert(receiver.name.clone(), id.clone());
-                    if let Some(origins) = origins {
-                        self.checked.insert(id.clone());
-                        self.origins.insert(id.clone(), origins.clone());
-                        self.point(
-                            CfgPointKind::Bind {
-                                binding: id.clone(),
-                            },
-                            receiver.span,
-                            scope,
-                            origins,
-                        );
-                    } else {
-                        self.point(
-                            CfgPointKind::Bind {
-                                binding: id.clone(),
-                            },
-                            receiver.span,
-                            scope,
-                            BTreeSet::new(),
-                        );
-                    }
-                    let widened_factory = (|| {
-                        if scope != ReferenceScopeId(0) || !self.generic_parameters.is_empty()
-                            || item_index != 0 || !calls.boundary.parameters.is_empty()
-                            || !outputs.secondary.is_empty() || block.unsafe_context
-                            || !matches!(&calls.named_place_roots, NamedPlaceRootFacts::Prepared(_))
-                        { return None; }
-                        let [RootOutputType { output: 0, ty }] = calls.boundary.root_outputs.as_slice()
-                        else { return None };
-                        let [_, BlockItem { kind: BlockItemKind::FinalOutput(output), .. }] =
-                            region.items.as_slice() else { return None };
-                        let [_, ScalarBlockItem::Expression(ScalarExpression::Name { name, .. })] =
-                            block.items.as_slice() else { return None };
-                        if output.output != 0 || *name != receiver.name
-                            || !aggregate::same_runtime_array_type(&receiver.ty, ty)
-                        { return None; }
-                        Some((output.expression, Self::pure_widened_literal_count(binding)?, initializer?))
-                    })();
-                    self.record_binding_definition(position, 0,
-                        binding.is_allocation || widened_factory.is_some() || runtime_generated, initializer);
-                    if let Some((output, count, placeholder)) = widened_factory {
-                        let bind = self.cursor.expect("widened array definition");
-                        self.aggregate_facts.literal_array_bind = Some(aggregate::LiteralArrayBind {
-                            bind, placeholder, position, length_occurrence: primary_ordinal,
-                            extent: aggregate::FreshArrayExtent::Literal(count),
-                        });
-                        self.aggregate_facts.widened_literal_factory = true;
-                        self.aggregate_result.widened_literal_factory = Some((receiver.span, output));
-                    }
-                    // The existing birth observer is selected while still at
-                    // the allocation, before the write or final result is visited.
-                    // Use the prepared final-output role to opt in only the new
-                    // exact three-item scalar observation corridor.
-                    let returned_extent_tail = scope == ReferenceScopeId(0)
-                        && matches!(calls.boundary.root_outputs.as_slice(),
-                            [RootOutputType { output: 0, ty: ScalarType::U64 }])
-                        && matches!((region.items.as_slice(), block.items.as_slice()),
-                            ([_, BlockItem { kind: BlockItemKind::Assignment { .. }, .. },
-                                BlockItem { kind: BlockItemKind::FinalOutput(slot), .. }],
-                             [_, _, ScalarBlockItem::Expression(expression)])
-                                if slot.output == 0
-                                    && matches!(expression, ScalarExpression::Call { .. })
-                                    && matches!(self.call_target(expression, slot.expression),
-                                        Ok(ResolvedCallTarget::Core(CoreOperationId::ArrayLen))));
-                    let returned_index_tail = scope == ReferenceScopeId(0)
-                        && matches!(calls.boundary.root_outputs.as_slice(), [output] if aggregate::ordinary_value(&output.ty))
-                        && matches!((region.items.as_slice(), block.items.as_slice()),
-                            ([_, item, BlockItem { kind: BlockItemKind::FinalOutput(slot), .. }],
-                             [_, authored, ScalarBlockItem::Expression(ScalarExpression::IndexedRead { place, .. })])
-                                if slot.output == 0 && matches!((&item.kind, authored),
-                                    (BlockItemKind::Assignment { .. }, ScalarBlockItem::Assignment(_)) |
-                                    (BlockItemKind::Evaluation { .. }, ScalarBlockItem::Expression(
-                                        ScalarExpression::If { .. } | ScalarExpression::UnitIf { .. })))
-                                    && matches!(place, ScalarPlace::Index { base, index, .. }
-                                    if matches!(base.as_ref(), ScalarPlace::Name { .. })
-                                        && Self::returned_array_index_selector_syntax(index)));
-                    if binding.is_allocation
-                        && (returned_extent_tail || returned_index_tail || (region.items.len() == 2
-                            && matches!(calls.boundary.root_outputs.as_slice(),
-                                [] | [RootOutputType { output: 0, ty: ScalarType::RuntimeArray { .. } }])))
-                    {
-                        self.observe_literal_array_bind(
-                            position, scope, binding, &binding_region.initialization, initializer,
-                        );
-                    }
-                    declared.push((receiver.name.clone(), id, old));
-                    self.additional_receivers(
-                        binding,
-                        block,
-                        scope,
-                        &mut declared,
-                        call_producer,
-                        binding_region.receivers(),
-                        outputs.primary,
-                        &outputs.secondary,
-                        position,
+                    self.prepare_block_binding(
+                        block, BlockPosition { block: ordinal, item: item_index }, scope,
+                        binding, binding_region, &mut declared, &mut declares_guarded_owner,
+                        ordinary_root_eligible,
                     )?;
                 }
                 (
@@ -6759,741 +7531,10 @@ impl<'a> ReferenceFlowBuilder<'a> {
                     ScalarBlockItem::Assignment(assignment),
                     BlockItemKind::Assignment { group: key },
                 ) => {
-                    let calls = self.call_sites;
-                    let group = &calls.assignments[&(key.block, key.item)];
-                    let output_types = self.assignment_output_types(group)?;
-                    let guarded_replacement = (|| {
-                        if block.unsafe_context || !self.generic_parameters.is_empty() { return None; }
-                        let ([target], [ScalarExpression::Name { span, .. }]) =
-                            (assignment.targets.as_slice(), assignment.values.as_slice()) else { return None; };
-                        if !matches!(target.place, ScalarPlace::Name { .. }) { return None; }
-                        let rhs = group.rhs_evaluations().next()?.expression;
-                        let destination = group.destinations().next()?.destination;
-                        let PlainNameIdentity::Lexical(source) = self.prepared_name_identity(rhs, *span).ok().flatten()?
-                        else { return None; };
-                        let DirectDestinationIdentity::Existing(target) = calls.prepared_direct_destination(destination)?
-                        else { return None; };
-                        let source_site = self.proof_points.fallible_allocation_bindings.as_ref()?.get(source)?;
-                        let ty = self.binding_types.get(target)?;
-                        (target.block_span == block.span
-                            && self.proof_points.guarded_runtime_receivers.contains(target)
-                            && aggregate::same_runtime_array_type(&source_site.ty, ty))
-                            .then(|| (source.clone(), target.clone(), ty.clone(), rhs, destination))
-                    })();
-                    let widened_rebind = (|| {
-                        let owners = self.widened_arrays.as_ref()?;
-                        if scope != ReferenceScopeId(0) || !self.generic_parameters.is_empty() { return None; }
-                        let ([target], [ScalarExpression::Name { span, .. }]) =
-                            (assignment.targets.as_slice(), assignment.values.as_slice())
-                        else { return None };
-                        if !matches!(target.place, ScalarPlace::Name { .. }) { return None; }
-                        let evaluation = group.rhs_evaluations().next()?;
-                        let destination = group.destinations().next()?.destination;
-                        let Some(PlainNameIdentity::Lexical(source)) =
-                            self.prepared_name_identity(evaluation.expression, *span).ok().flatten()
-                        else { return None };
-                        let Some(DirectDestinationIdentity::Existing(target)) = calls.prepared_direct_destination(destination)
-                        else { return None };
-                        (source != target && source.block_span == block.span && target.block_span == block.span
-                            && owners.contains(source) && owners.contains(target)
-                            && self.binding_types.get(source).zip(self.binding_types.get(target))
-                                .is_some_and(|(source, target)| aggregate::same_runtime_array_type(source, target)))
-                            .then_some((destination, source.declaration_span, target.declaration_span))
-                    })();
-                    let widened_roundtrip = (|| {
-                        if scope != ReferenceScopeId(0) || !self.generic_parameters.is_empty()
-                            || item_index != 1 || region.items.len() != 3
-                            || !matches!(calls.boundary.root_outputs.as_slice(), [output] if output.ty == ScalarType::U64)
-                        { return None; }
-                        let [_, _, BlockItem { kind: BlockItemKind::FinalOutput(observe), .. }] =
-                            region.items.as_slice() else { return None };
-                        let [_, _, ScalarBlockItem::Expression(observation)] = block.items.as_slice() else { return None };
-                        if !matches!(self.call_target(observation, observe.expression),
-                            Ok(ResolvedCallTarget::Core(CoreOperationId::ArrayLen))) { return None; }
-                        let ([target], [value]) = (assignment.targets.as_slice(), assignment.values.as_slice())
-                        else { return None; };
-                        if !matches!(target.place, ScalarPlace::Name { .. }) { return None; }
-                        let occurrence = group.rhs_evaluations().next()?.expression;
-                        let source = self.widened_owning_argument(value, occurrence, block.span)?;
-                        let destination = group.destinations().next()?.destination;
-                        let DirectDestinationIdentity::Existing(binding) = calls.prepared_direct_destination(destination)?
-                        else { return None; };
-                        (source == binding).then_some((occurrence, destination, binding.declaration_span))
-                    })();
-                    let widened_owning_replace = (|| {
-                        if scope != ReferenceScopeId(0) { return None; }
-                        let owners = self.widened_arrays.as_ref()?;
-                        let ([target], [value]) = (assignment.targets.as_slice(), assignment.values.as_slice())
-                        else { return None; };
-                        if !matches!(target.place, ScalarPlace::Name { .. }) { return None; }
-                        let call = group.rhs_evaluations().next()?.expression;
-                        let source = self.widened_owning_argument(value, call, block.span)?;
-                        let destination = group.destinations().next()?.destination;
-                        let DirectDestinationIdentity::Existing(target) = calls.prepared_direct_destination(destination)?
-                        else { return None; };
-                        (source != target && owners.contains(target) && target.block_span == block.span
-                            && self.binding_types.get(source).zip(self.binding_types.get(target))
-                                .is_some_and(|(a, b)| aggregate::same_runtime_array_type(a, b)))
-                            .then_some((call, destination, source.declaration_span, target.declaration_span))
-                    })();
-                    let widened_join_replace = (|| {
-                        let owners = self.widened_arrays.as_ref()?;
-                        let ([target], [value @ ScalarExpression::If { .. }]) =
-                            (assignment.targets.as_slice(), assignment.values.as_slice()) else { return None; };
-                        if !matches!(target.place, ScalarPlace::Name { .. }) { return None; }
-                        let evaluation = group.rhs_evaluations().next()?.expression;
-                        let destination = group.destinations().next()?.destination;
-                        let DirectDestinationIdentity::Existing(target) = calls.prepared_direct_destination(destination)?
-                        else { return None; };
-                        if target.block_span != block.span || !owners.contains(target) { return None; }
-                        let ty = self.binding_types.get(target)?;
-                        let arms = self.widened_join_inputs(value, ty, evaluation, scope)?;
-                        Some((destination, evaluation, target.declaration_span, arms))
-                    })();
-                    if let Some((_, _, _, arms)) = widened_join_replace {
-                        self.aggregate_result.widened_join_arms.extend(arms);
-                    }
-                    let descriptor_replace = (|| {
-                        if block.unsafe_context || !self.generic_parameters.is_empty()
-                            || group.projected_outputs().len() != 0 { return None; }
-                        let ([target], [value]) = (assignment.targets.as_slice(), assignment.values.as_slice())
-                        else { return None; };
-                        if !matches!(target.place, ScalarPlace::Name { .. })
-                            || !super::typecheck::guarded_runtime_rhs(value) { return None; }
-                        let rhs = group.rhs_evaluations().next()?.expression;
-                        let destination = group.destinations().next()?.destination;
-                        let DirectDestinationIdentity::Existing(owner) = calls.prepared_direct_destination(destination)?
-                        else { return None; };
-                        if owner.block_span != block.span
-                            || !self.widened_arrays.as_ref()?.contains(owner)
-                        { return None; }
-                        let ty = self.binding_types.get(owner)?;
-                        matches!(ty, ScalarType::RuntimeArray { element, .. } if aggregate::ordinary_value(element))
-                            .then(|| (destination, rhs, owner.declaration_span, ty.clone()))
-                    })();
-                    let mut descriptor_paths = None;
-                    let ordinary_aggregate_replacement = (|| {
-                        if block.unsafe_context || !self.generic_parameters.is_empty()
-                            || group.projected_outputs().len() != 0
-                        { return None; }
-                        let ([target], [value]) =
-                            (assignment.targets.as_slice(), assignment.values.as_slice()) else { return None; };
-                        if !matches!(target.place, ScalarPlace::Name { .. })
-                            || !matches!(value, ScalarExpression::StructLiteral { .. } | ScalarExpression::ArrayLiteral { .. })
-                        { return None; }
-                        let evaluation = group.rhs_evaluations().next()?;
-                        let destination = group.destinations().next()?.destination;
-                        let DirectDestinationIdentity::Existing(binding) = calls.prepared_direct_destination(destination)?
-                        else { return None; };
-                        let ty = self.binding_types.get(binding)?;
-                        (matches!((ty, value),
-                            (ScalarType::Struct(_), ScalarExpression::StructLiteral { .. })
-                            | (ScalarType::Array { .. }, ScalarExpression::ArrayLiteral { .. }))
-                            && calls.structure.checked_types.expressions.get(&evaluation.expression) == Some(ty))
-                            .then_some(evaluation.expression)
-                    })();
-                    let scalar_rhs_eligible = !block.unsafe_context && self.generic_parameters.is_empty()
-                        && group.projected_outputs().len() == 0;
-                    let mut scalar_rhs = Some(Vec::new());
-                    let mut values = Vec::new();
-                    for evaluation in group.rhs_evaluations() {
-                        let value = &assignment.values[evaluation.position];
-                        let ordinary_payload = if scalar_rhs_eligible && scalar_rhs.is_some()
-                            && (matches!(value, ScalarExpression::Call { .. }) || calls.candidate_fallible_composite(value, evaluation.expression))
-                        {
-                            group.destinations().as_slice().get(evaluation.position).and_then(|slot| {
-                                let AssignmentReplacement::Resolved(ty @ (ScalarType::U64 | ScalarType::I32 | ScalarType::Bool)) = &slot.replacement
-                                else { return None; };
-                                let target = &assignment.targets[slot.position].place;
-                                let exact = match target {
-                                    ScalarPlace::Name { .. } => matches!(calls.prepared_direct_destination(slot.destination),
-                                        Some(DirectDestinationIdentity::Existing(_))),
-                                    ScalarPlace::Index { .. } => {
-                                        let root = self.place_root(target, slot.destination);
-                                        matches!(root.place, ScalarPlace::Name { span, .. }
-                                            if matches!(self.prepared_place_root(root.ordinal, *span),
-                                                Ok(Some(PreparedPlaceRoot::Lexical(_)))))
-                                    }
-                                    _ => false,
-                                };
-                                (exact && calls.structure.checked_types.expressions.get(&evaluation.expression) == Some(ty)).then_some(ty)
-                            })
-                        } else { None };
-                        let exact_move = widened_roundtrip.map(|(call, _, owner)| (call, owner))
-                            .or(widened_owning_replace.map(|(call, _, owner, _)| (call, owner)));
-                        let mode = match exact_move {
-                            Some((call, owner)) if call == evaluation.expression => ExpressionReadMode::WidenedOwningRoundtrip(owner),
-                            _ if ordinary_aggregate_replacement == Some(evaluation.expression) =>
-                                ExpressionReadMode::OrdinaryScalarAggregateInitializer,
-                            _ => ExpressionReadMode::Ordinary,
-                        };
-                        let capture = self.capture_call_points;
-                        let descriptor_type = descriptor_replace.as_ref().filter(|(_, rhs, _, _)| *rhs == evaluation.expression)
-                            .map(|(_, _, _, ty)| ty);
-                        self.capture_call_points |= ordinary_payload.is_some() || descriptor_type.is_some();
-                        let result = self.expression_with_read_mode(value, scope, evaluation.expression, mode);
-                        self.capture_call_points = capture;
-                        let result = result?;
-                        if let Some(ty) = descriptor_type {
-                            descriptor_paths = self.guarded_runtime_call_paths(value, evaluation.expression, ty);
-                        }
-                        if let Some(ty) = ordinary_payload {
-                            if let Some(proof) = self.guarded_numeric_expression(value, evaluation.expression, ty) {
-                                scalar_rhs.as_mut().expect("eligible ordinary RHS group").push(proof);
-                            } else {
-                                // Do not partially enroll a group whose other
-                                // candidate requires an unsupported expression.
-                                scalar_rhs = None;
-                            }
-                        }
-                        let rhs_point = self.cursor.expect("evaluated assignment output");
-                        self.move_value_with_widened_receipt(value, scope, evaluation.expression, widened_rebind.is_some())?;
-                        if let Some((source, target, ty, rhs, destination)) = &guarded_replacement {
-                            let moved = self.cursor.filter(|point| *point != rhs_point)
-                                .ok_or_else(|| self.missing_context(expression_span(value),
-                                    ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer))?;
-                            self.proof_points.guarded_runtime_moves.insert(rhs_point, GuardedRuntimeMove {
-                                source: source.clone(), target: target.clone(), target_ty: ty.clone(), rhs: rhs.0,
-                                replacement: Some(destination.0), moved, scope,
-                            });
-                        }
-                        values.push((result, rhs_point));
-                    }
-                    if let Some(proofs) = scalar_rhs.filter(|proofs| !proofs.is_empty()) {
-                        self.aggregate_result.ordinary_fallible_expressions.push((None, proofs));
-                    }
-                    for projection in group.projected_outputs() {
-                        let producer = values[projection.producer.position].1;
-                        let rhs_point = self.project_call_output(producer, projection.producer.expression, projection.output);
-                        values.push((ReferenceValue::Uncomputed, rhs_point));
-                    }
-                    let destinations = group
-                        .destinations()
-                        .zip(&values)
-                        .map(|(slot, _)| {
-                            self.assignment_destination(
-                                &assignment.targets[slot.position],
-                                scope,
-                                slot.destination,
-                            )
-                        })
-                        .collect::<Result<Vec<_>, _>>()?;
-                    let capture = if group.previous_observations().len() > 1 {
-                        self.proof_points.has_grouped_assignment_capture = Some(true);
-                        Some(self.point(
-                            CfgPointKind::CaptureAssignmentPrevious { writes: Vec::new() },
-                            group.span,
-                            scope,
-                            BTreeSet::new(),
-                        ))
-                    } else {
-                        None
-                    };
-                    let mut array_rebind = None;
-                    let primary_array_producer = group
-                        .rhs_evaluations()
-                        .next()
-                        .filter(|evaluation| assignment.values.len() == 1 && evaluation.position == 0)
-                        .map(|evaluation| evaluation.expression);
-                    let mut simple_destinations = primary_array_producer.is_some();
-                    for ((slot, (value, rhs_point)), destination) in
-                        group.installs().zip(values).zip(destinations)
-                    {
-                        let existing_prepared = matches!(&destination, ReferenceAssignmentDestination::PreparedName(DirectDestinationIdentity::Existing(_)));
-                        simple_destinations &= existing_prepared;
-                        let prepared_local_introduction = matches!(&destination,
-                            ReferenceAssignmentDestination::PreparedName(DirectDestinationIdentity::Introduce { .. }));
-                        let position = slot.position;
-                        let target = &assignment.targets[position];
-                        if matches!(&destination,
-                                ReferenceAssignmentDestination::PreparedName(DirectDestinationIdentity::Module(_))
-                                | ReferenceAssignmentDestination::EvaluationOnly
-                                | ReferenceAssignmentDestination::RawName)
-                        {
-                            self.proof_points.has_nonlexical_install = true;
-                            if self.aggregate_facts.local_array_copy_allocation.is_some() {
-                                self.aggregate_facts.checked_producer_nonlocal_installs.insert(rhs_point);
-                            }
-                        }
-                        let emitted = if let ScalarPlace::Name { name, span } = &target.place {
-                            let lexical = match destination {
-                                ReferenceAssignmentDestination::PreparedName(identity) => {
-                                    match identity {
-                                        DirectDestinationIdentity::Existing(binding) => {
-                                            Some((binding.clone(), None))
-                                        }
-                                        DirectDestinationIdentity::Introduce { binding, name } => {
-                                            Some((binding.clone(), Some(name.as_str())))
-                                        }
-                                        DirectDestinationIdentity::Module(_) => None,
-                                    }
-                                }
-                                ReferenceAssignmentDestination::RawName => {
-                                    match self.names.get(name) {
-                                        Some(binding) => Some((binding.clone(), None)),
-                                        None if self.module_names.contains(name) => None,
-                                        None => Some((
-                                            ReferenceBindingId {
-                                                source: self.source.clone(),
-                                                function_span: self.function_span,
-                                                declaration_span: target.target_span,
-                                                block_span: block.span,
-                                                kind: ReferenceBindingKind::Declared,
-                                            },
-                                            Some(name.as_str()),
-                                        )),
-                                    }
-                                }
-                                _ => unreachable!("staged direct assignment destination"),
-                            };
-                            let Some((id, introduction)) = lexical else {
-                                if matches!(value, ReferenceValue::Checked(_)) {
-                                    return Err(self.missing_context(
-                                        *span,
-                                        ReferenceAnalysisErrorReason::MissingCheckedReferenceOrigin,
-                                    ));
-                                }
-                                let install = self.point(
-                                    CfgPointKind::Evaluate(ScalarExpression::Name {
-                                        name: name.clone(),
-                                        span: *span,
-                                    }),
-                                    *span,
-                                    scope,
-                                    BTreeSet::new(),
-                                );
-                                self.record_frozen_install(slot.destination, FrozenInstall { rhs: rhs_point, install });
-                                continue;
-                            };
-                            if let Some(name) = introduction {
-                                self.names.insert(name.to_owned(), id.clone());
-                                let ty = output_types.get(position).ok_or_else(|| {
-                                    self.missing_context(
-                                        target.target_span,
-                                        ReferenceAnalysisErrorReason::MissingResolvedBinding,
-                                    )
-                                })?;
-                                self.binding_types.record(id.clone(), ty.clone(), (prepared_local_introduction && self.deferred_local_reborrow).then_some(scope));
-                                declared.push((name.to_owned(), id.clone(), None));
-                            }
-                            let target_place =
-                                self.reference_place(&target.place, id.clone(), None);
-                            let previous_origins =
-                                self.origins.get(&id).cloned().unwrap_or_default();
-                            let previous_loans = previous_origins
-                                .iter()
-                                .filter_map(|origin| match &self.cfg.facts[origin.0] {
-                                    ReferenceOrigin::Fresh { loan, .. }
-                                    | ReferenceOrigin::BorrowedFrom { loan, .. } => {
-                                        Some(loan.clone())
-                                    }
-                                    ReferenceOrigin::Null { .. }
-                                    | ReferenceOrigin::Invalid { .. } => None,
-                                })
-                                .collect();
-                            let assign = CfgPointKind::Assign {
-                                target: target_place,
-                                rhs_point,
-                                previous_origins,
-                                previous_loans,
-                            };
-                            let widened_rebind = widened_rebind.filter(|(destination, _, target)|
-                                *destination == slot.destination && *target == id.declaration_span);
-                            let widened_roundtrip = widened_roundtrip.filter(|(_, destination, owner)|
-                                *destination == slot.destination && *owner == id.declaration_span);
-                            let widened_owning_replace = widened_owning_replace.filter(|(_, destination, _, target)|
-                                *destination == slot.destination && *target == id.declaration_span);
-                            let widened_join_replace = widened_join_replace.filter(|(destination, _, target, _)|
-                                *destination == slot.destination && *target == id.declaration_span && capture.is_none());
-                            let descriptor_replace = descriptor_replace.as_ref()
-                                .filter(|(destination, _, target, _)| *destination == slot.destination
-                                    && *target == id.declaration_span && capture.is_none())
-                                .zip(descriptor_paths.take());
-                            if widened_rebind.is_none() && widened_roundtrip.is_none() && widened_owning_replace.is_none()
-                                && widened_join_replace.is_none() && descriptor_replace.is_none()
-                                && self.widened_arrays.as_ref().is_some_and(|owners| owners.contains(&id))
-                                && matches!(&assign, CfgPointKind::Assign { target, .. } if target.projections.is_empty())
-                            {
-                                return Err(self.missing_context(*span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
-                            }
-                            let guarded_install = guarded_replacement.as_ref()
-                                .is_some_and(|(_, owner, _, _, destination)| owner == &id && *destination == slot.destination && capture.is_none());
-                            if !guarded_install && self.proof_points.guarded_runtime_receivers.contains(&id)
-                                && matches!(&assign, CfgPointKind::Assign { target, .. } if target.projections.is_empty())
-                            {
-                                return Err(self.missing_origin(*span, id, ReferenceAnalysisErrorReason::UnsupportedFallibleAllocationAccess));
-                            }
-                            let emitted = self.emit_direct_assignment(id, assign, rhs_point, value, *span, scope)?;
-                            if guarded_install {
-                                self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
-                            }
-                            if let Some((destination, source, target)) = widened_rebind {
-                                self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
-                                self.aggregate_result.widened_rebinds.insert(destination.0,
-                                    aggregate::ClosedWidenedRebind { point: emitted.install, source, target });
-                            }
-                            if let Some((call, _, owner)) = widened_roundtrip {
-                                self.aggregate_result.widened_owning_roundtrip = Some((call, emitted.install, owner));
-                            }
-                            if let Some((call, destination, source, target)) = widened_owning_replace {
-                                if !self.aggregate_facts.array_calls.get(&emitted.rhs)
-                                    .is_some_and(|(actual, _, binding)| *actual == call && binding.declaration_span == source)
-                                {
-                                    return Err(self.missing_context(*span, ReferenceAnalysisErrorReason::UnprovedWidenedArrayTransfer));
-                                }
-                                self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
-                                self.aggregate_result.widened_owning_receives.push((emitted.rhs, call, source, target,
-                                    Some((emitted.install, destination.0))));
-                            }
-                            if let Some((destination, rhs, target, _)) = widened_join_replace {
-                                self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
-                                self.aggregate_result.widened_join_replacements.insert(destination.0, (rhs.0, emitted.install, target));
-                            }
-                            if let Some(((destination, rhs, declaration, _), paths)) = descriptor_replace {
-                                self.proof_points.widened_rebind_points.get_or_insert_with(HashSet::new).insert(emitted.install);
-                                self.aggregate_result.ordinary_array_receivers.push((*rhs,
-                                    aggregate::OrdinaryArrayDestination::Replace {
-                                        destination: *destination, install: emitted.install, declaration: *declaration,
-                                    }, paths));
-                            }
-                            self.author_direct_assignment(emitted, existing_prepared && capture.is_none()
-                                && assignment.targets.len() == 1 && assignment.values.len() == 1);
-                            emitted
-                        } else {
-                            if let ReferenceAssignmentDestination::Through(pointer_point) =
-                                destination
-                            {
-                                if capture.is_none() && assignment.targets.len() == 1
-                                    && assignment.values.len() == 1
-                                    && aggregate::ordinary_value(&output_types[position])
-                                    && self.call_sites.structure.checked_types.places.get(&slot.destination) == Some(&output_types[position])
-                                {
-                                    if let Some(author) = &mut self.local_borrow {
-                                        author.prepare_projected_write(CfgPointId(self.cfg.points.len()));
-                                    }
-                                }
-                                let assign = CfgPointKind::AssignThrough {
-                                    place: self.proof_place(&target.place, slot.destination).into_owned(),
-                                    pointer_point,
-                                    rhs_point,
-                                    candidates: Vec::new(),
-                                    previous_origins: BTreeSet::new(),
-                                    previous_loans: Vec::new(),
-                                };
-                                match value {
-                                    ReferenceValue::Checked(origins) => {
-                                        self.point(assign, target.target_span, scope, origins);
-                                    }
-                                    ReferenceValue::Uncomputed
-                                        if matches!(
-                                            output_types[position],
-                                            ScalarType::CheckedReference { .. }
-                                        ) =>
-                                    {
-                                        self.uncomputed_point(assign, target.target_span, scope);
-                                    }
-                                    _ => {
-                                        self.point(
-                                            assign,
-                                            target.target_span,
-                                            scope,
-                                            BTreeSet::new(),
-                                        );
-                                    }
-                                }
-                                if capture.is_none()
-                                    && (self.proof_points.pending_named_reborrow.is_some() || self.has_projected_child || self.has_joined_root_reborrow)
-                                    && matches!(&self.cfg.points[pointer_point.0].kind,
-                                        CfgPointKind::Read { binding } if matches!(self.binding_types.get(binding),
-                                            Some(ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner })
-                                                if match &target.place {
-                                                    ScalarPlace::Dereference { pointer, .. } => matches!(pointer.as_ref(),
-                                                        ScalarExpression::Name { .. })
-                                                        && aggregate::ordinary_value(inner) && **inner == output_types[position],
-                                                    place @ ScalarPlace::Index { .. } => self.has_joined_root_reborrow
-                                                        && self.exact_indexed_store_type(place, slot.destination, inner, &output_types[position]),
-                                                    place => self.has_projected_child && aggregate::ordinary_value(&output_types[position])
-                                                        && matches!(direct_checked_field_base(place),
-                                                            Some((ScalarExpression::Name { .. }, ScalarFieldReference::Resolved(field)))
-                                                                if matches!(inner.as_ref(), ScalarType::Struct(id) if id == &field.structure)),
-                                                }))
-                                {
-                                    self.proof_points.checked_named_scalar_stores
-                                        .push(self.cursor.expect("typed scalar store"));
-                                }
-                            } else {
-                                let target_place = match destination {
-                                    ReferenceAssignmentDestination::EvaluationOnly => continue,
-                                    ReferenceAssignmentDestination::Resolved(place) => place,
-                                    ReferenceAssignmentDestination::RawName
-                                    | ReferenceAssignmentDestination::PreparedName(_)
-                                    | ReferenceAssignmentDestination::Through(_) => {
-                                        unreachable!("staged projected assignment destination")
-                                    }
-                                };
-                                let assign = CfgPointKind::Assign {
-                                    target: target_place,
-                                    rhs_point,
-                                    previous_origins: BTreeSet::new(),
-                                    previous_loans: Vec::new(),
-                                };
-                                match value {
-                                    ReferenceValue::Checked(origins) => {
-                                        self.point(assign, target.target_span, scope, origins);
-                                    }
-                                    ReferenceValue::Uncomputed
-                                        if matches!(
-                                            output_types[position],
-                                            ScalarType::CheckedReference { .. }
-                                        ) =>
-                                    {
-                                        self.uncomputed_point(assign, target.target_span, scope);
-                                    }
-                                    _ => {
-                                        self.point(
-                                            assign,
-                                            target.target_span,
-                                            scope,
-                                            BTreeSet::new(),
-                                        );
-                                    }
-                                }
-                            }
-                            if self.local_borrow.is_some()
-                                && !(capture.is_none() && assignment.targets.len() == 1
-                                    && assignment.values.len() == 1
-                                    && aggregate::ordinary_value(&output_types[position])
-                                    && self.call_sites.structure.checked_types.places.get(&slot.destination) == Some(&output_types[position])
-                                    && match &self.cfg.points[self.cursor.expect("assignment install point").0].kind {
-                                        CfgPointKind::Assign { target, .. } => local_borrow::direct_fixed_projection(target),
-                                        CfgPointKind::AssignThrough { .. } => true, // already qualified by the author
-                                        _ => false,
-                                    })
-                            {
-                                self.local_borrow = None;
-                            }
-                            FrozenInstall { rhs: rhs_point, install: self.cursor.expect("assignment install point") }
-                        };
-                        let FrozenInstall { rhs: rhs_point, install } = emitted;
-                        if capture.is_none() && assignment.targets.len() == 1 && assignment.values.len() == 1
-                            && position == 0 && block.terminated_items.get(item_index) == Some(&true)
-                            && matches!(target.place, ScalarPlace::Field { .. })
-                        {
-                            let canonical = self.proof_place(&target.place, slot.destination).into_owned();
-                            self.record_runtime_array_field_site(install, slot.destination, &canonical, None);
-                        }
-                        if let CfgPointKind::AssignThrough { pointer_point, .. } = self.cfg.points[install.0].kind {
-                            let (index_place, field_store) = match &target.place {
-                                ScalarPlace::Field { base, .. } => (base.as_ref(), true),
-                                _ => (&target.place, false),
-                            };
-                            let runtime_writer = matches!(index_place, ScalarPlace::Index { base, .. }
-                                if matches!(base.as_ref(), ScalarPlace::Dereference { .. }))
-                                && matches!(&self.cfg.points[pointer_point.0].kind, CfgPointKind::Read { binding }
-                                    if matches!(self.binding_types.get(binding),
-                                        Some(ScalarType::CheckedReference { mutability: ScalarReferenceMutability::Mutable, inner })
-                                            if matches!(inner.as_ref(), ScalarType::RuntimeArray { .. })));
-                            if runtime_writer {
-                                let ordinary_store = capture.is_none()
-                                    && assignment.targets.len() == 1 && assignment.values.len() == 1 && position == 0;
-                                let local = !field_store && ordinary_store && block.terminated_items.get(item_index) == Some(&true)
-                                    && group.projected_outputs().len() == 0
-                                    && self.local_runtime_exclusive_place(&target.place, slot.destination).is_some();
-                                if let Some(site) = local.then(|| self.local_runtime_exclusive_site(pointer_point, slot.destination)).flatten() {
-                                    self.cfg.runtime_array_exclusive_sites.insert(install, site);
-                                } else if let Some((prefix, field)) = (self.capture_private_runtime_reads && ordinary_store
-                                    && (!field_store || (block.terminated_items.get(item_index) == Some(&true)
-                                        && group.projected_outputs().len() == 0)))
-                                    .then(|| {
-                                        let canonical = self.proof_place(&target.place, slot.destination).into_owned();
-                                        self.private_runtime_formal_store(&canonical, slot.destination, pointer_point, &output_types[position])
-                                    }).flatten()
-                                {
-                                    self.proof_points.private_runtime_formal_stores.insert(install, prefix);
-                                    if let Some(field) = field {
-                                        self.proof_points.private_runtime_formal_copy_stores.insert(install, (slot.destination, field));
-                                    }
-                                } else {
-                                    return Err(self.missing_context(target.target_span,
-                                        ReferenceAnalysisErrorReason::MissingDereferencedArrayWriteExtent));
-                                }
-                            }
-                        }
-                        if capture.is_none() && assignment.targets.len() == 1 && assignment.values.len() == 1
-                            && position == 0 && aggregate::ordinary_value(&output_types[position])
-                            && matches!(&slot.replacement, AssignmentReplacement::Resolved(ty) if ty == &output_types[position])
-                        {
-                            if let CfgPointKind::Assign { target, rhs_point: actual, .. } = &self.cfg.points[install.0].kind {
-                                if *actual == rhs_point
-                                    && self.proof_points.fallible_allocation_bindings.as_ref()
-                                        .and_then(|sites| sites.get(&target.binding))
-                                        .and_then(|owner| self.exact_guarded_index(
-                                            &assignment.targets[position].place, slot.destination, &target.binding, owner))
-                                        == Some(&output_types[position])
-                                {
-                                    self.proof_points.guarded_indexed_stores.insert(install);
-                                }
-                                if let (ScalarPlace::Field { base, field: ScalarFieldReference::Resolved(field), .. },
-                                    [ReferencePlaceProjection::Field(ScalarFieldReference::Resolved(projection))]) =
-                                    (&target.place, target.projections.as_slice())
-                                {
-                                    if let ScalarPlace::Name { span, .. } = base.as_ref() {
-                                        let root = self.place_root(&target.place, slot.destination);
-                                        if *actual == rhs_point && field == projection
-                                            && matches!(self.binding_types.get(&target.binding),
-                                                Some(ScalarType::Struct(id)) if *id == field.structure)
-                                            && matches!(self.prepared_place_root(root.ordinal, *span)?,
-                                                Some(PreparedPlaceRoot::Lexical(binding)) if binding == &target.binding)
-                                        {
-                                            if let Some(evaluation) = group.rhs_evaluations().next() {
-                                                self.aggregate_facts.receipt_scalar_field_writes.insert(
-                                                    install, (evaluation.expression, slot.destination),
-                                                );
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        // Only the checked primary output can start same-array retention.
-                        // Projected outputs have distinct points and do not inherit this proof.
-                        if simple_destinations && position == 0
-                            && self.aggregate_facts.array_calls.get(&rhs_point).is_some_and(|(producer, _, binding)| {
-                                Some(*producer) == primary_array_producer
-                                    && matches!(&self.cfg.points[rhs_point.0].kind, CfgPointKind::Call { output: 0, .. })
-                                    && matches!(&self.cfg.points[install.0].kind,
-                                        CfgPointKind::Assign { target, rhs_point: actual, .. }
-                                            if *actual == rhs_point && target.projections.is_empty() && target.binding == *binding)
-                            })
-                        {
-                            array_rebind = Some((install, slot.destination));
-                        }
-                        self.record_frozen_install(slot.destination, emitted);
-                        let other_writer = item_index == 0
-                            && self.aggregate_facts.literal_array_other_writer == Some(ordinal);
-                        let literal_writer = (scope == ReferenceScopeId(0) && item_index == 1)
-                            || (item_index == 0 && self.aggregate_facts.literal_array_writer == Some(ordinal));
-                        if (literal_writer || other_writer) && existing_prepared
-                            && position == 0 && assignment.targets.len() == 1 && assignment.values.len() == 1
-                            && self.aggregate_facts.literal_array_bind.is_some()
-                            && matches!(output_types[position], ScalarType::RuntimeArray { .. })
-                        {
-                            if let Some(evaluation) = group.rhs_evaluations().next() {
-                                if let Some(argument) = self.literal_array_argument(evaluation.expression, rhs_point) {
-                                    let write = Some(aggregate::LiteralArrayWrite {
-                                        rhs: rhs_point,
-                                        writer: install,
-                                        producer: evaluation.expression,
-                                        destination: slot.destination,
-                                        argument,
-                                    });
-                                    if other_writer {
-                                        self.aggregate_facts.literal_array_other_write = write;
-                                    } else {
-                                        self.aggregate_facts.literal_array_write = write;
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(capture) = capture.filter(|_| {
-                            self.capture_call_points && scope == ReferenceScopeId(0)
-                                && assignment.values.len() == 1
-                                && (!matches!(self.proof_points.scalar_descriptor_install, ScalarDescriptorCandidates::Multiple)
-                                    || !matches!(self.proof_points.backing_descriptor_install, ScalarDescriptorCandidates::Multiple))
-                                && matches!(&calls.named_place_roots, NamedPlaceRootFacts::Prepared(_))
-                        }) {
-                            if let (
-                                ScalarType::CheckedReference { inner, .. },
-                                CfgPointKind::Assign { target, .. },
-                                CfgPointKind::Call { output, target: ResolvedCallTarget::ModuleCallable { .. }, .. },
-                                Some(evaluation),
-                            ) = (
-                                &output_types[position],
-                                &self.cfg.points[install.0].kind,
-                                &self.cfg.points[rhs_point.0].kind,
-                                group.rhs_evaluations().next(),
-                            ) {
-                                if let ScalarType::Struct(id) = inner.as_ref() {
-                                    if target.projections.is_empty() && *output == position
-                                        && calls.boundary.root_outputs.iter().all(|output| {
-                                            aggregate::ordinary_value(&output.ty) || matches!(output.ty, ScalarType::Unit | ScalarType::Enum(_))
-                                        })
-                                    {
-                                        let known = [&self.proof_points.scalar_descriptor_install, &self.proof_points.backing_descriptor_install]
-                                            .into_iter().find_map(|candidate| match candidate {
-                                                ScalarDescriptorCandidates::One(_, marker) if &marker.structure == id => Some(marker.validate_backing),
-                                                _ => None,
-                                            });
-                                        let class = known.or_else(|| {
-                                            let declaration = self.structs.iter().find(|declaration| &declaration.id == id)?;
-                                            if declaration.fields.is_empty() {
-                                                return None;
-                                            }
-                                            let mut fields = 0;
-                                            let supported = declaration.fields.iter().all(|field| match &field.ty {
-                                                ScalarType::RawPointer(_) => {
-                                                    fields += 1;
-                                                    fields == 1
-                                                }
-                                                ty => aggregate::ordinary_value(ty) || matches!(ty, ScalarType::Enum(_)),
-                                            });
-                                            (supported && (fields == 0 || *output == 0)).then_some(fields == 1)
-                                        });
-                                        if let Some(validate_backing) = class.filter(|class| !*class || *output == 0) {
-                                            let candidate = if validate_backing {
-                                                &mut self.proof_points.backing_descriptor_install
-                                            } else {
-                                                &mut self.proof_points.scalar_descriptor_install
-                                            };
-                                            match candidate {
-                                                ScalarDescriptorCandidates::Multiple => {}
-                                                ScalarDescriptorCandidates::One(previous, _) if *previous != slot.destination => {
-                                                    *candidate = ScalarDescriptorCandidates::Multiple;
-                                                }
-                                                _ => {
-                                                    let marker = ScalarDescriptorInstall {
-                                                        validate_backing,
-                                                        frozen: FrozenInstall { rhs: rhs_point, install },
-                                                        capture,
-                                                        binding: target.binding.clone(),
-                                                        call: evaluation.expression,
-                                                        output: *output,
-                                                        structure: id.clone(),
-                                                    };
-                                                    if let ScalarDescriptorCandidates::One(_, previous) = candidate {
-                                                        **previous = marker;
-                                                    } else {
-                                                        *candidate = ScalarDescriptorCandidates::One(slot.destination, Box::new(marker));
-                                                    }
-                                                }
-                                            }
-                                        }
-                                    }
-                                }
-                            }
-                        }
-                        if let Some(capture) = capture {
-                            let install = self.cursor.expect("assignment install point");
-                            let CfgPointKind::CaptureAssignmentPrevious { writes } =
-                                &mut self.cfg.points[capture.0].kind
-                            else {
-                                unreachable!("assignment group capture")
-                            };
-                            writes.push(install);
-                        }
-                    }
-                    if let Some((install, destination)) = array_rebind.filter(|_| simple_destinations) {
-                        self.aggregate_facts.array_installs.insert(install, destination);
-                    }
-                    let continuation = group.continuation();
-                    assert_eq!(
-                        continuation,
-                        BlockPosition {
-                            block: ordinal,
-                            item: item_index + 1
-                        }
-                    );
-                    next_item = continuation.item;
+                    next_item = self.prepare_block_assignment(
+                        block, BlockPosition { block: ordinal, item: item_index }, scope,
+                        assignment, key, &mut declared,
+                    )?;
                 }
                 _ => panic!(
                     "mismatched block item {ordinal:?}/{item_index} in {:?}",
