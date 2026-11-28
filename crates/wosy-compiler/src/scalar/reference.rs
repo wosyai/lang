@@ -6488,7 +6488,7 @@ pub(super) struct OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) prepared_range_binary: HashMap<OccurrenceOrdinal, (OccurrenceOrdinal, BinaryOperator, OccurrenceOrdinal)>,
     #[cfg(feature = "internal-checker")]
-    pub(super) prepared_i32_bitwise: HashMap<OccurrenceOrdinal, (OccurrenceOrdinal, BinaryOperator, OccurrenceOrdinal)>,
+    pub(super) prepared_integer_bitwise: HashMap<OccurrenceOrdinal, (OccurrenceOrdinal, BinaryOperator, OccurrenceOrdinal)>,
     #[cfg(feature = "internal-checker")]
     pub(super) prepared_range_literals: HashMap<OccurrenceOrdinal, BigInt>,
     #[cfg(feature = "internal-checker")]
@@ -6710,7 +6710,7 @@ impl OccurrenceStructure {
             #[cfg(feature = "internal-checker")]
             prepared_range_binary: HashMap::new(),
             #[cfg(feature = "internal-checker")]
-            prepared_i32_bitwise: HashMap::new(),
+            prepared_integer_bitwise: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             prepared_range_literals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -9476,9 +9476,9 @@ impl StructuralWalker<'_, '_> {
                                     | BinaryOperator::Multiply | BinaryOperator::Divide | BinaryOperator::Remainder)))
                         {
                             self.structure.prepared_range_binary.insert(ordinal, (left,operator.clone(),right));
-                        } else if *lhs==ScalarType::I32 && lhs==rhs && lhs==output
-                            && matches!(operator,BinaryOperator::BitAnd|BinaryOperator::BitXor) {
-                            self.structure.prepared_i32_bitwise.insert(ordinal,(left,operator.clone(),right));
+                        } else if is_integer_type(lhs) && lhs==rhs && lhs==output
+                            && matches!(operator,BinaryOperator::BitAnd|BinaryOperator::BitXor|BinaryOperator::BitOr|BinaryOperator::ShiftRight) {
+                            self.structure.prepared_integer_bitwise.insert(ordinal,(left,operator.clone(),right));
                         }
                     }
                     if self.structure.checked_types.expressions.get(&ordinal) == Some(&ScalarType::Bool)
@@ -9764,7 +9764,7 @@ impl StructuralWalker<'_, '_> {
             }
             ScalarPlace::Field { base, field, .. } => {
                 #[cfg(feature = "internal-checker")]
-                if self.structure.checked_types.places.get(&ordinal) == Some(&ScalarType::F32) {
+                if matches!(self.structure.checked_types.places.get(&ordinal), Some(ScalarType::F32|ScalarType::I32|ScalarType::U8)) {
                     if let ScalarFieldReference::Resolved(field) = field {
                         self.structure.projected_place_fields.insert(ordinal, field.clone());
                     }

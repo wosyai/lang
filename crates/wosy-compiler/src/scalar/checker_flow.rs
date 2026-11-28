@@ -1810,6 +1810,14 @@ pub(super) struct FloatFieldCell {
 }
 
 #[cfg(feature = "internal-checker")]
+#[derive(Clone, Debug, PartialEq, Eq, Hash)]
+pub(super) struct IntegerFieldCell {
+    pub(super) cell: observed_f32_array::Cell,
+    pub(super) structure: super::ScalarStructId,
+    pub(super) field: usize,
+}
+
+#[cfg(feature = "internal-checker")]
 #[derive(Clone, Debug, Default, PartialEq, Eq)]
 pub(super) struct ProjectedStorage {
     // Whole cells are immutable until a write on this symbolic path.
@@ -1820,6 +1828,7 @@ pub(super) struct ProjectedStorage {
     f32_initial: Rc<HashMap<wosy_syntax::SourceSpan, projected_f32::ExactF32>>,
     aggregate_initial: Rc<HashSet<wosy_syntax::SourceSpan>>,
     field_updates: StorageDelta<FloatFieldCell, projected_f32::ExactF32>,
+    integer_field_updates: StorageDelta<IntegerFieldCell, (ScalarType, i32)>,
     f32_array_updates: StorageDelta<observed_f32_array::Cell, projected_f32::ExactF32>,
     i32_array_updates: StorageDelta<observed_f32_array::Cell, i32>,
     u16_array_updates: StorageDelta<observed_f32_array::Cell, u16>,
@@ -1827,6 +1836,19 @@ pub(super) struct ProjectedStorage {
 
 #[cfg(feature = "internal-checker")]
 impl ProjectedStorage {
+    pub(super) fn observed_integer_field(&self, cell: &IntegerFieldCell, ty: &ScalarType) -> Option<i32> {
+        let (actual,value) = self.integer_field_updates.get(cell)?;
+        (actual == ty).then_some(*value)
+    }
+
+    pub(super) fn overwrite_integer_field(&mut self, cell: IntegerFieldCell, ty: ScalarType, value: i32) -> Option<()> {
+        if !self.has_observed_aggregate(&cell.cell.declaration) ||
+            !matches!(ty, ScalarType::I32) && !(ty == ScalarType::U8 && u8::try_from(value).is_ok())
+        { return None; }
+        self.integer_field_updates.insert(cell,(ty,value));
+        Some(())
+    }
+
     pub(super) fn forget(&mut self) { *self = Self::default(); }
 
     pub(super) fn overwrite_scalar(&mut self, declaration: &wosy_syntax::SourceSpan, ty: &ScalarType, value: &BigInt) -> Option<()> {
@@ -5551,6 +5573,13 @@ pub(super) fn apply_observed_integer_operator(ty:&ScalarType, op:&BinaryOperator
     let result=match op {
         BinaryOperator::BitAnd => left & right,
         BinaryOperator::BitXor => left ^ right,
+        BinaryOperator::BitOr => left | right,
+        BinaryOperator::ShiftRight => {
+            let count=usize::try_from(&right).ok()?;
+            let width=usize::try_from((&max-&min).bits()).ok()?;
+            if count>=width { return None; }
+            left >> count
+        }
         _ => AuthoredIntegerOperation::checked(op)?.apply(Cow::Owned(left),Cow::Owned(right),&min,&max)?,
     };
     (min<=result && result<=max).then_some(result)
@@ -12913,9 +12942,12 @@ pub(super) type ObservedProviderCall<'a> = dyn Fn(&FunctionCallSites, Occurrence
 #[cfg(feature = "internal-checker")]
 fn observed_mixed_provider_arguments(calls:&FunctionCallSites,at:OccurrenceOrdinal) -> Option<Vec<(OccurrenceOrdinal,&ScalarType)>> {
     let signature=calls.checked_call_signatures.get(&at)?;
-    if !calls.structure.checker_direct_targets.contains_key(&at)
-        || !signature.parameters.contains(&ScalarType::I32) || !signature.parameters.contains(&ScalarType::F32)
-        || !signature.parameters.iter().all(|ty| matches!(ty,ScalarType::I32|ScalarType::F32))
+    let mixed = signature.parameters.contains(&ScalarType::I32) && signature.parameters.contains(&ScalarType::F32)
+        && signature.parameters.iter().all(|ty| matches!(ty,ScalarType::I32|ScalarType::F32));
+    // Unary and binary ordinary integer calls keep their existing
+    // partitioned solver. The observed provider handles exact wide calls.
+    let wide = signature.parameters.len()>2 && signature.parameters.iter().all(|ty| *ty==ScalarType::I32);
+    if !calls.structure.checker_direct_targets.contains_key(&at) || !(mixed||wide)
         || !matches!(signature.outputs.outputs.as_slice(),[out] if out.ty==ScalarType::I32)
     { return None; }
     signature.parameters.iter().enumerate().map(|(slot,ty)| {

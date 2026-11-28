@@ -12,13 +12,29 @@ struct Place {
     declaration: SourceSpan,
     selectors: Vec<(OccurrenceOrdinal,u64)>,
     ty: ScalarType,
+    field: Option<super::super::ScalarStructFieldId>,
 }
 
 impl Place {
     fn indexed(body:&FunctionCallSites,site:OccurrenceOrdinal,ty:&ScalarType,owner:&SourceIdentity) -> Option<Self> {
-        let checked=observed_f32_array::typed_place(body,site,ty)?;
+        use super::super::reference::NamedPlaceRootIdentity;
+        let st = &body.structure;
+        if st.checked_types.places.get(&site)? != ty { return None; }
+        if let Some(field) = st.projected_place_fields.get(&site).filter(|_| matches!(ty,ScalarType::I32|ScalarType::U8)) {
+            let OccurrenceNode::Place(base) = *st.edges.get(&(OccurrenceParent::Place(site),OccurrenceEdge::PlaceBase))? else { return None; };
+            let base_ty = st.checked_types.places.get(&base)?;
+            if *base_ty != ScalarType::Struct(field.structure.clone()) { return None; }
+            let (declaration, selectors) = if let Some(NamedPlaceRootIdentity::ModuleValue(declaration)) = body.prepared_named_place_root(base) {
+                (declaration, Vec::new())
+            } else {
+                let checked=observed_f32_array::typed_provider_place(body,base,base_ty)?;
+                (checked.declaration,checked.selectors)
+            };
+            return (&declaration.source==owner).then(|| Self { declaration:declaration.clone(), selectors, ty:ty.clone(),field:Some(field.clone()) });
+        }
+        let checked=observed_f32_array::typed_provider_place(body,site,ty)?;
         if !matches!(ty,ScalarType::I32|ScalarType::F32|ScalarType::U16) || &checked.declaration.source!=owner { return None; }
-        Some(Self { declaration:checked.declaration.clone(),selectors:checked.selectors,ty:ty.clone() })
+        Some(Self { declaration:checked.declaration.clone(),selectors:checked.selectors,ty:ty.clone(),field:None })
     }
 
     fn cell(&self, indices:Vec<ExactValue>) -> Option<observed_f32_array::Cell> {
@@ -47,6 +63,7 @@ enum Task {
     Block(BlockOrdinal,usize,Output),
     Eval(OccurrenceOrdinal),
     DropUnit,
+    DropInteger(ScalarType),
     Bind(ReferenceBindingId,ScalarType),
     Read(Place),
     WritePlace(Place),
@@ -308,12 +325,26 @@ pub(super) struct Dispatch<'a> {
     requirement_conditions:HashMap<(PreparedCallable,OccurrenceOrdinal),Option<OccurrenceOrdinal>>,
 }
 
+/// This is capability selection only. The actual call still needs a current,
+/// compiler-owned row and every executed location must be authenticated.
+pub(super) fn has_nominal_integer_store(body:&FunctionCallSites,owner:&SourceIdentity)->bool {
+    body.assignments.values().any(|group|group.destinations().any(|destination|
+        matches!(&destination.replacement,AssignmentReplacement::Resolved(ty)
+            if matches!(ty,ScalarType::I32|ScalarType::U8)
+                && Place::indexed(body,destination.destination,ty,owner).is_some_and(|place|place.field.is_some()))))
+}
+
 pub(super) fn run<'a>(
     project:&'a ScalarProject,calls:&'a ProjectCallSiteResults,target:PreparedCallable,args:Vec<ExactValue>,
-    storage:&mut ProjectedStorage, trace:bool,dispatch:&mut Dispatch<'a>,
+    caller_storage:&mut ProjectedStorage, trace:bool,dispatch:&mut Dispatch<'a>,
     ranges:&HashMap<PreparedCallable,RangeRank>, visits:&[InitializationVisit], allow_single_failure:bool, reached_requirement:&std::cell::Cell<bool>,
     read_array:impl Fn(&ProjectedStorage,&observed_f32_array::Cell,&ScalarType)->Option<(ExactValue,usize)>,
+    read_integer_field:impl Fn(&ProjectedStorage,&super::super::checker_flow::IntegerFieldCell,&ScalarType)->Option<(ExactValue,usize)>,
 ) -> Option<(Option<ExactValue>,Option<ObservedTrace>,usize,Option<SelectedRequirement>)> {
+    // Keep each activation transactional. No partial state escapes if a
+    // later operation is unsupported or a selected requirement stops it.
+    let mut next_storage=caller_storage.clone();
+    let storage=&mut next_storage;
     let mut active=HashSet::new();
     let mut latest_segment=HashMap::<PreparedCallable,(Rc<ObservedTrace>,usize)>::new();
     let mut values=Vec::new();
@@ -385,8 +416,13 @@ pub(super) fn run<'a>(
                                 .or_insert_with(|| requirement_condition(body,*expression)))?;
                             tasks.extend([Task::DropUnit,Task::Requirement(*expression),Task::Eval(condition)]);
                         } else {
-                            if st.checked_types.expressions.get(expression)?!=&ScalarType::Unit { return None; }
-                            tasks.extend([Task::DropUnit,Task::Eval(*expression)]);
+                            let ty=st.checked_types.expressions.get(expression)?;
+                            let discard=match ty {
+                                ScalarType::Unit=>Task::DropUnit,
+                                ScalarType::I32 if st.checker_direct_targets.contains_key(expression)=>Task::DropInteger(ty.clone()),
+                                _=>return None,
+                            };
+                            tasks.extend([discard,Task::Eval(*expression)]);
                         }
                     }
                     BlockItemKind::Assignment { group } => {
@@ -398,7 +434,7 @@ pub(super) fn run<'a>(
                             || st.checked_types.places.get(&destination.destination)?!=ty { return None; }
                         let p=if let Some(DirectDestinationIdentity::Module(declaration))=body.prepared_direct_destination(destination.destination) {
                             if &declaration.source!=owner || !matches!(ty,ScalarType::I32|ScalarType::Bool) { return None; }
-                            Place { declaration:declaration.clone(),selectors:Vec::new(),ty:ty.clone() }
+                            Place { declaration:declaration.clone(),selectors:Vec::new(),ty:ty.clone(),field:None }
                         } else { Place::indexed(body,destination.destination,ty,owner)? };
                         tasks.extend([Task::WritePlace(p),Task::Eval(rhs.expression)]);
                     }
@@ -406,6 +442,7 @@ pub(super) fn run<'a>(
                 }
             }
             Task::DropUnit => if !matches!(values.pop()?,ResultValue::Unit) { return None; },
+            Task::DropInteger(ty) => if scalar(values.pop()?)?.ty()!=ty { return None; },
             Task::Bind(id,ty) => {
                 let value=scalar(values.pop()?)?;
                 if value.ty()!=ty || frame.slots.insert(id,value).is_some() { return None; }
@@ -445,7 +482,7 @@ pub(super) fn run<'a>(
                 } else if let Some(cut)=body.short_circuits.get(&at) {
                     if *ty!=ScalarType::Bool || cut.evaluate_right_when==cut.bypass { return None; }
                     tasks.extend([Task::Short(cut.left,cut.evaluate_right_when,cut.right),Task::Eval(cut.left)]);
-                } else if let Some((l,op,r))=st.prepared_range_binary.get(&at).or_else(|| st.prepared_i32_bitwise.get(&at)) {
+                } else if let Some((l,op,r))=st.prepared_range_binary.get(&at).or_else(|| st.prepared_integer_bitwise.get(&at)) {
                     tasks.extend([Task::Binary(op.clone()),Task::Eval(*r),Task::Eval(*l)]);
                 } else if let Some((l,op,r))=st.projected_f32_comparisons.get(&at).or_else(|| st.projected_f32_math.get(&at)) {
                     tasks.extend([Task::Binary(op.clone()),Task::Eval(*r),Task::Eval(*l)]);
@@ -467,7 +504,10 @@ pub(super) fn run<'a>(
                 let args=values.split_off(values.len().checked_sub(place.selectors.len())?);
                 let indices=args.into_iter().map(scalar).collect::<Option<_>>()?;
                 let cell=place.cell(indices)?;
-                let (value,cost)=read_array(storage,&cell,&place.ty)?;
+                let (value,cost)=if let Some(field)=place.field {
+                    let cell=super::super::checker_flow::IntegerFieldCell { cell, structure:field.structure,field:field.index };
+                    read_integer_field(storage,&cell,&place.ty)?
+                } else { read_array(storage,&cell,&place.ty)? };
                 charge_call_work(&mut work,cost)?;
                 values.push(ResultValue::Scalar(value));
             }
@@ -482,6 +522,12 @@ pub(super) fn run<'a>(
                 let args=values.split_off(values.len().checked_sub(place.selectors.len())?);
                 let indices=args.into_iter().map(scalar).collect::<Option<_>>()?;
                 let cell=place.cell(indices)?;
+                if let Some(field) = place.field {
+                    let ExactValue::Integer(ty,value) = value else { return None; };
+                    let cell=super::super::checker_flow::IntegerFieldCell { cell,structure:field.structure,field:field.index };
+                    storage.overwrite_integer_field(cell,ty,i32::try_from(&value).ok()?)?;
+                    continue;
+                }
                 match value {
                     ExactValue::F32(value) if !cell.indices.is_empty()=>storage.overwrite_f32_array_element(cell,value)?,
                     ExactValue::Integer(ScalarType::I32,value) if cell.indices.is_empty()=>
@@ -558,17 +604,25 @@ pub(super) fn run<'a>(
                 let [out]=signature.outputs.outputs.as_slice() else { return None; };
                 if !signature.parameters.iter().cloned().eq(args.iter().map(ExactValue::ty)) { return None; }
                 if body.resolved_call_site(site)?.target==ResolvedCallTarget::Core(super::super::CoreOperationId::IntExtend) {
-                    let [ExactValue::Integer(ScalarType::I32,value)]=args.as_slice() else { return None; };
-                    if out.ty!=ScalarType::U64 { return None; }
-                    let value=i64::from(i32::try_from(value).ok()?) as u64;
-                    values.push(ResultValue::Scalar(ExactValue::Integer(ScalarType::U64,value.into())));
+                    let [ExactValue::Integer(input,value)]=args.as_slice() else { return None; };
+                    let value=match (input,&out.ty) {
+                        (ScalarType::I32,ScalarType::U64)=>BigInt::from(i64::from(i32::try_from(value).ok()?) as u64),
+                        (ScalarType::I32,ScalarType::I64)=>BigInt::from(i64::from(i32::try_from(value).ok()?)),
+                        (ScalarType::U8,ScalarType::I32)=>BigInt::from(i32::from(u8::try_from(value).ok()?)),
+                        _=>return None,
+                    };
+                    values.push(ResultValue::Scalar(ExactValue::Integer(out.ty.clone(),value)));
                     continue;
                 }
                 if body.resolved_call_site(site)?.target==ResolvedCallTarget::Core(super::super::CoreOperationId::IntTrunc) {
-                    let [ExactValue::Integer(ScalarType::I32,value)]=args.as_slice() else { return None; };
-                    if out.ty!=ScalarType::U16 { return None; }
-                    let value=i32::try_from(value).ok()? as u16;
-                    values.push(ResultValue::Scalar(ExactValue::Integer(ScalarType::U16,value.into())));
+                    let [ExactValue::Integer(input,value)]=args.as_slice() else { return None; };
+                    let value=match (input,&out.ty) {
+                        (ScalarType::I32,ScalarType::U16)=>BigInt::from(i32::try_from(value).ok()? as u16),
+                        (ScalarType::I32,ScalarType::U8)=>BigInt::from(i32::try_from(value).ok()? as u8),
+                        (ScalarType::I64,ScalarType::I32)=>BigInt::from(i64::try_from(value).ok()? as i32),
+                        _=>return None,
+                    };
+                    values.push(ResultValue::Scalar(ExactValue::Integer(out.ty.clone(),value)));
                     continue;
                 }
                 let child=authenticate_prepared_direct_edge(project,calls,frame.target.0,body,site,signature)?;
@@ -683,5 +737,6 @@ pub(super) fn run<'a>(
         Some(ObservedTrace::new(root,segments,&mut work)?)
     } else { None };
     let value=match values.pop()? { ResultValue::Scalar(v)=>Some(v),ResultValue::Unit=>None };
+    *caller_storage=next_storage;
     Some((value,trace,work,None))
 }

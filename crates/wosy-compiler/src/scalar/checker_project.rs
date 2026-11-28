@@ -2080,14 +2080,9 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
                     InitializerValue::PassiveFloat { _atom: ranked_float::Atom::Single(bits) } => projected_storage.observe_f32(declaration, *bits),
                     InitializerValue::FixedArray { ty, cells } => projected_storage.observe_array(declaration, ty, cells.iter()),
                     InitializerValue::PassiveAggregate { ty, value, .. } => {
-                        let nominal = match ty {
-                            ScalarType::Struct(id) => Some(id),
-                            ScalarType::Array { element, .. } => match element.as_ref() {
-                                ScalarType::Struct(id) => Some(id),
-                                _ => None,
-                            },
-                            _ => None,
-                        };
+                        let mut leaf = *ty;
+                        while let ScalarType::Array {element,..} = leaf { leaf = element; }
+                        let nominal = if let ScalarType::Struct(id) = leaf { Some(id) } else { None };
                         if nominal.is_some_and(|id| &id.source == source && module.structs.get(id.index)
                             .is_some_and(|structure| &structure.id == id && structure.copy_policy == super::CopyPolicy::Copy)) {
                             projected_storage.observe_aggregate(declaration.clone());
@@ -2163,7 +2158,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
             InitializerValue::PassiveAggregate { ty: ScalarType::Struct(_),generation,.. } =>
                 *generation == passive_generation,
             InitializerValue::PassiveAggregate { ty,generation,depth,value }
-                if observed_nested_array_leaf(ty).is_some() && projected_storage.has_observed_aggregate(
+                if matches!(ty, ScalarType::Array { .. }) && projected_storage.has_observed_aggregate(
                     &wosy_syntax::SourceSpan::new(source.clone(),*range)) => {
                 completed_arrays.entry(ordinal).or_default().insert(*range,InitializerValue::PassiveAggregate {
                     ty,generation:*generation,depth:*depth,value:Rc::clone(value),
@@ -2287,6 +2282,7 @@ fn try_observed_projected_storage_call(
     let mut admitted = HashMap::new();
     let mut observed_owners = HashMap::new();
     let mut provider_units = HashSet::new();
+    let mut provider_scalars = HashSet::new();
     let mut productive_ranges = HashMap::new();
     let mut authored_units=HashSet::new();
     let mut getters = HashMap::new();
@@ -2363,6 +2359,16 @@ fn try_observed_projected_storage_call(
                         if let Some(signature) = super::checker_flow::observed_getter_signature(body,*site) {
                             let Some(getter) = admit_getter(node,body,*site,child,signature) else { return Ok(false); };
                             getters.insert((body as *const FunctionCallSites,*site),getter);
+                        } else if let Some(signature)=body.checked_call_signatures.get(site).filter(|signature|
+                            signature.parameters.len()>2 && signature.parameters.iter().all(|ty| *ty==ScalarType::I32)
+                                && matches!(signature.outputs.outputs.as_slice(),[out] if out.ty==ScalarType::I32)) {
+                            let Some(callee)=body_of(child) else { return Ok(false); };
+                            let Some(child_module)=actual.project.modules.get(child.0) else { return Ok(false); };
+                            if authenticate_prepared_direct_edge(actual.project,actual.calls,node.0,body,*site,signature)!=Some(child)
+                                || !stateful_provider::has_nominal_integer_store(callee,&child_module.source)
+                            { return Ok(false); }
+                            provider_scalars.insert(child);
+                            writes_or_reads_storage=true;
                         }
                         continue;
                     }
@@ -2418,7 +2424,16 @@ fn try_observed_projected_storage_call(
             _ => return None,
         };
         if let Some(atom) = overlay { return Some((atom,1)); }
-        observed_passive_array_element(observed_array_backing(&cell.declaration)?, &cell.indices,ty)
+        observed_passive_array_element(observed_array_backing(&cell.declaration)?, &cell.indices,ty,None)
+    };
+    let read_integer_field = |storage: &super::checker_flow::ProjectedStorage,
+        field: &super::checker_flow::IntegerFieldCell, ty: &ScalarType| {
+        if !storage.has_observed_aggregate(&field.cell.declaration) { return None; }
+        if let Some(value) = storage.observed_integer_field(field,ty) {
+            return Some((ObservedExactValue::Integer(ty.clone(),value.into()),1));
+        }
+        let field_id=super::ScalarStructFieldId { structure:field.structure.clone(),index:field.field };
+        observed_passive_array_element(observed_array_backing(&field.cell.declaration)?,&field.cell.indices,ty,Some(&field_id))
     };
     let read_array = |storage: &super::checker_flow::ProjectedStorage,
         cell: &super::checker_flow::observed_f32_array::Cell| {
@@ -2503,12 +2518,13 @@ fn try_observed_projected_storage_call(
         // Do not observe an ambient owner. The real namespace provider has
         // finished initialization and shares this exact storage row.
         if child.0==caller {
-            if !productive_ranges.contains_key(&child) || visits.get(child.0)!=Some(&InitializationVisit::Started) { return None; }
+            if !(productive_ranges.contains_key(&child)||provider_scalars.contains(&child))
+                || visits.get(child.0)!=Some(&InitializationVisit::Started) { return None; }
         } else if !completed_namespace_owner(&actual.project.modules.get(caller)?.source,
             &actual.project.modules.get(child.0)?.source,child.0,Some(visits)) { return None; }
         let allow_failure=authored_units.contains(&child) && history.is_some() && permits_capped_requirement();
         let (value,result,cost,failure)=stateful_provider::run(actual.project,actual.calls,child,args,storage,trace.is_some(),
-            &mut provider_dispatch.borrow_mut(),&productive_ranges,visits,allow_failure,&reached_requirement,&read_array_atom)?;
+            &mut provider_dispatch.borrow_mut(),&productive_ranges,visits,allow_failure,&reached_requirement,&read_array_atom,&read_integer_field)?;
         if let Some(failure)=failure {
             use failure_search::{Admission,PathStep};
             if !allow_failure || failure.target.0!=target.0 { return None; }
@@ -3179,7 +3195,7 @@ fn observed_nested_array_leaf(mut ty: &ScalarType) -> Option<&ScalarType> {
 }
 
 #[cfg(feature = "internal-checker")]
-fn observed_passive_array_element(value: &InitializerValue<'_>, indices: &[u64], expected:&ScalarType)
+fn observed_passive_array_element(value: &InitializerValue<'_>, indices: &[u64], expected:&ScalarType, field:Option<&super::ScalarStructFieldId>)
     -> Option<(ObservedExactValue,usize)> {
     let InitializerValue::PassiveAggregate { mut ty,value,.. } = value else { return None; };
     let mut value = value.as_ref();
@@ -3193,12 +3209,22 @@ fn observed_passive_array_element(value: &InitializerValue<'_>, indices: &[u64],
         value = cells.get(usize::try_from(index).ok()?)?;
         ty = element;
     }
+    if let Some(field) = field {
+        let ScalarType::Struct(declared) = ty else { return None; };
+        if declared != &field.structure { return None; }
+        while let PassiveLiteral::Copy(next) = value { value = next; work = work.checked_add(1)?; }
+        let PassiveLiteral::Nominal(actual,fields) = value else { return None; };
+        if *actual != declared { return None; }
+        value = fields.get(field.index)?;
+        ty = expected;
+        work = work.checked_add(1)?;
+    }
     if ty != expected { return None; }
     while let PassiveLiteral::Copy(next) = value { value = next; work = work.checked_add(1)?; }
     let atom = match (ty,value) {
         (ScalarType::F32,PassiveLiteral::Float(ranked_float::Atom::Single(bits))) =>
             ObservedExactValue::F32(super::checker_flow::projected_f32::ExactF32::checked_bits(*bits)?),
-        (ScalarType::I32|ScalarType::U16,PassiveLiteral::Integer(actual,value)) if *actual == ty =>
+        (ScalarType::I32|ScalarType::U16|ScalarType::U8,PassiveLiteral::Integer(actual,value)) if *actual == ty =>
             ObservedExactValue::Integer(ty.clone(),value.clone()),
         _ => return None,
     };
@@ -20863,6 +20889,110 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 assert_eq!(solver.incoming_entry_requirement(publication),Some(ByteSpan::new(41777,41933)));
             }
             assert!(solver.close_guarded_formals(function("publish_chunk")).is_none());
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn observed_startup_consumes_wide_scalar_return_after_typed_nominal_write() {
+        let app = source("src/main.w","observed-wide-integer-store");
+        let text = r#"%%start
+            struct copy Cell { i32 epoch; u8 material; }
+            Cell blank = {.epoch=0;.material=0;};
+            Cell[2] row = [blank,blank];
+            Cell[2][2] table = [row,row];
+            i32 result = 0;
+            i32(i32,i32,i32,i32) edit=fn(x,z,epoch,material) {
+                u64 ix=core.int_extend<u64>(x);
+                u64 iz=core.int_extend<u64>(z);
+                table[iz][ix].material=core.int_trunc<u8>(material);
+                table[iz][ix].epoch=epoch;
+                if (table[iz][ix].epoch==epoch) { core.int_extend<i32>(table[iz][ix].material) } else { -1 }
+            };
+            unit() launch=fn { result=edit(0,1,9,260); };
+            launch();
+            core.narrow(false,{.stdout="";.stderr="";.code=result;.files=[];});
+        %%end"#;
+        let out_of_bound = text.replace("edit(0,1,9,260)","edit(2,1,9,260)");
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let prepare=|text| prepare_loaded_scalar_ordered_local_proof_contexts(
+                vec![(declarations(&app,text),Vec::new())],[],vec![app.clone()],
+                ScalarPreparationInputs { target_layout },ScalarCheckerScope::MainFlowOnly,Vec::new(),
+            ).unwrap();
+            let report=prepare(text).run().expect("scheduled current-row return");
+            assert_eq!(report.directives.len(),1);
+            assert_eq!(report.directives[0].code(),&BigInt::from(4));
+            assert!(matches!(prepare(&out_of_bound).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned unmodified Pocket Island engine source"]
+    fn pinned_pocket_nominal_edit_keeps_real_result_and_does_not_commit_unknown_suffix() {
+        use crate::scalar::checker_flow::{IntegerFieldCell,ProjectedStorage,observed_f32_array::Cell};
+        let path = std::env::var_os("WOSY_TEST_PINNED_POCKET_ENGINE").unwrap();
+        let text = std::fs::read_to_string(path).unwrap();
+        let source = source("src/engine.w","pinned-pocket-observed-edit");
+        let (x,y,z)=(28i32,5i32,-50i32);
+        let slot=((x*2531011)^(z*1752193)^(y*2654439)^(x>>5)^(z>>2))&2047;
+        let hint=((x*101)^(z*173)^(x>>3)^(z>>1))&255;
+        let coordinate=|slot:i32| vec![(slot/256) as u64,((slot/16)%16) as u64,(slot%16) as u64].into_boxed_slice();
+        let integer=|value:i32| ObservedExactValue::Integer(ScalarType::I32,value.into());
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let owner=prepare_checker_project(vec![(declarations(&source,&text),Vec::new())],vec![source.clone()],
+                ScalarPreparationInputs { target_layout }).unwrap();
+            let (project,calls)=owner.parts();
+            let module=&project.modules[0];
+            let declaration=|wanted| {
+                let binding=module.items.iter().find_map(|item| match item {
+                    ScalarItem::Binding(binding) if binding.name==wanted=>Some(binding), _=>None,
+                }).unwrap();
+                wosy_syntax::SourceSpan::new(source.clone(),binding.receivers[0].span)
+            };
+            let edit=(0,module.items.iter().position(|item|matches!(item,ScalarItem::Function(f) if f.name=="store_exterior_edit")).unwrap());
+            let nominal=module.structs.iter().find(|item|item.name=="TerrainEdit").unwrap();
+            let terrain=declaration("terrain_edits");
+            let hints=declaration("edit_hints");
+            let field=|name,at| IntegerFieldCell { cell:Cell {declaration:terrain.clone(),indices:coordinate(at)},
+                structure:nominal.id.clone(),field:nominal.fields.iter().position(|f|f.name==name).unwrap() };
+            let mut entry=ProjectedStorage::default();
+            entry.observe_aggregate(terrain.clone());
+            entry.observe_aggregate(hints.clone());
+            entry.observe_boolean(declaration("archipelago_hunt"),true);
+            entry.observe_boolean(declaration("target_dirty"),false);
+            entry.observe_boolean(declaration("ground_contact_dirty"),false);
+            for (name,value) in [("edit_epoch",1),("exterior_edits",0),("north_cave_z",-56),("terrain_chunk_x",0),("terrain_chunk_z",0)] {
+                entry.observe_scalar(declaration(name),&ScalarType::I32,&value.into());
+            }
+            let run=|state:&mut ProjectedStorage,material| {
+                stateful_provider::run(project,calls,edit,vec![integer(x),integer(y),integer(z),integer(material)],
+                    state,true,&mut stateful_provider::Dispatch::default(),&HashMap::new(),&[InitializationVisit::Started],
+                    false,&std::cell::Cell::new(false),|_,_,_|None,|state,cell,ty|{
+                        let value=state.observed_integer_field(cell,ty)?;
+                        Some((ObservedExactValue::Integer(ty.clone(),value.into()),1))
+                    })
+            };
+            // Only the current first slot is known. No assumed data in any
+            // other cell and no host result is supplied to the cursor.
+            entry.overwrite_integer_field(field("epoch",slot),ScalarType::I32,0).unwrap();
+            let mut known=entry.clone();
+            known.observe_boolean(declaration("terrain_window_active"),false);
+            let (value,_,work,None)=run(&mut known,260).expect("real edit on the nonvisible cave shelf") else { panic!("unexpected selected failure"); };
+            assert_eq!(value,Some(integer(1)));
+            assert!(work>0);
+            for (name,ty,value) in [("x",ScalarType::I32,x),("y",ScalarType::I32,y),("z",ScalarType::I32,z),
+                    ("epoch",ScalarType::I32,1),("material",ScalarType::U8,4)] {
+                assert_eq!(known.observed_integer_field(&field(name,slot),&ty),Some(value));
+            }
+            assert_eq!(known.observed_i32_array_element(&Cell { declaration:hints,indices:vec![(hint/16) as u64,(hint%16) as u64].into_boxed_slice() }),Some(1));
+            assert_eq!(known.observed_atom(&declaration("exterior_edits")),Some(integer(1)));
+            assert_eq!(known.observed_atom(&declaration("target_dirty")),Some(ObservedExactValue::Boolean(true)));
+            assert_eq!(known.observed_atom(&declaration("ground_contact_dirty")),Some(ObservedExactValue::Boolean(true)));
+            assert!(run(&mut entry,260).is_none(),"missing visibility must not invent a normal return");
+            assert_eq!(entry.observed_integer_field(&field("epoch",slot),&ScalarType::I32),Some(0));
+            assert_eq!(entry.observed_atom(&declaration("exterior_edits")),Some(integer(0)));
+            eprintln!("Pocket edit {target_layout:?}: source slot={slot}, hint={hint}, ordered work={work}");
         }
     }
 

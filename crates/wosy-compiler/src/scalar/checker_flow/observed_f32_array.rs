@@ -46,7 +46,18 @@ pub(super) fn read(calls: &FunctionCallSites, place: Place<'_>, roots: &IntegerR
     Some(value)
 }
 
-pub(in super::super) fn typed_place<'a>(calls: &'a FunctionCallSites, mut cursor: OccurrenceOrdinal, ty: &ScalarType) -> Option<Place<'a>> {
+pub(in super::super) fn typed_place<'a>(calls: &'a FunctionCallSites, cursor: OccurrenceOrdinal, ty: &ScalarType) -> Option<Place<'a>> {
+    typed_index_path(calls,cursor,ty,false)
+}
+
+/// The stateful cursor evaluates each checked index using its ordinary effect
+/// continuation. The simpler float-row reader still needs lexical/literal
+/// selectors because it never dispatches index expression calls.
+pub(in super::super) fn typed_provider_place<'a>(calls: &'a FunctionCallSites, cursor: OccurrenceOrdinal, ty: &ScalarType) -> Option<Place<'a>> {
+    typed_index_path(calls,cursor,ty,true)
+}
+
+fn typed_index_path<'a>(calls: &'a FunctionCallSites, mut cursor: OccurrenceOrdinal, ty: &ScalarType, dispatch_indices:bool) -> Option<Place<'a>> {
     use super::super::reference::NamedPlaceRootIdentity;
     let structure = &calls.structure;
     if structure.checked_types.places.get(&cursor)? != ty { return None; }
@@ -59,7 +70,7 @@ pub(in super::super) fn typed_place<'a>(calls: &'a FunctionCallSites, mut cursor
         let ScalarType::Array { element,length,.. } = structure.checked_types.places.get(&base)? else { return None; };
         if !super::super::scalar_type_equal(element,structure.checked_types.places.get(&cursor)?)
             || structure.checked_types.expressions.get(&index)? != &ScalarType::U64
-            || !(structure.prepared_range_literals.contains_key(&index)
+            || !(dispatch_indices || structure.prepared_range_literals.contains_key(&index)
                 || matches!(calls.prepared_plain_name(index),Some(PlainNameIdentity::Lexical(_))))
         { return None; }
         selectors.push((index,*length));
