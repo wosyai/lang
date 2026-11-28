@@ -33,7 +33,7 @@ impl Place {
             return (&declaration.source==owner).then(|| Self { declaration:declaration.clone(), selectors, ty:ty.clone(),field:Some(field.clone()) });
         }
         let checked=observed_f32_array::typed_provider_place(body,site,ty)?;
-        if !matches!(ty,ScalarType::I32|ScalarType::F32|ScalarType::U16) || &checked.declaration.source!=owner { return None; }
+        if !matches!(ty,ScalarType::I32|ScalarType::F32|ScalarType::U16|ScalarType::U8) || &checked.declaration.source!=owner { return None; }
         Some(Self { declaration:checked.declaration.clone(),selectors:checked.selectors,ty:ty.clone(),field:None })
     }
 
@@ -188,18 +188,18 @@ pub(super) struct SelectedRequirement {
 }
 
 #[derive(Clone,Copy)]
-enum RangeBound { Formal(usize), Literal(i32) }
+enum RangeBound { Formal(usize), Literal(i128) }
 
 #[derive(Clone,Copy)]
-pub(super) struct RangeRank { begin:usize, finish:RangeBound }
+pub(super) struct RangeRank { begin:usize, finish:RangeBound, inclusive:bool }
 
 /// Locate the unique terminal self-edge through prepared Unit branches.
 /// Only an enclosing admitted comparison can authorize the advancing axis.
 pub(super) fn advancing_range_plan(body:&FunctionCallSites,target:PreparedCallable) -> Option<RangeRank> {
     let st=&body.structure;
     let ids=body.boundary.checker_parameter_bindings.as_deref()?;
-    if !body.checker_returns_unit() || ids.len()!=2 || (has_callable_obligations(body) && !supports_requirements(body))
-        || !body.boundary.parameters.iter().all(|p| p.ty==ScalarType::I32) { return None; }
+    if !body.checker_returns_unit() || ids.len()!=body.boundary.parameters.len()
+        || (has_callable_obligations(body) && !supports_requirements(body)) { return None; }
     let mut sites=st.checker_direct_targets.iter().filter_map(|(&site,&child)| (child==target).then_some(site));
     let backedge=sites.next()?;
     if sites.next().is_some() { return None; }
@@ -213,8 +213,10 @@ pub(super) fn advancing_range_plan(body:&FunctionCallSites,target:PreparedCallab
     let (begin,old)= (0..ids.len()).find_map(|slot| {
         let arg=argument(slot)?;
         let (old,BinaryOperator::Add,one)=st.prepared_range_binary.get(&arg)? else { return None; };
-        (formal(*old)==Some(slot) && st.prepared_range_literals.get(one)?==&BigInt::from(1)
-            && st.checked_types.expressions.get(&arg)?==&ScalarType::I32).then_some((slot,*old))
+        let ty=&body.boundary.parameters.get(slot)?.ty;
+        (matches!(ty,ScalarType::I32|ScalarType::U64)
+            && formal(*old)==Some(slot) && st.prepared_range_literals.get(one)?==&BigInt::from(1)
+            && st.checked_types.expressions.get(&arg)?==ty).then_some((slot,*old))
     })?;
     let bound=|mut condition| {
         // A positive conjunction proves its left predicate before any right
@@ -223,19 +225,21 @@ pub(super) fn advancing_range_plan(body:&FunctionCallSites,target:PreparedCallab
             if !cut.evaluate_right_when || cut.bypass { return None; }
             condition=cut.left;
         }
-        let (left,BinaryOperator::Less,right)=st.prepared_range_binary.get(&condition)? else { return None; };
-        if formal(*left)!=formal(old) || st.checked_types.expressions.get(right)?!=&ScalarType::I32 { return None; }
-        if let Some(slot)=formal(*right) {
-            (slot!=begin && formal(argument(slot)?)==Some(slot)).then_some(RangeBound::Formal(slot))
+        let (left,operation,right)=st.prepared_range_binary.get(&condition)?;
+        let inclusive=match operation { BinaryOperator::Less=>false,BinaryOperator::LessEqual=>true,_=>return None };
+        if formal(*left)!=formal(old) || st.checked_types.expressions.get(right)?!=&body.boundary.parameters.get(begin)?.ty { return None; }
+        let finish=if let Some(slot)=formal(*right) {
+            (slot!=begin && formal(argument(slot)?)==Some(slot)).then_some(RangeBound::Formal(slot))?
         } else {
-            Some(RangeBound::Literal(i32::try_from(st.prepared_range_literals.get(right)?).ok()?))
-        }
+            RangeBound::Literal(i128::try_from(st.prepared_range_literals.get(right)?).ok()?)
+        };
+        Some((finish,inclusive))
     };
     let mut pending=vec![(st.root,None)];
     while let Some((block,limit))=pending.pop() {
         let Some(item)=st.blocks.get(block.0)?.items.last() else { continue; };
         let BlockItemKind::Evaluation {expression}=item.kind else { continue; };
-        if expression==backedge { return Some(RangeRank {begin,finish:limit?}); }
+        if expression==backedge { let (finish,inclusive)=limit?; return Some(RangeRank {begin,finish,inclusive}); }
         if st.checked_types.expressions.get(&expression)!=Some(&ScalarType::Unit) { continue; }
         match body.conditionals.get(&expression) {
             Some(ConditionalRegion::Unit {condition,then_block,..})=>
@@ -252,17 +256,27 @@ pub(super) fn advancing_range_plan(body:&FunctionCallSites,target:PreparedCallab
 
 impl RangeRank {
     fn decreases(self, slots:&HashMap<ReferenceBindingId,ExactValue>,ids:&[ReferenceBindingId],args:&[ExactValue]) -> Option<()> {
-        let begin=rank_value(slots.get(ids.get(self.begin)?)?)?;
-        let next=rank_value(args.get(self.begin)?)?;
+        let mathematical=|value:&ExactValue| {
+            let ExactValue::Integer(ty,value)=value else { return None; };
+            match ty {
+                ScalarType::I32=>Some(i128::from(i32::try_from(value).ok()?)),
+                ScalarType::U64=>Some(i128::from(u64::try_from(value).ok()?)),
+                _=>None,
+            }
+        };
+        let begin=mathematical(slots.get(ids.get(self.begin)?)?)?;
+        let next=mathematical(args.get(self.begin)?)?;
         let (finish,next_finish)=match self.finish {
-            RangeBound::Formal(slot)=>(rank_value(slots.get(ids.get(slot)?)?)?,rank_value(args.get(slot)?)?),
+            RangeBound::Formal(slot)=>(mathematical(slots.get(ids.get(slot)?)?)?,mathematical(args.get(slot)?)?),
             RangeBound::Literal(value)=>(value,value),
         };
-        // Compute the true mathematical distance in i64, not a potentially
-        // overflowing difference in the source i32 coordinate type.
-        let distance=i64::from(finish)-i64::from(begin);
-        let successor=i64::from(next_finish)-i64::from(next);
-        (distance>0 && successor==distance-1 && finish==next_finish && begin.checked_add(1)?==next).then_some(())
+        // For either typed axis the enclosing true guard bounds a
+        // mathematical distance; checked source arithmetic already gave
+        // the exact non-wrapping next argument.
+        let adjustment=i128::from(self.inclusive);
+        let distance=finish-begin+adjustment;
+        let successor=next_finish-next+adjustment;
+        (distance>0 && successor==distance-1 && finish==next_finish && begin+1==next).then_some(())
     }
 }
 
@@ -538,6 +552,8 @@ pub(super) fn run<'a>(
                         storage.overwrite_i32_array_element(cell,i32::try_from(&value).ok()?)?,
                     ExactValue::Boolean(value) if cell.indices.is_empty()=>
                         storage.overwrite_scalar(&cell.declaration,&ScalarType::Bool,&BigInt::from(u8::from(value)))?,
+                    ExactValue::Integer(ScalarType::U8,value) if !cell.indices.is_empty()=>
+                        storage.overwrite_u8_array_element(cell,u8::try_from(&value).ok()?)?,
                     ExactValue::Integer(ScalarType::U16,value) if !cell.indices.is_empty()=>
                         storage.overwrite_u16_array_element(cell,u16::try_from(&value).ok()?)?,
                     _=>return None,
@@ -612,6 +628,13 @@ pub(super) fn run<'a>(
                 let signature=body.checked_call_signatures.get(&site)?;
                 let [out]=signature.outputs.outputs.as_slice() else { return None; };
                 if !signature.parameters.iter().cloned().eq(args.iter().map(ExactValue::ty)) { return None; }
+                if body.resolved_call_site(site)?.target==ResolvedCallTarget::Core(super::super::CoreOperationId::SintToFloat) {
+                    let [ExactValue::Integer(ScalarType::I32,value)]=args.as_slice() else { return None; };
+                    if out.ty!=ScalarType::F32 { return None; }
+                    let value=super::super::checker_flow::projected_f32::ExactF32::signed_i32(i32::try_from(value).ok()?);
+                    values.push(ResultValue::Scalar(ExactValue::F32(value)));
+                    continue;
+                }
                 if body.resolved_call_site(site)?.target==ResolvedCallTarget::Core(super::super::CoreOperationId::IntExtend) {
                     let [ExactValue::Integer(input,value)]=args.as_slice() else { return None; };
                     let value=match (input,&out.ty) {
@@ -629,6 +652,7 @@ pub(super) fn run<'a>(
                         (ScalarType::I32,ScalarType::U16)=>BigInt::from(i32::try_from(value).ok()? as u16),
                         (ScalarType::I32,ScalarType::U8)=>BigInt::from(i32::try_from(value).ok()? as u8),
                         (ScalarType::I64,ScalarType::I32)=>BigInt::from(i64::try_from(value).ok()? as i32),
+                        (ScalarType::U64,ScalarType::I32)=>BigInt::from(u64::try_from(value).ok()? as i32),
                         _=>return None,
                     };
                     values.push(ResultValue::Scalar(ExactValue::Integer(out.ty.clone(),value)));

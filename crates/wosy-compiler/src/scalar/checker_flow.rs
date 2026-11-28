@@ -1832,6 +1832,7 @@ pub(super) struct ProjectedStorage {
     f32_array_updates: StorageDelta<observed_f32_array::Cell, projected_f32::ExactF32>,
     i32_array_updates: StorageDelta<observed_f32_array::Cell, i32>,
     u16_array_updates: StorageDelta<observed_f32_array::Cell, u16>,
+    u8_array_updates: StorageDelta<observed_f32_array::Cell, u8>,
 }
 
 #[cfg(feature = "internal-checker")]
@@ -1876,6 +1877,16 @@ impl ProjectedStorage {
                 *scalar = value;
             }
         }
+        Some(())
+    }
+
+    pub(super) fn observed_u8_array_element(&self, cell:&observed_f32_array::Cell) -> Option<u8> {
+        self.u8_array_updates.get(cell).copied()
+    }
+
+    pub(super) fn overwrite_u8_array_element(&mut self, cell:observed_f32_array::Cell, value:u8) -> Option<()> {
+        if !self.has_observed_aggregate(&cell.declaration) { return None; }
+        self.u8_array_updates.insert(cell,value);
         Some(())
     }
 

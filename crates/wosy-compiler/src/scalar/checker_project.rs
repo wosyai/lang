@@ -2420,6 +2420,7 @@ fn try_observed_projected_storage_call(
         let overlay = match ty {
             ScalarType::F32 => storage.observed_f32_array_element(cell).map(ObservedExactValue::F32),
             ScalarType::I32 => storage.observed_i32_array_element(cell).map(|n| ObservedExactValue::Integer(ScalarType::I32,n.into())),
+            ScalarType::U8 => storage.observed_u8_array_element(cell).map(|n| ObservedExactValue::Integer(ScalarType::U8,n.into())),
             ScalarType::U16 => storage.observed_u16_array_element(cell).map(|n| ObservedExactValue::Integer(ScalarType::U16,n.into())),
             _ => return None,
         };
@@ -3191,7 +3192,7 @@ fn observed_nominal_f32_field(value: &InitializerValue<'_>, index: Option<u64>,
 fn observed_nested_array_leaf(mut ty: &ScalarType) -> Option<&ScalarType> {
     if !matches!(ty,ScalarType::Array { .. }) { return None; }
     while let ScalarType::Array { element,.. } = ty { ty = element; }
-    matches!(ty,ScalarType::I32 | ScalarType::F32 | ScalarType::U16).then_some(ty)
+    matches!(ty,ScalarType::I32 | ScalarType::F32 | ScalarType::U16 | ScalarType::U8).then_some(ty)
 }
 
 #[cfg(feature = "internal-checker")]
@@ -21122,6 +21123,99 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
             assert!(run(&mut visible,4).is_none());
             assert_eq!(visible,old_visible);
             eprintln!("Pocket seeded cache {target_layout:?}: miss {miss_work}, hit {hit_work}, height 8, visible unresolved");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned unmodified Pocket Island engine source"]
+    fn pinned_pocket_halo_fill_and_empty_mesh_use_actual_ranked_u8_rows() {
+        use crate::scalar::checker_flow::{ProjectedStorage,observed_f32_array::Cell};
+        use ordered_float_prefix::ObservedStep;
+        let text=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_POCKET_ENGINE").unwrap()).unwrap();
+        let source=source("src/engine.w","pinned-pocket-rank-halo");
+        let integer=|value:i32| ObservedExactValue::Integer(ScalarType::I32,value.into());
+        let index=|value:u64| ObservedExactValue::Integer(ScalarType::U64,value.into());
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let owner=prepare_checker_project(vec![(declarations(&source,&text),Vec::new())],vec![source.clone()],
+                ScalarPreparationInputs { target_layout }).unwrap();
+            let (project,calls)=owner.parts();
+            let module=&project.modules[0];
+            let function=|name:&str| (0,module.items.iter().position(|item|
+                matches!(item,ScalarItem::Function(f) if f.name==name)).unwrap());
+            let declaration=|wanted| {
+                let binding=module.items.iter().find_map(|item| match item {
+                    ScalarItem::Binding(binding) if binding.name==wanted=>Some(binding), _=>None,
+                }).unwrap();
+                wosy_syntax::SourceSpan::new(source.clone(),binding.name_span)
+            };
+            let halo=declaration("mesh_halo");
+            let cell=|y,z,x| Cell { declaration:halo.clone(),indices:vec![y,z,x].into_boxed_slice() };
+            let run=|target,args,state:&mut ProjectedStorage| {
+                stateful_provider::run(project,calls,target,args,state,true,&mut stateful_provider::Dispatch::default(),
+                    &HashMap::new(),&[InitializationVisit::Started],false,&std::cell::Cell::new(false),
+                    |state,cell,ty| {
+                        if *ty!=ScalarType::U8 { return None; }
+                        Some((ObservedExactValue::Integer(ScalarType::U8,state.observed_u8_array_element(cell)?.into()),1))
+                    },|_,_,_|None)
+            };
+            let fill=function("fill_halo_procedural");
+            let mut column=ProjectedStorage::default();
+            column.observe_aggregate(halo.clone());
+            column.overwrite_u8_array_element(cell(0,5,5),99).unwrap();
+            let (_,Some(fill_trace),fill_work,None)=run(fill,vec![index(6),index(5),index(0),integer(4),integer(0)],&mut column)
+                .expect("original halo column fill") else { panic!("missing fill history"); };
+            for y in 0..16 {
+                assert_eq!(column.observed_u8_array_element(&cell(y,5,6)),Some(if y<4 { 3 } else if y==4 { 4 } else { 0 }));
+            }
+            assert_eq!(column.observed_u8_array_element(&cell(0,5,5)),Some(99));
+            let before=column.clone();
+            assert!(run(fill,vec![index(15),index(5),index(0),integer(4),integer(0)],&mut column).is_none());
+            assert_eq!(column,before);
+            assert!(fill_trace.root.iter().chain(fill_trace.segments.iter().flatten()).any(|step|
+                matches!(step,ObservedStep::Branch { accepted:false,.. })));
+            let mut empty=ProjectedStorage::default();
+            empty.observe_aggregate(halo.clone());
+            for y in 0..16 { for z in 1..=12 { for x in 1..=12 {
+                empty.overwrite_u8_array_element(cell(y,z,x),0).unwrap();
+            } } }
+            let old=empty.clone();
+            let (None,Some(mesh_trace),mesh_work,None)=run(function("mesh_cells"),vec![integer(0),integer(108),integer(36)],&mut empty)
+                .expect("original empty typed halo mesh") else { panic!("missing mesh history"); };
+            assert_eq!(empty,old);
+            let face=function("face");
+            let row=function("mesh_row");
+            let row_body=calls.function_body(row.0,row.1,None).unwrap();
+            let face_sites=row_body.structure.checker_direct_targets.iter().filter(|(_,target)| **target==face)
+                .map(|(at,_)|row_body.occurrences[at.0].span).collect::<HashSet<_>>();
+            assert_eq!(face_sites.len(),6);
+            assert!(mesh_trace.root.iter().chain(mesh_trace.segments.iter().flatten()).all(|step|
+                !matches!(step,ObservedStep::Call {site,..} if face_sites.contains(&site.range))));
+            assert!(mesh_work>fill_work);
+            let vertices=declaration("vertices");
+            let written=declaration("write_position");
+            empty.observe_scalar(written.clone(),&ScalarType::I32,&BigInt::from(0));
+            empty.observe_aggregate(vertices.clone());
+            empty.overwrite_u8_array_element(cell(0,1,1),3).unwrap();
+            empty.overwrite_u8_array_element(cell(0,1,0),0).unwrap();
+            empty.overwrite_u8_array_element(cell(0,0,1),0).unwrap();
+            let (None,Some(real_faces),occupied_work,None)=run(function("mesh_cells"),vec![integer(0),integer(108),integer(36)],&mut empty)
+                .expect("original bottom cell emits faces before the host") else { panic!("missing occupied mesh history"); };
+            assert_eq!(empty.observed_atom(&written),Some(integer(36)));
+            let face_count=real_faces.root.iter().chain(real_faces.segments.iter().flatten())
+                .filter(|step| matches!(step,ObservedStep::Call {site,..} if face_sites.contains(&site.range))).count();
+            assert_eq!(face_count,6);
+            let vertex=|at:usize,component| Cell { declaration:vertices.clone(),indices:
+                vec![0,0,(at/24) as u64,(at%24) as u64,component].into_boxed_slice() };
+            for (component,expected) in [108.0f32,0.0,36.0,0.37890625,0.03125,0.79].into_iter().enumerate() {
+                assert_eq!(empty.observed_f32_array_element(&vertex(0,component as u64)).map(|v|v.0),Some(expected.to_bits()));
+            }
+            for at in 0..36 { for component in 0..6 {
+                assert!(empty.observed_f32_array_element(&vertex(at,component)).is_some());
+            } }
+            assert!(empty.observed_f32_array_element(&vertex(36,0)).is_none());
+            assert!(occupied_work>mesh_work);
+            eprintln!("Pocket real halo {target_layout:?}: 16 writes; empty 2304 mesh cells; occupied 6 faces/36 vertices; ordered work {fill_work}/{mesh_work}/{occupied_work}");
         }
     }
 
