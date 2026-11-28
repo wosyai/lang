@@ -2194,6 +2194,7 @@ fn walk_package_initialization<'a, const COLLECT: bool, const PRIVATE_NESTED_SCA
 
 #[cfg(all(test, feature = "internal-checker"))]
 thread_local! {
+    static AUTHORED_ROLLBACK_ORACLE: RefCell<Option<Vec<bool>>> = const { RefCell::new(None) };
     static OBSERVED_MATH_HITS: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
     static OBSERVED_MATH_MISSES: std::cell::Cell<usize> = const { std::cell::Cell::new(0) };
 }
@@ -2306,6 +2307,7 @@ fn try_observed_projected_storage_call(
     let mut local_float_units = HashSet::new();
     let mut productive_ranges = HashMap::new();
     let mut authored_units=HashSet::new();
+    let mut staged_authored_units=HashSet::new();
     let mut getters = HashMap::new();
     let mut frontiers = HashMap::new();
     let admit_getter = |node: PreparedCallable, body: &FunctionCallSites, site, child: PreparedCallable, signature: &CheckedCallSignature| {
@@ -2324,6 +2326,20 @@ fn try_observed_projected_storage_call(
                 if node!=target && node.0==target.0 && trace.as_ref().is_some_and(|s| {let s=s.borrow(); s.proof_free_scalar_initializers && !s.proof_only_continuation()}) && stateful_provider::supports_requirements(body) {
                     let Some(rank)=stateful_provider::advancing_range_plan(body,node) else { return Ok(false); };
                     productive_ranges.insert(node,rank);
+                    authored_units.insert(node);
+                    provider_units.insert(node);
+                    writes_or_reads_storage=true;
+                    visiting.remove(&node);
+                    complete.insert(node);
+                    continue;
+                }
+                if node!=target && node.0==target.0
+                    && trace.as_ref().is_some_and(|s| {let s=s.borrow(); s.proof_free_scalar_initializers && !s.proof_only_continuation()})
+                    && root_body.structure.checker_direct_targets.values().any(|child| *child==node)
+                    && (stateful_provider::has_nested_observed_authored_call(actual.project,actual.calls,node)
+                        || (stateful_provider::supports_module_state_requirements(body)
+                            && body.boundary.parameters.iter().all(|p|matches!(p.ty,ScalarType::I32|ScalarType::F32)))) {
+                    staged_authored_units.insert(node);
                     authored_units.insert(node);
                     provider_units.insert(node);
                     writes_or_reads_storage=true;
@@ -2555,18 +2571,29 @@ fn try_observed_projected_storage_call(
         // Do not observe an ambient owner. The real namespace provider has
         // finished initialization and shares this exact storage row.
         if child.0==caller {
-            if !(productive_ranges.contains_key(&child)||provider_scalars.contains(&child)||local_float_units.contains(&child))
+            if !(productive_ranges.contains_key(&child)||provider_scalars.contains(&child)||local_float_units.contains(&child)||staged_authored_units.contains(&child))
                 || visits.get(child.0)!=Some(&InitializationVisit::Started) { return None; }
         } else if !completed_namespace_owner(&actual.project.modules.get(caller)?.source,
             &actual.project.modules.get(child.0)?.source,child.0,Some(visits)) { return None; }
         let allow_failure=authored_units.contains(&child) && history.is_some() && permits_capped_requirement();
         // Keep the current activation separate from prior calls on this
         // history: a guard may return before the first authored requirement.
+        #[cfg(test)]
+        let sampled=AUTHORED_ROLLBACK_ORACLE.with(|entries|
+            entries.borrow().is_some().then(|| storage.clone()));
         let call_reached=std::cell::Cell::new(false);
         let outcome=stateful_provider::run(actual.project,actual.calls,child,args,storage,trace.is_some(),
             &mut provider_dispatch.borrow_mut(),&productive_ranges,visits,allow_failure,&call_reached,&read_array_atom,&read_integer_field);
         if call_reached.get() { reached_requirement.set(true); }
-        if let Some(stop) = provider_dispatch.borrow_mut().take_stop() {
+        let stop=provider_dispatch.borrow_mut().take_stop();
+        #[cfg(test)]
+        if let Some(sampled)=sampled {
+            if stop.is_some() || outcome.as_ref().is_some_and(|(_,_,_,failure)| failure.is_some()) {
+                AUTHORED_ROLLBACK_ORACLE.with(|entries|
+                    entries.borrow_mut().as_mut().unwrap().push(sampled==*storage));
+            }
+        }
+        if let Some(stop) = stop {
             // Do not turn an authored pre-host prefix into a completed call,
             // even if its last requirement was proved. Nothing crosses the
             // external boundary without a sound effect/continuation model.
@@ -2592,7 +2619,8 @@ fn try_observed_projected_storage_call(
             if result.as_ref().is_some_and(|trace|trace.verified_requirements.is_some()) {
                 has_verified_returns.set(true);
             }
-            if call_reached.get() && authored_units.contains(&child) && !permits_capped_requirement() {
+            if call_reached.get() && authored_units.contains(&child)
+                && (staged_authored_units.contains(&child) || !permits_capped_requirement()) {
                 // This extends only the private pre-stop path, not admission
                 // to normal whole-root exhaustion or final storage writeback.
                 result.as_ref()?.verified_requirements.as_ref()?;
@@ -2604,6 +2632,9 @@ fn try_observed_projected_storage_call(
             use failure_search::{Admission,PathStep};
             if !allow_failure || failure.target.0!=target.0 { return None; }
             let body=body_of(failure.target)?;
+            if staged_authored_units.contains(&child) && !stateful_provider::supports_staged_requirements(body) {
+                return None;
+            }
             let directive=body.structure.checker_directives.get(&failure.site)?;
             let at=body.occurrences.get(failure.site.0)?.span;
             let mut search=trace.as_ref()?.borrow_mut();
@@ -26364,6 +26395,338 @@ unit(u8) parent = fn(a) {
             assert_eq!(all.directives,capped);
             for site in [&next_mask,&pad_call,&next_pad,&zero_vertex] { assert!(trace.contains_return(site),"{site:?}"); }
             eprintln!("Orbital original pack_prepared/pad {target_layout:?}: mask5 selects 0 and 2 only, 7 sparse index writes; pad retains end and subsequent duplicate allocates 47");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires the original Orbital source graph and Wasm manifest"]
+    fn pinned_orbital_authenticates_declared_rotation_wrappers_not_package_closure() {
+        let dir=std::path::PathBuf::from(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_SOURCES").unwrap());
+        let manifest=std::fs::read_to_string(dir.parent().unwrap().join("wosy.toml")).unwrap();
+        let exports=manifest.split("[targets.app.artifacts.main.profiles.dev.exports]").nth(1).unwrap()
+            .lines().take_while(|line|!line.trim_start().starts_with('['))
+            .filter_map(|line|line.split_once('='))
+            .map(|(name,target)|(name.trim().to_owned(),target.trim().trim_matches('"').to_owned()))
+            .collect::<std::collections::BTreeMap<_,_>>();
+        let mut files=std::fs::read_dir(&dir).unwrap().map(|entry|entry.unwrap().path())
+            .filter(|path|path.extension().is_some_and(|ext|ext=="w")).collect::<Vec<_>>();
+        files.sort_unstable_by_key(|path|(path.file_name().unwrap()!="engine.w",path.clone()));
+        let all=files.into_iter().map(|path| {
+            let file=path.file_name().unwrap().to_str().unwrap().to_owned();
+            let text=std::fs::read_to_string(path).unwrap();
+            let id=SourceIdentity::new("pinned-orbital".into(),"orbital".into(),format!("src/{file}"),
+                format!("original-source-{file}"));
+            (file,id,text)
+        }).collect::<Vec<_>>();
+        let mut modules=Vec::with_capacity(all.len());
+        for (_,source,text) in &all {
+            let mut links=Vec::new();
+            let mut offset=0;
+            for line in text.split_inclusive('\n') {
+                if let Some((binding,target))=line.trim().split_once(" = namespace orbital \"") {
+                    let path=target.strip_suffix("\";").unwrap();
+                    let (_,owner,_)=all.iter().find(|(file,_,_)|file==path).unwrap();
+                    links.push(ScalarNamespaceBinding { binding:binding.into(),target:owner.clone(),
+                        span:ByteSpan::new(offset as u32,(offset+line.trim_end().len()) as u32) });
+                }
+                offset+=line.len();
+            }
+            modules.push((declarations(source,text),links));
+        }
+        let startup=all.iter().map(|(_,source,_)|source.clone()).collect::<Vec<_>>();
+        let source=startup[0].clone();
+        let configured=prepare_loaded_scalar_ordered_local_proof_contexts(modules,[],startup,
+            ScalarPreparationInputs {target_layout:ScalarTargetLayout::WASM32},
+            ScalarCheckerScope::CurrentPackage,Vec::new()).unwrap().with_selected_wasm_entries(&source,&exports).unwrap();
+        let PreparedConfiguredCheck::Plain { owner, .. }=&configured.owner else { panic!("pinned ordinary root"); };
+        let (project,calls)=owner.parts();
+        let module=project.modules.iter().position(|entry|entry.source==source).unwrap();
+        let entry=|name:&str| (module,project.modules[module].items.iter().position(|item|
+            matches!(item,ScalarItem::Function(f) if f.name==name)).unwrap());
+        assert!(owner.independent_entries().contains(&entry("tick")));
+        assert!(owner.independent_entries().contains(&entry("input_advance")));
+        assert!(owner.independent_entries().contains(&entry("reset")));
+        for name in ["publish_actuators","upload_actuators","advance_fixed"] {
+            assert!(!owner.independent_entries().contains(&entry(name)));
+        }
+        // Ingress exists, but no known calling row covers the whole package.
+        // The same actual callee still refuses an independent finite history
+        // before a provider transaction/host evaluation is attempted.
+        let mut known=HashSet::new();
+        let mut work=0;
+        assert!(plan_finite_projected_history(project,calls,entry("upload_actuators"),&mut known,&mut work).is_none());
+        assert!(matches!(configured.into_startup_authored_owner(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires pinned original Orbital tick source and selected export manifest"]
+    fn pinned_orbital_cargo_rotation_checks_real_bounded_state_without_crossing_publication() {
+        use super::super::checker_flow::{ProjectedStorage, projected_f32::ExactF32};
+        use super::stateful_provider::take_requirement_results;
+        use wosy_syntax::SourceSpan;
+        let dir=std::path::PathBuf::from(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_SOURCES").unwrap());
+        let engine=std::fs::read_to_string(dir.join("engine.w")).unwrap();
+        let manifest=std::fs::read_to_string(dir.parent().unwrap().join("wosy.toml")).unwrap();
+        let entries=manifest.split("[targets.app.artifacts.main.profiles.dev.exports]").nth(1).unwrap();
+        assert!(entries.lines().take_while(|line|!line.trim_start().starts_with('['))
+            .any(|line|line.trim()==r#"tick = "tick""#));
+        let tick=engine.find("unit(f32,i32,f32,f32) tick = fn(dt,keys,look_x,look_y)").unwrap();
+        let section=&engine[tick..];
+        let interaction=section.find("if(mode==2){
+            if(deck==1 && station_leg==2){").unwrap();
+        let start=&section[interaction..];
+        let transfer=&start[..start.find("}else{if(first_exterior_rail()&&!push)").unwrap()];
+        let phase=section.find("if(seat_clock>0.0){
+        seat_clock=seat_clock+d;").unwrap();
+        let phase=&section[phase..];
+        let before_publish=&phase[..phase.find("mesh_grip=-1.0;publish_actuators(CARGO_GEOMETRY|ROBOT_GEOMETRY|CONSOLE_GEOMETRY)").unwrap()];
+        // Two independent entered regions of the pinned tick. Never feed
+        // the first prefix through the opaque publication into the second.
+        let fixture=format!(r#"%%start
+            i32 mode=2; i32 deck=1; i32 station_leg=2; i32 alignment_stage=3;
+            bool cargo_locked=true; i32 lock_kind=0; i32 seat_pose=6;
+            i32 mark=9; i32 transfer_pose=4;
+            f32 seat_clock=0.0; f32 transfer_clock=0.0; f32 lock_clock=0.0;
+            f32 vx=0.125; f32 vy=0.25; f32 vz=0.5;
+            unit() transfer=fn{{{transfer}}};}};}};
+            unit(f32) advance_seat_prefix=fn(d){{{before_publish}}};}};}};
+        %%end"#);
+        let app=source("src/main.w","pinned-orbital-bounded-cargo-rotation");
+        let span=|text:&str| {
+            let a=text.find("core.require(cargo_locked&&seat_pose==6").unwrap();
+            let b=a+text[a..].find(");").unwrap()+1;
+            SourceSpan::new(app.clone(),ByteSpan::new(a as u32,b as u32))
+        };
+        let integer=|n:i32| ObservedExactValue::Integer(ScalarType::I32,n.into());
+        let float=|n:f32| ObservedExactValue::F32(ExactF32(n.to_bits()));
+        for layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let prepared=prepare_checker_project(vec![(declarations(&app,&fixture),Vec::new())],vec![app.clone()],
+                ScalarPreparationInputs {target_layout:layout}).unwrap();
+            let (project,calls)=prepared.parts();
+            let root=&project.modules[0];
+            let decl=|name:&str| root.items.iter().find_map(|item|match item {
+                ScalarItem::Binding(b) if b.name==name=>Some(SourceSpan::new(app.clone(),b.name_span)),
+                _=>None,
+            }).unwrap();
+            let fun=|name:&str| (0,root.items.iter().position(|item|
+                matches!(item,ScalarItem::Function(f) if f.name==name)).unwrap());
+            let row=|pose:Option<i32>,locked:Option<bool>,clock:f32,stage:i32| {
+                let mut out=ProjectedStorage::default();
+                for (name,n) in [("mode",2),("deck",1),("station_leg",2),("alignment_stage",stage),
+                    ("lock_kind",0),("mark",9),("transfer_pose",4)] {
+                    out.observe_scalar(decl(name),&ScalarType::I32,&n.into());
+                }
+                if let Some(n)=pose { out.observe_scalar(decl("seat_pose"),&ScalarType::I32,&n.into()); }
+                if let Some(n)=locked { out.observe_boolean(decl("cargo_locked"),n); }
+                for (name,n) in [("seat_clock",clock),("transfer_clock",0.0),("lock_clock",0.0),
+                    ("vx",0.125),("vy",0.25),("vz",0.5)] {
+                    out.observe_f32(decl(name),n.to_bits());
+                }
+                out
+            };
+            let project_call=|name:&str,args,state:&mut ProjectedStorage| {
+                let mut dispatch=stateful_provider::Dispatch::default();
+                let outcome=stateful_provider::run(project,calls,fun(name),args,state,true,&mut dispatch,&HashMap::new(),
+                    &[InitializationVisit::Started],false,&std::cell::Cell::new(false),|_,_,_|None,|_,_,_|None);
+                (outcome,dispatch.take_stop())
+            };
+            for (delta,reached) in [(0.001f32,false),(0.02,true)] {
+                let mut state=row(Some(5),Some(true),0.47,2);
+                assert!(project_call("advance_seat_prefix",vec![float(delta)],&mut state).0.is_some());
+                assert_eq!(state.observed_atom(&decl("seat_pose")),Some(integer(if reached {6}else{5})));
+                assert_eq!(state.observed_atom(&decl("alignment_stage")),Some(integer(if reached {3}else{2})));
+                assert_eq!(state.observed_atom(&decl("seat_clock")),Some(float(if reached {0.0}else{0.47+delta})));
+                assert_eq!(state.observed_atom(&decl("transfer_clock")),Some(float(0.0)));
+                assert_eq!(state.observed_atom(&decl("transfer_pose")),Some(integer(4)));
+            }
+            let mut unknown=row(None,Some(true),0.47,2);
+            let baseline=unknown.clone();
+            assert!(project_call("advance_seat_prefix",vec![float(0.02)],&mut unknown).0.is_none());
+            assert_eq!(unknown,baseline,"tentative clock increment must be rolled back on unknown pose");
+
+            take_requirement_results();
+            let mut accepted=row(Some(6),Some(true),0.0,3);
+            let expected=accepted.clone();
+            let (_,history,_,_)=project_call("transfer",Vec::new(),&mut accepted).0.unwrap();
+            assert_eq!(take_requirement_results(),[(span(&fixture),true)]);
+            assert_eq!(history.unwrap().verified_requirements.unwrap().spans().collect::<Vec<_>>(),[span(&fixture)]);
+            assert_eq!(accepted.observed_atom(&decl("transfer_clock")),Some(float(0.001)));
+            for name in ["seat_clock","seat_pose","alignment_stage","transfer_pose","cargo_locked","lock_clock","mark","vx","vy","vz"] {
+                assert_eq!(accepted.observed_atom(&decl(name)),expected.observed_atom(&decl(name)));
+            }
+            let mut blocked=row(Some(5),Some(true),0.0,3);
+            let baseline=blocked.clone();
+            let (blocked_outcome,stop)=project_call("transfer",Vec::new(),&mut blocked);
+            assert!(blocked_outcome.is_none());
+            assert!(matches!(stop,Some(stateful_provider::ProviderStop::RefutedRow {directive,..}) if directive==span(&fixture)));
+            assert_eq!(take_requirement_results(),[(span(&fixture),false)]);
+            assert_eq!(blocked,baseline);
+            for (pose,locked) in [(None,Some(true)),(Some(6),None)] {
+                let mut uncertain=row(pose,locked,0.0,3);
+                let baseline=uncertain.clone();
+                let (outcome,stop)=project_call("transfer",Vec::new(),&mut uncertain);
+                assert!(outcome.is_none());
+                assert!(stop.is_none());
+                assert_eq!(uncertain,baseline);
+                assert!(take_requirement_results().is_empty());
+            }
+            let mut not_locked=row(Some(5),Some(false),0.0,3);
+            assert!(project_call("transfer",Vec::new(),&mut not_locked).0.is_some());
+            assert!(take_requirement_results().is_empty());
+            assert_eq!(not_locked.observed_atom(&decl("lock_kind")),Some(integer(1)));
+            assert_eq!(not_locked.observed_atom(&decl("transfer_clock")),Some(float(0.0)));
+
+            for pose in [5,6] {
+                let input=fixture.strip_suffix("%%end").unwrap().replace("i32 seat_pose=6",&format!("i32 seat_pose={pose}"))
+                    +"unit() launch=fn{transfer();};launch();%%end";
+                let configured=prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations(&app,&input),Vec::new())],Vec::new(),vec![app.clone()],
+                    ScalarPreparationInputs {target_layout:layout},ScalarCheckerScope::MainFlowOnly,Vec::new(),
+                ).unwrap();
+                let cap=std::num::NonZeroUsize::MIN;
+                if pose==5 {
+                    let (selected,completion,_,_)=configured.search_startup_authored_path(cap).unwrap();
+                    assert_eq!(completion,StartupAuthoredCompletion::LimitReached);
+                    let [failure]=selected.as_slice() else {panic!("one exact cargo transfer requirement");};
+                    assert_eq!(failure.directive,span(&input).range);
+                    assert_eq!(failure.code(),&BigInt::from(74));
+                } else {
+                    assert!(matches!(configured.search_startup_authored_path(cap),Err(ProjectCheck::Unsupported)),
+                        "proof of the known entered row is not authority to complete the ordinary root");
+                }
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires original Orbital engine, indexed packer and material provider"]
+    fn pinned_orbital_measured_publication_stops_only_at_authored_false_or_real_host() {
+        use super::stateful_provider::{ForeignOperand,ProviderStop,take_requirement_results};
+        use super::super::checker_flow::take_observed_u16_writes as take_writes;
+        use wosy_syntax::SourceSpan;
+        let dir=std::path::PathBuf::from(std::env::var_os("WOSY_TEST_PINNED_ORBITAL_SOURCES").unwrap());
+        let engine=std::fs::read_to_string(dir.join("engine.w")).unwrap();
+        let packing=std::fs::read_to_string(dir.join("indexed-pack.w")).unwrap();
+        let material=std::fs::read_to_string(dir.join("station-material.w")).unwrap();
+        let fragment=|begin:&str,end:&str| {
+            let start=engine.find(begin).unwrap();
+            &engine[start..start+engine[start..].find(end).unwrap()]
+        };
+        let mesh=fragment("f32[8] vertex =", "f32[38] state =");
+        let paint_and_box=fragment("f32 r =", "unit(i32) rib =");
+        let round_and_sweep=fragment("f32(f32) wave =", "unit(f32,f32,f32,f32,f32,f32,i32) lower_rail_tube");
+        let lock_blend=fragment("f32() lock_blend =", "f32() cargo_lock_y =");
+        let lock_y=fragment("f32() hatch_lock_y =", "f32(i32) transfer_ease =");
+        let bolts_and_locator=fragment("unit(i32) airlock_bolts =", "unit() airlock_pressure_face=");
+        let airlock=fragment("unit() airlock = fn", "f32(f32,f32,f32) lamp_field");
+        // Only the id=0 emitter arm is retained. The actual fallback branch
+        // of publish remains, with an opaque tripwire instead of the
+        // separate full-room build. A selected fallback cannot pass this gate.
+        let emit=fragment("unit(i32) emit_actuator=fn", "    if(id==1){suspended_cargo();};");
+        let measure=fragment("unit(i32) measure_actuator=fn", "i32 HATCH_GEOMETRY=");
+        let range=fragment("unit(i32,i32) index_range=", "unit(i32,i32) static_partition=");
+        let moving=fragment("unit(i32) moving_partition=", "i32(i32,i32) pack_moving=");
+        let pack_prepared=fragment("unit(i32,i32) pack_prepared=", "f32 r =");
+        let publish=fragment("bool(i32,i32) prepare_actuators=", "f32 pilot_x=");
+        let packed=source("src/indexed-pack.w","pinned-measured-indexed-pack");
+        let decorated=source("src/station-material.w","pinned-measured-station-material");
+        let packing_ns=r#"packing=namespace demo "indexed-pack.w";"#;
+        let decorated_ns=r#"material_scene=namespace demo "station-material.w";"#;
+        for layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            for (offset,good) in [(4098,true),(4097,false)] {
+                let a=source("src/main.w",&format!("pinned-measured-publication-{offset}"));
+                let text=format!(r#"%%start
+                    {packing_ns}{decorated_ns}
+                    fallback_probe=extern wasm "test_only" {{ unsafe unit() tripwire; }};
+                    unit() eva_room=fn{{unsafe {{fallback_probe.tripwire();}};}};
+                    i32 count={offset}; i32 alignment_stage=4; i32 lock_kind=2; i32 lock_pose=2;
+                    i32[5] motion_first=[0,0,0,0,0]; i32[5] motion_size=[0,0,0,0,0];
+                    i32[5] motion_base=[37,0,0,0,0]; i32[5] motion_unique=[0,0,0,0,0];
+                    i32 room_partial=0;
+                    {mesh}{paint_and_box}{round_and_sweep}{lock_blend}{lock_y}{bolts_and_locator}
+                    {airlock}{emit}}};{measure}{range}{moving}{pack_prepared}{publish}
+                    unit() launch=fn{{measure_actuator(0);publish_actuators(1);}};
+                    launch();
+                %%end"#);
+                let select=|needle:&str| {
+                    let start=text.find(needle).unwrap();
+                    SourceSpan::new(a.clone(),ByteSpan::new(start as u32,(start+needle.len()) as u32))
+                };
+                let measure_site=select("measure_actuator(0)");
+                let publish_site=select("publish_actuators(1)");
+                let upload_site=select("upload_actuators(mask,0)");
+                let start=text.find("core.require(motion_base").unwrap();
+                let end=start+text[start..].find(");").unwrap()+1;
+                let authored=SourceSpan::new(a.clone(),ByteSpan::new(start as u32,end as u32));
+                let prepare_with=|packing_text:&str| prepare_loaded_scalar_ordered_local_proof_contexts(
+                    vec![(declarations(&a,&text),vec![
+                        ScalarNamespaceBinding {binding:"packing".into(),target:packed.clone(),span:select(packing_ns).range},
+                        ScalarNamespaceBinding {binding:"material_scene".into(),target:decorated.clone(),span:select(decorated_ns).range},
+                    ]),(declarations(&packed,packing_text),Vec::new()),(declarations(&decorated,&material),Vec::new())],
+                    [],vec![a.clone(),packed.clone(),decorated.clone()],
+                    ScalarPreparationInputs {target_layout:layout},ScalarCheckerScope::MainFlowOnly,Vec::new(),
+                ).unwrap();
+                let prepare=||prepare_with(&packing);
+                take_requirement_results(); take_writes();
+                AUTHORED_ROLLBACK_ORACLE.with(|audit| *audit.borrow_mut()=Some(Vec::new()));
+                let outcome=prepare().search_startup_authored_path(std::num::NonZeroUsize::MIN);
+                let rollback=AUTHORED_ROLLBACK_ORACLE.with(|audit| audit.borrow_mut().take().unwrap());
+                assert_eq!(take_requirement_results(),[(authored.clone(),good)]);
+                assert_eq!(rollback,[true],"no tentative publication state survives abort");
+                let writes=take_writes();
+                assert_eq!(writes.len(),2556,"one index for each actually measured vertex");
+                assert!(writes.iter().all(|(cell,_)| cell.declaration.source==packed));
+                let distinct=writes.iter().map(|(_,value)| *value).collect::<HashSet<_>>();
+                assert!(!distinct.is_empty());
+                if good {
+                    let Err(ProjectCheck::ProviderStopped(stop,_))=outcome else { panic!("positive authored route must stop at the original host") };
+                    let ProviderStop::External(pending)=*stop else { panic!("known positive predicate cannot be refuted"); };
+                    assert_eq!(pending.call.source,packed);
+                    assert_eq!(&packing[pending.declaration.range.start as usize..pending.declaration.range.end as usize],"indexed");
+                    assert_eq!(pending.verified_prefix.spans().collect::<Vec<_>>(),[authored.clone()]);
+                    assert!(pending.invocation.contains(&upload_site));
+                    let [ForeignOperand::ArrayAddress(vertices),ForeignOperand::Integer(_,nf),ForeignOperand::ArrayAddress(indices),
+                        ForeignOperand::Integer(_,ni),ForeignOperand::Integer(_,kind),ForeignOperand::Integer(_,fv),
+                        ForeignOperand::Integer(_,fi)]=pending.operand_prefix.as_slice()
+                        else { panic!("all seven pre-host operands should be known"); };
+                    assert_eq!(&*vertices.indices,&[0,0,2,5,0]);
+                    assert_eq!(&*indices.indices,&[1,0,0,2]);
+                    assert_eq!([nf,ni,kind,fv,fi].map(|n|i32::try_from(n).unwrap()),[distinct.len() as i32*8,2556,2,37,4098]);
+                    // In this independent control only, a closed provider
+                    // returns normally. A pre-host receipt must not finish
+                    // the extended ordinary root or commit its storage.
+                    let before_transmit=packing.find("unit(i32,i32,i32,i32,i32) transmit=").unwrap();
+                    let closed=packing[..before_transmit].to_owned()+r#"
+                        unit(i32,i32,i32,i32,i32) transmit=fn(kind,first_vert,n_vert,first_element,n_element){
+                            if(kind>=0&&first_vert>=0&&n_vert>=0&&first_element>=0&&n_element>=0){failed=false;};
+                        };
+                    %%end"#;
+                    assert!(matches!(prepare_with(&closed).search_startup_authored_path(std::num::NonZeroUsize::MIN),
+                        Err(ProjectCheck::Unsupported)));
+                    assert_eq!(take_requirement_results(),[(authored.clone(),true)]);
+                    assert_eq!(take_writes().len(),2556);
+                } else {
+                    let (failures,completion,trace,active)=outcome.expect("selected exact false row gets its authored diagnostic");
+                    assert_eq!(completion,StartupAuthoredCompletion::LimitReached);
+                    assert!(active && trace.contains_return(&measure_site));
+                    assert!(!trace.contains_return(&publish_site) && !trace.contains_return(&upload_site));
+                    let [failure]=failures.as_slice() else {panic!("exactly one selected obligation");};
+                    assert_eq!(failure.directive,authored.range);
+                    assert_eq!(failure.code(),&BigInt::from(73));
+                    assert_eq!(failure.stderr(),b"Orbital indexed actuator span");
+                    let cap=std::num::NonZeroUsize::new(2).unwrap();
+                    let Err(ProjectCheck::ProviderStopped(stop,_))=prepare().search_startup_authored_path(cap)
+                        else { panic!("larger quota must not publish an incomplete negative search"); };
+                    assert!(matches!(*stop,ProviderStop::RefutedRow { directive, .. } if directive==authored));
+                    assert_eq!(take_requirement_results(),[(authored.clone(),false)]);
+                    assert_eq!(take_writes().len(),2556);
+                }
+                assert!(matches!(prepare().run(),Err(ScalarOrderedCheckerOutcome::Unsupported)),
+                    "typed early result did not complete or widen ordinary Check");
+            }
         }
     }
 

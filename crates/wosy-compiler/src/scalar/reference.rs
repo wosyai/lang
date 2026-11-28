@@ -8489,7 +8489,11 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
                 || (matches!(self.mode,WalkMode::Callable(_)) && marker.operation==super::checker_directive::CheckerOperation::Require
                     && output.state_files.is_empty() && !output.has_module_values
                     && matches!(output.code_value,super::checker_directive::CheckerCode::Literal(_))
-                    && is_current_integer_projection_predicate(condition))
+                    && is_candidate_observed_requirement_predicate(condition, |name| {
+                        let WalkMode::Callable(callable) = &self.mode else { return false; };
+                        matches!(callable.target_resolver.plain_name(name, names),
+                            Some(PlainNameIdentity::ModuleValue(_)))
+                    }))
             {
                 // The ordinary checker has already type-checked this
                 // condition. Retain its real operand occurrences only in
@@ -12577,12 +12581,17 @@ fn build_function_reference_cfg(
 
 
 #[cfg(feature = "internal-checker")]
-fn is_current_integer_projection_predicate(root:&ScalarExpression)->bool {
-    let mut projected=false;
+fn is_candidate_observed_requirement_predicate(root:&ScalarExpression,
+    is_module_value: impl Fn(&str)->bool) -> bool {
+    // Preserve typed occurrence evidence for named state as well as indexed
+    // storage. The consuming VM still authenticates the exact operand types,
+    // ownership, and current projected value; this is only a syntactic sieve.
+    let mut uses_storage=false;
     let mut pending=vec![root];
     while let Some(node)=pending.pop() {
         match node {
-            ScalarExpression::Boolean {..}|ScalarExpression::Integer {..}|ScalarExpression::Name {..}=>{}
+            ScalarExpression::Boolean {..}|ScalarExpression::Integer {..}=>{}
+            ScalarExpression::Name {name,..}=>uses_storage |= is_module_value(name),
             ScalarExpression::Binary {operator,left,right,..} if matches!(operator,
                 BinaryOperator::And|BinaryOperator::Or|BinaryOperator::Equal|BinaryOperator::NotEqual
                 |BinaryOperator::Less|BinaryOperator::LessEqual|BinaryOperator::Greater|BinaryOperator::GreaterEqual
@@ -12594,7 +12603,7 @@ fn is_current_integer_projection_predicate(root:&ScalarExpression)->bool {
                 let mut cursor=place;
                 while let super::ScalarPlace::Index {base,index,..}=cursor {
                     if !matches!(index.as_ref(),ScalarExpression::Integer {..}|ScalarExpression::Name {..}) { return false; }
-                    projected=true;
+                    uses_storage=true;
                     cursor=base.as_ref();
                 }
                 if !matches!(cursor,super::ScalarPlace::Name {..}) { return false; }
@@ -12602,5 +12611,5 @@ fn is_current_integer_projection_predicate(root:&ScalarExpression)->bool {
             _=>return false,
         }
     }
-    projected
+    uses_storage
 }

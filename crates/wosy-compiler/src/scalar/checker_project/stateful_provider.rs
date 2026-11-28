@@ -118,7 +118,7 @@ fn direct_symbol<'a>(project:&'a ScalarProject,calls:&'a ProjectCallSiteResults,
     let body=calls.function_body(target.0,target.1,None)?;
     if !function.generic_parameters.is_empty() || !body.arms.is_empty() || !body.callable_escapes.is_empty()
         || body.contextual_formal().is_some() || !body.allocation_length_calls.is_empty()
-        || (has_callable_obligations(body) && !supports_observed_requirements(body,false))
+        || (has_callable_obligations(body) && !supports_observed_requirements(body,|_,_|true))
     { return None; }
     let [return_slot]=body.boundary.results.as_slice() else { return None; };
     Some((function,body,return_slot.ty.clone()))
@@ -140,7 +140,7 @@ fn rank_value(value:&ExactValue) -> Option<i32> {
     i32::try_from(value).ok()
 }
 
-fn requirement_condition(body:&FunctionCallSites,at:OccurrenceOrdinal) -> Option<(OccurrenceOrdinal,bool)> {
+fn requirement_condition(body:&FunctionCallSites,at:OccurrenceOrdinal) -> Option<(OccurrenceOrdinal,bool,bool)> {
     let st=&body.structure;
     let directive=st.checker_directives.get(&at)?;
     if directive.operation!=CheckerOperation::Require || !directive.output.state_files.is_empty()
@@ -150,6 +150,7 @@ fn requirement_condition(body:&FunctionCallSites,at:OccurrenceOrdinal) -> Option
     if st.checked_types.expressions.get(condition)?!=&ScalarType::Bool
         || body.occurrences.get(condition.0)?.span!=directive.condition { return None; }
     let mut indexed=false;
+    let mut module_state=false;
     let mut pending=vec![*condition];
     while let Some(at)=pending.pop() {
         let ty=st.checked_types.expressions.get(&at)?;
@@ -162,8 +163,10 @@ fn requirement_condition(body:&FunctionCallSites,at:OccurrenceOrdinal) -> Option
         } else if let Some(leaf)=st.observed_bool_negations.get(&at) {
             if *ty!=ScalarType::Bool { return None; }
             pending.push(*leaf);
-        } else if st.prepared_range_literals.contains_key(&at) || st.observed_bool_literals.contains_key(&at)
-            || matches!(body.prepared_plain_name(at),Some(PlainNameIdentity::Lexical(_) | PlainNameIdentity::ModuleValue(_))) {
+        } else if let Some(identity)=body.prepared_plain_name(at) {
+            if !matches!(ty,ScalarType::Bool|ScalarType::I32) { return None; }
+            module_state |= matches!(identity,PlainNameIdentity::ModuleValue(_));
+        } else if st.prepared_range_literals.contains_key(&at) || st.observed_bool_literals.contains_key(&at) {
             if !matches!(ty,ScalarType::Bool|ScalarType::I32) { return None; }
         } else if let Some(OccurrenceNode::Place(place))=st.edges.get(&(OccurrenceParent::Expression(at),OccurrenceEdge::ExpressionPlace)) {
             if *ty!=ScalarType::I32 { return None; }
@@ -171,17 +174,25 @@ fn requirement_condition(body:&FunctionCallSites,at:OccurrenceOrdinal) -> Option
             indexed=true;
         } else { return None; }
     }
-    Some((*condition,indexed))
+    Some((*condition,indexed,module_state))
 }
 
-fn supports_observed_requirements(body:&FunctionCallSites,indexed:bool) -> bool {
+fn supports_observed_requirements(body:&FunctionCallSites,projection:impl Fn(bool,bool)->bool) -> bool {
     body.checker_returns_unit() && body.arms.is_empty() && !body.structure.checker_directives.is_empty()
-        && body.structure.checker_directives.keys().all(|&site|
-            requirement_condition(body,site).is_some_and(|(_,projects)| !indexed || projects))
+        && body.structure.checker_directives.keys().all(|&site|requirement_condition(body,site)
+            .is_some_and(|(_,indexed,module_state)|projection(indexed,module_state)))
 }
 
 pub(super) fn supports_requirements(body:&FunctionCallSites) -> bool {
-    supports_observed_requirements(body,true)
+    supports_observed_requirements(body,|indexed,_|indexed)
+}
+
+pub(super) fn supports_module_state_requirements(body:&FunctionCallSites) -> bool {
+    supports_observed_requirements(body,|_,module_state|module_state)
+}
+
+pub(super) fn supports_staged_requirements(body:&FunctionCallSites) -> bool {
+    supports_observed_requirements(body,|indexed,module_state|indexed||module_state)
 }
 
 #[cfg(test)]
@@ -357,6 +368,34 @@ pub(super) fn qualified_store_reachable(project:&ScalarProject,calls:&ProjectCal
             let Some(to)=project.modules.get(child.0) else { continue; };
             if completed_namespace_owner(&from.source,&to.source,child.0,Some(visits))
                 && calls.function_body(child.0,child.1,None).is_some_and(needs_unit_runner) { return true; }
+        }
+    }
+    false
+}
+
+/// Positive dispatch authority for a wrapper with an exact same-owner
+/// observed requirement below it. This neither asserts that another route
+/// is absent nor describes any call result: the cursor still has to reach
+/// and execute each typed instruction, or stop on its actual frontier.
+pub(super) fn has_nested_observed_authored_call(project:&ScalarProject,calls:&ProjectCallSiteResults,
+    start:PreparedCallable) -> bool {
+    let Some((_,root,ScalarType::Unit))=direct_symbol(project,calls,start) else { return false; };
+    if has_callable_obligations(root) || !root.boundary.parameters.iter().all(|p|p.ty==ScalarType::I32) {
+        return false;
+    }
+    let mut seen=HashSet::new();
+    let mut pending=vec![start];
+    while let Some(target)=pending.pop() {
+        if !seen.insert(target) { continue; }
+        let Some((_,body,ScalarType::Unit))=direct_symbol(project,calls,target) else { continue; };
+        if target!=start && supports_staged_requirements(body) { return true; }
+        if has_callable_obligations(body) { continue; }
+        for (&site,&child) in &body.structure.checker_direct_targets {
+            if child.0!=start.0 || child==target { continue; }
+            let Some(signature)=body.checked_call_signatures.get(&site) else {continue;};
+            if matches!(signature.outputs.outputs.as_slice(),[out] if out.ty==ScalarType::Unit)
+                && authenticate_prepared_direct_edge(project,calls,target.0,body,site,signature)==Some(child)
+            { pending.push(child); }
         }
     }
     false
@@ -712,7 +751,7 @@ pub(super) fn run<'a>(
                     BlockItemKind::Evaluation { expression } => {
                         if st.checker_directives.contains_key(expression) {
                             let condition=(*dispatch.requirement_conditions.entry((frame.target,*expression))
-                                .or_insert_with(|| requirement_condition(body,*expression).map(|(condition,_)| condition)))?;
+                                .or_insert_with(|| requirement_condition(body,*expression).map(|(condition,_,_)| condition)))?;
                             tasks.extend([Task::DropUnit,Task::Requirement(*expression),Task::Eval(condition)]);
                         } else {
                             let ty=st.checked_types.expressions.get(expression)?;
