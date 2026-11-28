@@ -270,7 +270,10 @@ fn validate_current_generation(root: &Path, target: &str, profile: &str, manifes
 fn selected_source(
     root: &Path, target: &str, profile: &str, pending: Option<&PendingBuilderInputs>,
 ) -> Result<Option<(SqliteSourceState, wosy_cli::source_state::AcknowledgedSourceGeneration)>, Box<dyn std::error::Error + Send + Sync>> {
-    let session = tokio::runtime::Builder::new_current_thread().enable_time().build()?;
+    let mut runtime = tokio::runtime::Builder::new_current_thread();
+    runtime.enable_time();
+    if pending.is_some() { runtime.enable_io(); }
+    let session = runtime.build()?;
     let owner = root.join(".wosy");
     let source_store = owner.join("incremental-daemon");
     fs::create_dir_all(&owner)?;
@@ -302,6 +305,9 @@ fn selected_source(
     let comparison: Result<_, Box<dyn std::error::Error + Send + Sync>> = comparison;
     if let Some(store) = Arc::into_inner(store) {
         session.block_on(store.close())?;
+    }
+    if pending.is_some() && matches!(&comparison, Ok(Some(_))) {
+        eprintln!("incremental compiler LLVM compared over local Unix socket for {target}:{profile}");
     }
     comparison
 }

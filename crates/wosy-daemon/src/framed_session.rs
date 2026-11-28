@@ -123,6 +123,26 @@ impl SourceStorageWorker {
             Opening::Recoverable { replay, limits, ordinary_llvm }, None).await
     }
 
+    /// Compare ordinary authored LLVM for one exact profile nominated with
+    /// the source by a trusted, local activator that owns both stream ends.
+    /// A replay-required exchange must close; only a fresh connection can
+    /// receive the authorized client-side replay for the same selection.
+    pub async fn serve_scoped_ordinary_llvm_session<T: AsyncRead + AsyncWrite + Unpin>(
+        &self, stream: T, selected: BuildSourceSelection, replay: Option<Delta>, profile: String,
+        limits: BaseCstAdmissionLimits, max_partition_bytes: usize, cutoff: Instant,
+    ) -> Result<BuildSessionEnd> {
+        if profile.is_empty() || profile.len() > MAX_ORDINARY_LLVM_PROFILE_BYTES {
+            return Err("invalid selected ordinary LLVM profile".into());
+        }
+        let lifetime = cutoff.saturating_duration_since(Instant::now());
+        let ordinary_llvm = Some(OrdinaryLlvmScope {
+            limits, bytes: max_partition_bytes.min(MAX_SESSION_FRAME_BYTES),
+            version: ORDINARY_LLVM_PROJECTION_VERSION, pinned_profile: Some(profile),
+        });
+        self.serve_selected_session(stream, selected, lifetime,
+            Opening::Recoverable { replay, limits, ordinary_llvm }, Some(cutoff)).await
+    }
+
     /// The trusted local activator owns and binds this stream, selects a
     /// known source out of band, and never supplies replay for this path.
     /// The v2 builder witness is not an OS peer authentication mechanism.
@@ -284,7 +304,7 @@ async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
 ) -> Result<Close> {
     let mut owner = None;
     let cutoff = session.hard_deadline();
-    let native_v3 = ordinary_llvm.as_ref().is_some_and(|scope| scope.pinned_profile.is_some());
+    let selected_projection_only = ordinary_llvm.as_ref().is_some_and(|scope| scope.pinned_profile.is_some());
     loop {
         if cutoff_reached(cutoff) { return Ok(Close::Deadline); }
         let Some(deadline) = session.deadline() else { return Ok(Close::Deadline); };
@@ -295,7 +315,7 @@ async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
         };
         if cutoff_reached(cutoff) { return Ok(Close::Deadline); }
         let (id, operation) = match request? {
-            Some(Command { id, request: Request::Analyze { .. } }) if native_v3 => {
+            Some(Command { id, request: Request::Analyze { .. } }) if selected_projection_only => {
                 if !send(output, deadline, cutoff, id, Reply::Refused { reason: Refusal::AnalysisUnavailable }).await? {
                     return Ok(Close::Deadline);
                 }
@@ -328,7 +348,7 @@ async fn run<R: AsyncRead + Unpin, W: AsyncWrite + Unpin>(
                     && profile.len() <= MAX_ORDINARY_LLVM_PROFILE_BYTES
                     && scope.pinned_profile.as_ref().is_none_or(|selected| selected == &profile)).cloned();
                 if let Some(scope) = scope {
-                    if native_v3 { ordinary_llvm = None; }
+                    if selected_projection_only { ordinary_llvm = None; }
                     (id, Operation::OrdinaryLlvm(scope, version, profile))
                 } else {
                     let reason = if !supported { Refusal::UnsupportedVersion }

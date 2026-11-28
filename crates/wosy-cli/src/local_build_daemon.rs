@@ -1,11 +1,14 @@
-//! An ordinary, in-process daemon peer. The framed stream is paired directly
-//! with our compiled server code; it cannot be supplied by an external process.
+//! An ordinary, in-process daemon peer. The Build comparison uses an
+//! anonymous Unix socket, with no endpoint path, listener or external
+//! producer. Only our linked worker receives the other stream end.
 
-use crate::{
-    artifact_inputs::PendingBuilderInputs,
-    source_state::{AcknowledgedSourceGeneration, AuthorizedOrdinaryBuilderPeer, ReplaySource, SqliteSourceState},
-};
-use std::{cell::RefCell, fs::File, num::NonZeroUsize, sync::Arc, time::Duration};
+use crate::source_state::{AuthorizedOrdinaryBuilderPeer, ReplaySource, SqliteSourceState};
+#[cfg(target_os = "linux")]
+use crate::{artifact_inputs::PendingBuilderInputs, source_state::AcknowledgedSourceGeneration};
+use std::{fs::File, num::NonZeroUsize, sync::Arc, time::Duration};
+#[cfg(target_os = "linux")]
+use {crate::source_state::SourceReplay, tokio::net::UnixStream, wosy_daemon::BuildSessionEnd,
+    wosy_protocol::BuildSourceSelection};
 use tokio::{task::JoinSet, time::{timeout_at, Instant}};
 use wosy_daemon::{BaseCstAdmissionLimits, SourceStorageWorker, SourceStore};
 
@@ -60,6 +63,7 @@ pub async fn establish_local_build_source(
         && store.snapshot(selection.root)?.is_some())
 }
 
+#[cfg(target_os = "linux")]
 pub async fn compare_local_build(
     source: &mut SqliteSourceState,
     store: Arc<SourceStore>,
@@ -76,23 +80,14 @@ pub async fn compare_local_build(
         let one = NonZeroUsize::MIN;
         let worker = Arc::new(SourceStorageWorker::new(store, tokio::runtime::Handle::current(), one, one, one)?);
         // A dropped comparison (including timeout) aborts all framed sessions.
-        let sessions = RefCell::new(JoinSet::new());
+        let mut sessions = JoinSet::new();
         let answer = source.compare_selected_ordinary_llvm(
             target, profile, deadline.saturating_duration_since(Instant::now()),
             limits.authored_bytes, max_partition_bytes, &expected, ordinary,
-            |selection, replay| {
-                let worker = Arc::clone(&worker);
-                let (client, server) = tokio::io::duplex(4096);
-                sessions.borrow_mut().spawn(async move {
-                    worker.serve_recoverable_ordinary_llvm_session(
-                        server, selection, replay.map(|replay| replay.source.delta),
-                        limits, max_partition_bytes, deadline.saturating_duration_since(Instant::now()),
-                    ).await
-                });
-                std::future::ready(Ok(client))
-            },
+            |selection, replay| std::future::ready(open_scoped_session(
+                &worker, &mut sessions, selection, replay, profile, limits, max_partition_bytes, deadline,
+            )),
         ).await;
-        let mut sessions = sessions.into_inner();
         if answer.is_err() {
             sessions.shutdown().await;
             return answer;
@@ -105,6 +100,24 @@ pub async fn compare_local_build(
         }
         answer
     }).await?
+}
+
+#[cfg(target_os = "linux")]
+fn open_scoped_session(
+    worker: &Arc<SourceStorageWorker>, sessions: &mut JoinSet<Result<BuildSessionEnd>>,
+    selection: BuildSourceSelection, replay: Option<SourceReplay>, profile: &str,
+    limits: BaseCstAdmissionLimits, max_partition_bytes: usize, deadline: Instant,
+) -> Result<UnixStream> {
+    let (client, server) = UnixStream::pair()?;
+    let worker = Arc::clone(worker);
+    let profile = profile.to_owned();
+    sessions.spawn(async move {
+        worker.serve_scoped_ordinary_llvm_session(
+            server, selection, replay.map(|replay| replay.source.delta), profile,
+            limits, max_partition_bytes, deadline.into_std(),
+        ).await
+    });
+    Ok(client)
 }
 
 /// Select the ordinary authored IR from our own linked daemon. The result
@@ -160,3 +173,6 @@ fn open_running_image() -> std::io::Result<File> {
 fn open_running_image() -> std::io::Result<File> {
     Err(std::io::Error::new(std::io::ErrorKind::Unsupported, "running compiler image is unavailable"))
 }
+
+#[cfg(all(test, target_os = "linux"))]
+mod socket_tests;
