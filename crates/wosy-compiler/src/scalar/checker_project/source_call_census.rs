@@ -284,10 +284,17 @@ impl PreparedAuthoredIncoming {
                     out.unresolved.insert(target);
                 }
             }
-            for value in initializers.structure.prepared_callable_value_uses.values() {
-                if let Some(target)=index.get(&(&value.source,value.range)) { out.unresolved.insert(*target); }
-            }
             let same_package=owner.source.project==package.project && owner.source.package==package.package;
+            let resolved_startup_arguments: HashSet<_> = if same_package {
+                canonical.iter().filter_map(|&site| prepare_startup_callable_forwarder(
+                    project, calls, initializers, site, &owner.source,
+                ).map(|forwarder| forwarder.formal_site)).collect()
+            } else { HashSet::new() };
+            for (site, value) in &initializers.structure.prepared_callable_value_uses {
+                if !resolved_startup_arguments.contains(site) {
+                    if let Some(target)=index.get(&(&value.source,value.range)) { out.unresolved.insert(*target); }
+                }
+            }
             for (item,declaration) in owner.items.iter().enumerate() {
                 if !matches!(declaration,ScalarItem::Function(_)) { continue; }
                 let parent=(module,item);

@@ -3869,6 +3869,84 @@ impl ActualIntegerObserver for () {
     fn observe(&mut self, _target: (usize, usize), _arguments: &[&BigInt], _value: &BigInt) {}
 }
 
+#[cfg(feature = "internal-checker")]
+struct PreparedStartupForwarder<'project> {
+    wrapper: PreparedCallable,
+    callback: PreparedCallable,
+    owner: &'project ScalarModule,
+    body: &'project FunctionCallSites,
+    formal_site: OccurrenceOrdinal,
+    indirect: ByteSpan,
+}
+
+// Authenticate this one use without treating every use of the same callable
+// as a resolved call. Startup owns the execution and may never reach this site.
+#[cfg(feature = "internal-checker")]
+fn prepare_startup_callable_forwarder<'project>(
+    project: &'project ScalarProject, calls: &'project ProjectCallSiteResults,
+    topology: &ModuleInitializationTopology, occurrence: OccurrenceOrdinal,
+    module_source: &SourceIdentity,
+) -> Option<PreparedStartupForwarder<'project>> {
+    let ModuleInitializationCallTarget::Direct {
+        declaration, concrete: ConcreteCallSelection::Declaration,
+    } = topology.call_targets.get(&occurrence)? else { return None; };
+    use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
+    let wrapper = *topology.structure.checker_direct_targets.get(&occurrence)?;
+    let owner = project.modules.get(wrapper.0)?;
+    let ScalarItem::Function(function) = owner.items.get(wrapper.1)? else { return None; };
+    if owner.source != declaration.source || function.name_span != declaration.range
+        || owner.source != *module_source
+        || !function.generic_parameters.is_empty() || !function.overload_arms.is_empty()
+    { return None; }
+    let body = calls.function_body(wrapper.0, wrapper.1, None)?;
+    let signature = topology.checked_call_signatures.get(&occurrence)?;
+    if signature.overload.is_some() || signature.overload_origin.is_some()
+        || !matches!(signature.outputs.outputs.as_slice(), [out] if out.ty == ScalarType::Unit)
+    { return None; }
+    let [callable_ty @ ScalarType::Callable { parameters, outputs }, input] = signature.parameters.as_slice() else { return None; };
+    if !matches!(parameters.as_slice(), [ty] if ty == input && is_integer_type(ty))
+        || !matches!(outputs.outputs.as_slice(), [out] if out.ty == ScalarType::Unit)
+        || !body.checker_returns_unit() || !body.arms.is_empty() || !body.assignments.is_empty()
+        || !body.allocation_length_calls.is_empty() || body.contextual_formal().is_some()
+        || body.boundary.parameters.len() != signature.parameters.len()
+        || !body.boundary.parameters.iter().zip(&signature.parameters)
+            .all(|(slot, ty)| super::scalar_type_equal(&slot.ty, ty))
+    { return None; }
+    let [formal, input_slot] = body.boundary.checker_parameter_bindings.as_deref()? else { return None; };
+    let [call_site] = body.call_occurrences.as_slice() else { return None; };
+    let [statement] = body.structure.blocks.get(body.structure.root.0)?.items.as_slice() else { return None; };
+    let BlockItemKind::Evaluation { expression: call } = statement.kind else { return None; };
+    if call != call_site.ordinal || !matches!(&body.resolved_call_site(call)?.target,
+        ResolvedCallTarget::LocalCallable(binding) if binding == formal)
+    { return None; }
+    let indirect = body.checked_call_signatures.get(&call)?;
+    if &indirect.parameters != parameters
+        || !matches!(indirect.outputs.outputs.as_slice(), [out] if out.ty == ScalarType::Unit)
+        || indirect.overload.is_some() || indirect.overload_origin.is_some() { return None; }
+    let expression = |structure: &OccurrenceStructure, call, slot| match structure.edges.get(&(
+        OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(slot),
+    ))? { OccurrenceNode::Expression(at) => Some(*at), _ => None };
+    let forwarded = expression(&body.structure, call, 0)?;
+    if !matches!(body.prepared_plain_name(forwarded), Some(PlainNameIdentity::Lexical(binding)) if binding == input_slot)
+        || body.structure.checked_types.expressions.get(&forwarded) != Some(input)
+    { return None; }
+    let selected = expression(&topology.structure, occurrence, 0)?;
+    if !topology.structure.checked_types.expressions.get(&selected)
+        .is_some_and(|ty| super::scalar_type_equal(ty, callable_ty)) { return None; }
+    let target = topology.structure.prepared_callable_value_uses.get(&selected)?;
+    if target.source != owner.source { return None; }
+    let item = owner.items.iter().position(|item| matches!(item, ScalarItem::Function(f)
+        if f.name_span == target.range && super::scalar_type_equal(&f.signature, callable_ty)
+            && f.generic_parameters.is_empty() && f.overload_arms.is_empty()))?;
+    let callback = (wrapper.0, item);
+    let callback_body = calls.function_body(callback.0, callback.1, None)?;
+    if callback == wrapper || callback_body.contextual_formal().is_some() { return None; }
+    Some(PreparedStartupForwarder {
+        wrapper, callback, owner, body: callback_body, formal_site: selected,
+        indirect: body.occurrences.get(call.0)?.span,
+    })
+}
+
 impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> CheckedCalls<'project, Observer, ACTUAL_STARTUP> {
     #[inline]
     fn note_reached(&mut self, target: (usize, usize)) {
@@ -4407,60 +4485,17 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         Ok(Some(result))
     }
 
-    // A transparent forwarding activation may use the original callback
-    // checker frame: the wrapper must contain exactly the typed indirect call
-    // of its callable formal, with no other evaluation or binding effects.
     #[cfg(feature = "internal-checker")]
     fn exact_startup_callable_forwarder<'a>(
         &self, topology: &'a ModuleInitializationTopology, occurrence: OccurrenceOrdinal,
         declaration: &wosy_syntax::SourceSpan, signature: &CheckedCallSignature,
         argument: &impl Fn(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
     ) -> Option<(PreparedCallable, PreparedCallable, &'project ScalarModule, &'project FunctionCallSites, &'a BigInt, ByteSpan)> {
-        use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
-        let (wrapper, owner, _, body) = self.validated_direct_body(
-            &topology.structure, occurrence, &declaration.source, declaration.range,
-        ).ok()?;
-        let [callable_ty @ ScalarType::Callable { parameters, outputs }, input] = signature.parameters.as_slice() else { return None; };
-        if !matches!(parameters.as_slice(), [ty] if ty == input && is_integer_type(ty))
-            || !matches!(outputs.outputs.as_slice(), [out] if out.ty == ScalarType::Unit)
-            || !body.checker_returns_unit() || !body.arms.is_empty() || !body.assignments.is_empty()
-            || !body.allocation_length_calls.is_empty() || body.contextual_formal().is_some()
-            || body.boundary.parameters.len() != signature.parameters.len()
-            || !body.boundary.parameters.iter().zip(&signature.parameters)
-                .all(|(slot, ty)| super::scalar_type_equal(&slot.ty, ty))
-        { return None; }
-        let [formal, input_slot] = body.boundary.checker_parameter_bindings.as_deref()? else { return None; };
-        let [call_site] = body.call_occurrences.as_slice() else { return None; };
-        let [statement] = body.structure.blocks.get(body.structure.root.0)?.items.as_slice() else { return None; };
-        let BlockItemKind::Evaluation { expression: call } = statement.kind else { return None; };
-        if call != call_site.ordinal || !matches!(&body.resolved_call_site(call)?.target,
-            ResolvedCallTarget::LocalCallable(binding) if binding == formal)
-        { return None; }
-        let indirect = body.checked_call_signatures.get(&call)?;
-        if &indirect.parameters != parameters
-            || !matches!(indirect.outputs.outputs.as_slice(), [out] if out.ty == ScalarType::Unit)
-            || indirect.overload.is_some() || indirect.overload_origin.is_some() { return None; }
-        let expression = |structure: &OccurrenceStructure, call, slot| match structure.edges.get(&(
-            OccurrenceParent::Expression(call), OccurrenceEdge::CallArgument(slot),
-        ))? { OccurrenceNode::Expression(at) => Some(*at), _ => None };
-        let forwarded = expression(&body.structure, call, 0)?;
-        if !matches!(body.prepared_plain_name(forwarded), Some(PlainNameIdentity::Lexical(binding)) if binding == input_slot)
-            || body.structure.checked_types.expressions.get(&forwarded) != Some(input)
-        { return None; }
-        let selected = expression(&topology.structure, occurrence, 0)?;
-        if !topology.structure.checked_types.expressions.get(&selected)
-            .is_some_and(|ty| super::scalar_type_equal(ty, callable_ty)) { return None; }
-        let target = topology.structure.prepared_callable_value_uses.get(&selected)?;
-        if target.source != owner.source { return None; }
-        let item = owner.items.iter().position(|item| matches!(item, ScalarItem::Function(f)
-            if f.name_span == target.range && super::scalar_type_equal(&f.signature, callable_ty)
-                && f.generic_parameters.is_empty() && f.overload_arms.is_empty()))?;
-        let callback = (wrapper.0, item);
-        let (_, owner, _, callback_body) = self.validated_prepared_body(callback, &target.source, target.range).ok()?;
-        if callback == wrapper || callback_body.contextual_formal().is_some() { return None; }
+        let typed = prepare_startup_callable_forwarder(self.project, self.calls, topology, occurrence, &declaration.source)?;
+        let [_, input] = signature.parameters.as_slice() else { return None; };
         let (value_ty, value) = exact_typed_call_argument_at(&topology.structure, occurrence, 1, false, argument)?;
         (value_ty == input && integer_literal_fits_type(value, input))
-            .then_some((wrapper, callback, owner, callback_body, value, body.occurrences.get(call.0)?.span))
+            .then_some((typed.wrapper, typed.callback, typed.owner, typed.body, value, typed.indirect))
     }
 
     fn validated_prepared_body(
@@ -23587,11 +23622,15 @@ i32(i32) transform=fn(x) { x };
     fn prepared_actual_callable_formal_preserves_callback_guard() {
         let app = source("src/main.w", "prepared-actual-callable-formal");
         for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
-            for (value, expected) in [(1, 0), (4, 1)] {
+            for (entry, expected_main, expected_full) in [
+                ("dispatch(target, 1);", 0, 0),
+                ("dispatch(target, 4);", 1, 1),
+                ("if (false) { dispatch(target, 1); };", 0, 1),
+            ] {
                 let text = format!(r#"%%start
                     unit(u8) target = fn(value) {{ core.require(value < 4, {OUTPUT}); }};
                     unit((unit(u8)),u8) dispatch = fn(callback, input) {{ callback(input); }};
-                    dispatch(target, {value});
+                    {entry}
                 %%end"#);
                 let prepared = prepare_checker_project(
                     vec![(declarations(&app, &text), Vec::new())], vec![app.clone()],
@@ -23600,15 +23639,25 @@ i32(i32) transform=fn(x) { x };
                 let (active, failures) = collect_ordered_package_failures(
                     &prepared, ScalarCheckerScope::MainFlowOnly, 1,
                 ).expect("the exact prepared callback must be checked in its real startup context");
-                assert!(active);
-                assert_eq!(failures.len(), expected);
+                assert!(active || entry.starts_with("if (false)"));
+                assert_eq!(failures.len(), expected_main);
                 let (reported, completion, _, active) = run_startup_authored_path(
                     &prepared, Some(std::num::NonZeroUsize::MIN), &[], false, &[],
                     Some(&[]), None, false, None,
                 ).expect("the capped production route must preserve the concrete callback");
-                assert!(active);
-                assert_eq!(reported.len(), expected);
-                assert_eq!(completion == StartupAuthoredCompletion::LimitReached, expected == 1);
+                assert!(active || entry.starts_with("if (false)"));
+                assert_eq!(reported.len(), expected_main);
+                assert_eq!(completion == StartupAuthoredCompletion::LimitReached, expected_main == 1);
+                let (project, _) = prepared.parts();
+                let (root, ordinals) = package_startup_order(project, &project.modules[..1]).unwrap();
+                let (_, authored) = package_obligation_roots(&prepared, ScalarCheckerScope::CurrentPackage, 1, root).unwrap();
+                let (roots, mandatory, _) =
+                    plan_closed_authored_roots(&prepared, root, 1, &ordinals, authored, true).unwrap();
+                let (package, _, _, _) = run_startup_authored_path(
+                    &prepared, Some(std::num::NonZeroUsize::MIN), &[], false, &roots,
+                    Some(&mandatory), None, false, None,
+                ).unwrap();
+                assert_eq!(package.len(), expected_full);
             }
         }
     }
