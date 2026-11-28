@@ -1543,6 +1543,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             let mut symbolic = CheckedCalls::<ProofFreeSymbolic<true>, false> {
                 project, calls, active: HashSet::from([(ordinal, item)]), active_depth: 1, reached: HashSet::new(),
             #[cfg(feature = "internal-checker")] mixed_reached: None,
+            #[cfg(feature = "internal-checker")] nominal_store_routes: HashMap::new(),
                 had_obligations: false, observer: ProofFreeSymbolic { ordinary_projected_effects: !Proof::ENABLED, citation_only: false, named_pair: false, named_mixed_pair: false, named_pair_work: 0 }, symbolic_module: ordinal,
             };
             let mut cursor = ExactCallCursor::arbitrary_root(body, &body.boundary.results[0].ty)
@@ -1587,6 +1588,7 @@ fn check_unused_module<const COLLECT: bool, const ENTRY_EVIDENCE: bool, Proof: S
             let mut symbolic = CheckedCalls::<(), false> {
                 project, calls, active: HashSet::from([(ordinal, item)]), active_depth: 1, reached: HashSet::new(),
             #[cfg(feature = "internal-checker")] mixed_reached: None,
+            #[cfg(feature = "internal-checker")] nominal_store_routes: HashMap::new(),
                 had_obligations: false, observer: (), symbolic_module: ordinal,
             };
             if COLLECT {
@@ -1698,6 +1700,7 @@ fn walk_prepared_initialization<'a, Observer: ActualIntegerObserver, const COLLE
     let mut actual = CheckedCalls {
         project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
             #[cfg(feature = "internal-checker")] mixed_reached: None,
+            #[cfg(feature = "internal-checker")] nominal_store_routes: HashMap::new(),
         had_obligations: false, observer, symbolic_module: 0,
     };
     #[cfg(feature = "internal-checker")]
@@ -2363,11 +2366,12 @@ fn try_observed_projected_storage_call(
                         } else if let Some(signature)=body.checked_call_signatures.get(site).filter(|signature|
                             signature.parameters.len()>2 && signature.parameters.iter().all(|ty| *ty==ScalarType::I32)
                                 && matches!(signature.outputs.outputs.as_slice(),[out] if out.ty==ScalarType::I32)) {
-                            let Some(callee)=body_of(child) else { return Ok(false); };
-                            let Some(child_module)=actual.project.modules.get(child.0) else { return Ok(false); };
-                            if authenticate_prepared_direct_edge(actual.project,actual.calls,node.0,body,*site,signature)!=Some(child)
-                                || !stateful_provider::has_nominal_integer_store(callee,&child_module.source)
-                            { return Ok(false); }
+                            if authenticate_prepared_direct_edge(actual.project,actual.calls,node.0,body,*site,signature)!=Some(child) {
+                                return Ok(false);
+                            }
+                            let routes=actual.nominal_store_routes.entry(child.0).or_insert_with(||
+                                stateful_provider::local_nominal_store_routes(actual.project,actual.calls,child.0));
+                            if !routes.as_ref().is_some_and(|routes|routes.contains(&child)) { return Ok(false); }
                             provider_scalars.insert(child);
                             writes_or_reads_storage=true;
                         }
@@ -3689,6 +3693,8 @@ struct CheckedCalls<'a, Observer, const ACTUAL_STARTUP: bool = true> {
     reached: HashSet<(usize, usize)>,
     #[cfg(feature = "internal-checker")]
     mixed_reached: Option<HashMap<PreparedCallable, usize>>,
+    #[cfg(feature = "internal-checker")]
+    nominal_store_routes: HashMap<usize, Option<HashSet<PreparedCallable>>>,
     had_obligations: bool,
     observer: Observer,
     symbolic_module: usize,
@@ -7978,7 +7984,8 @@ fn run_named_partition_cursor<'a, const ORDINARY_LOCALS: bool>(
     let mut evaluator = CheckedCalls::<ProofFreeSymbolic<ORDINARY_LOCALS, true>, false> {
         project: runtime.project, calls: runtime.calls, active: HashSet::from([target]),
         active_depth: 1, reached: HashSet::new(),
-            #[cfg(feature = "internal-checker")] mixed_reached: None, had_obligations: false,
+            #[cfg(feature = "internal-checker")] mixed_reached: None,
+            #[cfg(feature = "internal-checker")] nominal_store_routes: HashMap::new(), had_obligations: false,
         observer: ProofFreeSymbolic { ordinary_projected_effects: false, citation_only, named_pair, named_mixed_pair, named_pair_work: 0 }, symbolic_module: target.0,
     };
     if named_pair {
@@ -20911,11 +20918,14 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 table[iz][ix].epoch=epoch;
                 if (table[iz][ix].epoch==epoch) { core.int_extend<i32>(table[iz][ix].material) } else { -1 }
             };
-            unit() launch=fn { result=edit(0,1,9,260); };
+            i32(i32,i32,i32,i32) wrapper=fn(x,z,epoch,material) {
+                if (epoch>0) { edit(x,z,epoch,material) } else { -2 }
+            };
+            unit() launch=fn { result=wrapper(0,1,9,260); };
             launch();
             core.narrow(false,{.stdout="";.stderr="";.code=result;.files=[];});
         %%end"#;
-        let out_of_bound = text.replace("edit(0,1,9,260)","edit(2,1,9,260)");
+        let out_of_bound = text.replace("wrapper(0,1,9,260)","wrapper(2,1,9,260)");
         for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
             let prepare=|text| prepare_loaded_scalar_ordered_local_proof_contexts(
                 vec![(declarations(&app,text),Vec::new())],[],vec![app.clone()],
@@ -21287,6 +21297,91 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 vec![(wosy_syntax::SourceSpan::new(source.clone(),required),false)]);
             assert_eq!(before_host,before);
             eprintln!("Pocket rebuild {target_layout:?}: 3136 current world reads to exact true publication; false preserved; no host or returned row");
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    #[ignore = "requires independently pinned unmodified Pocket Island engine source"]
+    fn pinned_pocket_active_exterior_edit_rebuilds_to_real_publication_without_host() {
+        use crate::scalar::checker_flow::{IntegerFieldCell,ProjectedStorage,observed_f32_array::Cell};
+        let text=std::fs::read_to_string(std::env::var_os("WOSY_TEST_PINNED_POCKET_ENGINE").unwrap()).unwrap();
+        let source=source("src/engine.w","pinned-pocket-active-edit-publication");
+        let integer=|value:i32| ObservedExactValue::Integer(ScalarType::I32,value.into());
+        let (x,y,z)=(110i32,5i32,40i32);
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            let owner=prepare_checker_project(vec![(declarations(&source,&text),Vec::new())],vec![source.clone()],
+                ScalarPreparationInputs { target_layout }).unwrap();
+            let (project,calls)=owner.parts();
+            let module=&project.modules[0];
+            let function=|name:&str| (0,module.items.iter().position(|item|
+                matches!(item,ScalarItem::Function(f) if f.name==name)).unwrap());
+            let declaration=|wanted:&str| {
+                let binding=module.items.iter().find_map(|item| match item {
+                    ScalarItem::Binding(binding) if binding.name==wanted=>Some(binding), _=>None,
+                }).unwrap();
+                wosy_syntax::SourceSpan::new(source.clone(),binding.name_span)
+            };
+            let edit=function("edit_exterior");
+            let store=function("store_exterior_edit");
+            let routes=stateful_provider::local_nominal_store_routes(project,calls,0).unwrap();
+            assert!(routes.contains(&edit)&&routes.contains(&store));
+            assert!(!routes.contains(&function("publish_chunk")));
+            let nominal=module.structs.iter().find(|item|item.name=="TerrainEdit").unwrap();
+            let field=|name:&str| nominal.fields.iter().find(|item|item.name==name).unwrap().id.index;
+            let phase=module.enums.iter().find(|item|item.name=="BeaconPhase").unwrap();
+            let active=phase.variants().iter().find(|item|item.name=="active").unwrap();
+            let cell=|name:&str,indices:Vec<u64>| Cell { declaration:declaration(name),indices:indices.into_boxed_slice() };
+            let mut current=ProjectedStorage::default();
+            for name in ["world","mesh_halo","vertices","terrain_edits","edit_hints","cache_x",
+                "cache_z","cache_seed","cache_height","cache_passage"] { current.observe_aggregate(declaration(name)); }
+            for (name,value) in [("archipelago_hunt",false),("target_dirty",false),("ground_contact_dirty",false),("terrain_window_active",true)] {
+                current.observe_boolean(declaration(name),value);
+            }
+            for (name,value) in [("edit_epoch",1),("exterior_edits",0),("world_seed",471),("terrain_chunk_x",9),
+                ("terrain_chunk_z",3),("loose_count",0),("write_position",27)] {
+                current.observe_scalar(declaration(name),&ScalarType::I32,&value.into());
+            }
+            current.observe_enum(declaration("beacon_phase"),phase.id.clone(),active.tag);
+            // This observed row has an empty edit table and known hint grid;
+            // every queried epoch is represented explicitly, not guessed by
+            // address or inferred from absence of a write.
+            for position in 0..2048u64 {
+                let key=IntegerFieldCell { cell:cell("terrain_edits",vec![position/256,position/16%16,position%16]),
+                    structure:nominal.id.clone(),field:field("epoch") };
+                current.overwrite_integer_field(key,ScalarType::I32,0).unwrap();
+            }
+            for row in 0..16 { for column in 0..16 {
+                current.overwrite_i32_array_element(cell("edit_hints",vec![row,column]),0).unwrap();
+            } }
+            for (name,value) in [("cache_x",x),("cache_z",z),("cache_seed",471),("cache_height",8),("cache_passage",0)] {
+                current.overwrite_i32_array_element(cell(name,vec![0,14]),value).unwrap();
+            }
+            let epoch_field=field("epoch");
+            let material_field=field("material");
+            let active_epoch_seen=std::cell::Cell::new(false);
+            let placed_air_seen=std::cell::Cell::new(false);
+            let reached=std::cell::Cell::new(false);
+            let before=current.clone();
+            stateful_provider::take_requirement_results();
+            let result=stateful_provider::run(project,calls,edit,vec![integer(x),integer(y),integer(z),integer(0)],
+                &mut current,true,&mut stateful_provider::Dispatch::default(),&HashMap::new(),&[InitializationVisit::Started],
+                false,&reached,|state,cell,ty| match ty {
+                    ScalarType::I32=>Some((integer(state.observed_i32_array_element(cell)?),1)),
+                    ScalarType::U8=>Some((ObservedExactValue::Integer(ScalarType::U8,state.observed_u8_array_element(cell)?.into()),1)),
+                    _=>None,
+                },|state,cell,ty|{
+                    let value=state.observed_integer_field(cell,ty)?;
+                    if cell.field==epoch_field && value==1 { active_epoch_seen.set(true); }
+                    if cell.field==material_field && value==0 { placed_air_seen.set(true); }
+                    Some((ObservedExactValue::Integer(ty.clone(),value.into()),1))
+                });
+            assert!(result.is_none() && reached.get(),"the real visible rebuild runs to the authored check, but cannot return through opaque host");
+            assert!(active_epoch_seen.get() && placed_air_seen.get(),"the mesh overlay consumed this edit, not the initial blank table");
+            assert_eq!(stateful_provider::take_requirement_results(),
+                vec![(wosy_syntax::SourceSpan::new(source.clone(),ByteSpan::new(41777,41933)),true)]);
+            assert_eq!(current,before);
+            eprintln!("Pocket active edit {target_layout:?}: actual mesh reread the edit and reached the authored requirement; host and external return unresolved");
         }
     }
 
@@ -26032,6 +26127,7 @@ unit(u8) parent = fn(a) {
         let mut actual = CheckedCalls {
             project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
             #[cfg(feature = "internal-checker")] mixed_reached: None,
+            #[cfg(feature = "internal-checker")] nominal_store_routes: HashMap::new(),
             had_obligations: false, observer: ProofFreeOrderedEvidence, symbolic_module: 0,
         };
         let mut effects = OrderedFailures::default();
@@ -31773,6 +31869,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
         let mut actual = CheckedCalls::<_, true> {
             project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
             #[cfg(feature = "internal-checker")] mixed_reached: None,
+            #[cfg(feature = "internal-checker")] nominal_store_routes: HashMap::new(),
             had_obligations: false, observer, symbolic_module: 0,
         };
         let mut visits = vec![InitializationVisit::Unseen; project.modules.len()];
@@ -35045,6 +35142,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             let mut actual = CheckedCalls {
                 project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
             #[cfg(feature = "internal-checker")] mixed_reached: None,
+            #[cfg(feature = "internal-checker")] nominal_store_routes: HashMap::new(),
                 had_obligations: false, observer: (), symbolic_module: 0,
             };
             let mut output = OrderedFailures::default();
@@ -36715,6 +36813,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             let mut actual = CheckedCalls {
                 project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
             #[cfg(feature = "internal-checker")] mixed_reached: None,
+            #[cfg(feature = "internal-checker")] nominal_store_routes: HashMap::new(),
                 had_obligations: false, observer: ProofFreeOrderedEvidence, symbolic_module: 0,
             };
             let mut failures = OrderedFailures::default();
@@ -36798,6 +36897,7 @@ i8(i8) identity = fn(value) { value }; i8 out = identity(8);
             let mut actual = CheckedCalls {
                 project, calls, active: HashSet::new(), active_depth: 0, reached: HashSet::new(),
             #[cfg(feature = "internal-checker")] mixed_reached: None,
+            #[cfg(feature = "internal-checker")] nominal_store_routes: HashMap::new(),
                 had_obligations: false, observer: ProofFreeOrderedEvidence, symbolic_module: 0,
             };
             let mut failures = OrderedFailures::default();

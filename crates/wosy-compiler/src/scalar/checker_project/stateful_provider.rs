@@ -358,6 +358,41 @@ pub(super) fn has_nominal_integer_store(body:&FunctionCallSites,owner:&SourceIde
                 && Place::indexed(body,destination.destination,ty,owner).is_some_and(|place|place.field.is_some()))))
 }
 
+/// Find the prepared direct-call paths that can execute a nominal store in
+/// this owner. This selects an evaluator, never a proof root or a reason to
+/// assume an edge is taken. Reverse closure scans each local edge once so
+/// every wider call in the observed startup can share the same decision.
+pub(super) fn local_nominal_store_routes(
+    project:&ScalarProject,calls:&ProjectCallSiteResults,owner:usize,
+) -> Option<HashSet<PreparedCallable>> {
+    let module=project.modules.get(owner)?;
+    let mut incoming=HashMap::<_,Vec<_>>::new();
+    let mut covered=HashSet::new();
+    let mut pending=Vec::new();
+    for (item,declaration) in module.items.iter().enumerate() {
+        if !matches!(declaration,ScalarItem::Function(_)) { continue; }
+        let Some(body)=calls.function_body(owner,item,None) else { continue; };
+        let target=(owner,item);
+        if has_nominal_integer_store(body,&module.source) {
+            covered.insert(target);
+            pending.push(target);
+        }
+        for (&site,&child) in &body.structure.checker_direct_targets {
+            if child.0!=owner { continue; }
+            let Some(signature)=body.checked_call_signatures.get(&site) else { continue; };
+            if authenticate_prepared_direct_edge(project,calls,owner,body,site,signature)==Some(child) {
+                incoming.entry(child).or_default().push(target);
+            }
+        }
+    }
+    while let Some(target)=pending.pop() {
+        for parent in incoming.remove(&target).unwrap_or_default() {
+            if covered.insert(parent) { pending.push(parent); }
+        }
+    }
+    Some(covered)
+}
+
 pub(super) fn run<'a>(
     project:&'a ScalarProject,calls:&'a ProjectCallSiteResults,target:PreparedCallable,args:Vec<ExactValue>,
     caller_storage:&mut ProjectedStorage, trace:bool,dispatch:&mut Dispatch<'a>,
