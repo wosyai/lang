@@ -12017,11 +12017,12 @@ fn plan_closed_authored_roots(
     let proven_joins = if allow_startup_scalars { prove_typed_local_roots(owner, &mut deferred)? } else { Vec::new() };
     let mut needed = deferred.into_iter().flat_map(|(module,items)| items.into_iter().map(move |item| (module,item))).collect::<HashSet<_>>();
     if !needed.is_empty() {
-        let callers = ordered_symbolic_callers(project, calls, root, None)?;
+        let callers = source_call_census::PreparedAuthoredIncoming::build(project,calls,root)
+            .ok_or(ProjectCheck::Unsupported)?;
         let mut pending = needed.iter().copied().collect::<Vec<_>>();
         let mut work = 0;
         while let Some(callee) = pending.pop() {
-            let Some(edges) = callers.get(&callee) else { continue; };
+            let edges=callers.parents(callee).ok_or(ProjectCheck::Unsupported)?;
             super::checker_flow::charge_call_work(&mut work, edges.len()).ok_or(ProjectCheck::Unsupported)?;
             pending.extend(edges.iter().copied().filter(|caller| needed.insert(*caller)));
         }
@@ -20595,6 +20596,49 @@ unit(i32,f32) frame = fn(mail_status,wreck_alpha) {
                 }
                 // A separate symbolic call cannot take the seed proof.
                 assert!(envelopes.close_guarded_formals(scan).is_none());
+            }
+        }
+    }
+
+    #[cfg(feature = "internal-checker")]
+    #[test]
+    fn product_authored_incoming_includes_qualified_scalar_and_refuses_escape_as_root_evidence() {
+        use source_call_census::PreparedAuthoredIncoming;
+        let root=source("src/main.w","typed-authored-product-root");
+        let lib=source("src/provider.w","typed-authored-product-provider");
+        let code=r#"%%start
+            dep = namespace demo "provider.w";
+            host = extern wasm "device" { unit(i32) output; };
+            i32(i32) forward = fn(x) { dep.transform(x) };
+            unit(i32) unrelated = fn(x) { host.output(x); };
+        %%end"#;
+        let escaped=code.replace("%%end",
+            "unit((i32(i32)),i32) consume=fn(f,x) { f(x); };
+            unit() leak=fn { consume(dep.transform,1); };
+            %%end");
+        let provider="%%start
+i32(i32) transform=fn(x) { x };
+%%end";
+        let start=code.find("dep =").unwrap();
+        let end=start+code[start..].find(';').unwrap()+1;
+        for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
+            for (text,escaped) in [(code,false),(escaped.as_str(),true)] {
+                let prepared=prepare_checker_project(vec![
+                    (declarations(&root,text),vec![ScalarNamespaceBinding {binding:"dep".into(),target:lib.clone(),
+                        span:ByteSpan::new(start as u32,end as u32)}]),
+                    (declarations(&lib,provider),Vec::new())],vec![root.clone(),lib.clone()],
+                    ScalarPreparationInputs { target_layout }).unwrap();
+                let (project,calls)=prepared.parts();
+                let item=|source:&SourceIdentity,name:&str| {
+                    let module=project.modules.iter().position(|m| &m.source==source).unwrap();
+                    (module,project.modules[module].items.iter().position(|item|
+                        matches!(item,ScalarItem::Function(f) if f.name==name)).unwrap())
+                };
+                let forward=item(&root,"forward");
+                let transform=item(&lib,"transform");
+                let inventory=PreparedAuthoredIncoming::build(project,calls,&root).unwrap();
+                assert_eq!(inventory.parents(transform),(!escaped).then_some([forward].as_slice()));
+                assert_eq!(inventory.parents(item(&root,"unrelated")),Some([].as_slice()));
             }
         }
     }

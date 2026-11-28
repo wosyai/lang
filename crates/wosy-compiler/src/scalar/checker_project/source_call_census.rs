@@ -235,3 +235,102 @@ impl SourceCallCensus {
         Some(())
     }
 }
+
+/// Reverse edges for ordinary authored root planning. This is deliberately
+/// not an artifact entry roster: a missing edge does not certify nonuse,
+/// purity or external reachability. Only the separate package startup and
+/// symbolic execution may establish those facts.
+pub(super) struct PreparedAuthoredIncoming {
+    parents: HashMap<PreparedCallable, Vec<PreparedCallable>>,
+    unresolved: HashSet<PreparedCallable>,
+}
+
+impl PreparedAuthoredIncoming {
+    pub(super) fn build(project: &ScalarProject, calls: &ProjectCallSiteResults,
+        package: &SourceIdentity) -> Option<Self> {
+        let mut index = HashMap::new();
+        for (module, owner) in project.modules.iter().enumerate() {
+            if owner.source.project != package.project || owner.source.package != package.package { continue; }
+            for (item, declaration) in owner.items.iter().enumerate() {
+                if let ScalarItem::Function(function) = declaration {
+                    if index.insert((&owner.source,function.name_span),(module,item)).is_some() { return None; }
+                }
+            }
+        }
+        let mut out = Self { parents:HashMap::new(),unresolved:HashSet::new() };
+        let find = |resolution: &ResolvedCallTarget| match resolution {
+            ResolvedCallTarget::ModuleCallable { source,declaration_span,concrete } =>
+                index.get(&(source,*declaration_span)).copied().map(|target|(target,matches!(concrete,ConcreteCallSelection::Declaration))),
+            _=>None,
+        };
+        for (module,owner) in project.modules.iter().enumerate() {
+            let region=calls.initialization_region(module)?;
+            if region.source != owner.source { return None; }
+            let ModuleInitializationDetail::Occurrences(initializers)=&region.detail else { return None; };
+            let canonical:HashSet<_>=initializers.calls.iter().copied().collect();
+            for (&site,edge) in &initializers.call_targets {
+                let (decl,direct)=match edge {
+                    ModuleInitializationCallTarget::Direct { declaration,concrete } =>
+                        (declaration,matches!(concrete,ConcreteCallSelection::Declaration)),
+                    ModuleInitializationCallTarget::Generic { declaration,.. }
+                    | ModuleInitializationCallTarget::CallableBinding(declaration) => (declaration,false),
+                    _=>continue,
+                };
+                let Some(&target)=index.get(&(&decl.source,decl.range)) else { continue; };
+                if !direct || !canonical.contains(&site)
+                    || initializers.structure.checker_direct_targets.get(&site)!=Some(&target)
+                    || !initializers.checked_call_signatures.contains_key(&site)
+                {
+                    out.unresolved.insert(target);
+                }
+            }
+            for value in initializers.structure.prepared_callable_value_uses.values() {
+                if let Some(target)=index.get(&(&value.source,value.range)) { out.unresolved.insert(*target); }
+            }
+            let same_package=owner.source.project==package.project && owner.source.package==package.package;
+            for (item,declaration) in owner.items.iter().enumerate() {
+                if !matches!(declaration,ScalarItem::Function(_)) { continue; }
+                let parent=(module,item);
+                let mut body_stack=vec![calls.function_body(module,item,None)?];
+                while let Some(body)=body_stack.pop() {
+                    body_stack.extend(&body.arms);
+                    for value in body.structure.prepared_callable_value_uses.values() {
+                        if let Some(target)=index.get(&(&value.source,value.range)) { out.unresolved.insert(*target); }
+                    }
+                    let mut associated=vec![false;body.sites.len()];
+                    for occurrence in &body.call_occurrences {
+                        *associated.get_mut(occurrence.site)?=true;
+                        let resolution=&body.sites.get(occurrence.site)?.target;
+                        let Some((target,direct))=find(resolution) else { continue; };
+                        let site=occurrence.ordinal;
+                        let typed=body.checked_call_signatures.get(&site).is_some_and(|signature|
+                            authenticate_prepared_direct_edge(project,calls,module,body,site,signature)==Some(target));
+                        if !same_package || !typed || !direct {
+                            out.unresolved.insert(target);
+                        } else {
+                            // All prepared occurrence sites are considered, including
+                            // qualified scalar calls. At most one parent edge is kept
+                            // per function, even if several arms invoke it.
+                            let before=out.parents.entry(target).or_default();
+                            if before.last()!=Some(&parent) { before.push(parent); }
+                        }
+                    }
+                    for (known,site) in associated.into_iter().zip(&body.sites) {
+                        if !known {
+                            if let Some((target,_))=find(&site.target) { out.unresolved.insert(target); }
+                        }
+                    }
+                    for call in body.allocation_length_call_targets.values() {
+                        if let Some((target,_))=find(call) { out.unresolved.insert(target); }
+                    }
+                }
+            }
+        }
+        Some(out)
+    }
+
+    pub(super) fn parents(&self,target:PreparedCallable)->Option<&[PreparedCallable]> {
+        if self.unresolved.contains(&target) { return None; }
+        Some(self.parents.get(&target).map(Vec::as_slice).unwrap_or(&[]))
+    }
+}
