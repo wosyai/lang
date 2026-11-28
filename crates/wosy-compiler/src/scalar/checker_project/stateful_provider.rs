@@ -349,6 +349,10 @@ pub(super) struct PendingExternalCall {
     pub(super) declaration: SourceSpan,
     pub(super) signature: CheckedCallSignature,
     pub(super) invocation: Vec<SourceSpan>,
+    pub(super) pending_arguments: Vec<SourceSpan>,
+    // Actual requirements proved on this single observed prefix. These are
+    // not entry summaries and say nothing about post-call state.
+    pub(super) verified_prefix: Vec<SourceSpan>,
 }
 
 fn pending_external_call(
@@ -362,11 +366,22 @@ fn pending_external_call(
         &body.resolved_call_site(expression)?.target else { return None; };
     let signature = body.checked_call_signatures.get(&expression)?;
     if signature.overload.is_some() || signature.overload_origin.is_some() { return None; }
+    let pending_arguments = signature.parameters.iter().enumerate().map(|(slot, ty)| {
+        let OccurrenceNode::Expression(at) = body.structure.edges.get(&(
+            OccurrenceParent::Expression(expression), OccurrenceEdge::CallArgument(slot),
+        ))? else { return None; };
+        if !super::super::scalar_type_equal(body.structure.checked_types.expressions.get(at)?, ty) {
+            return None;
+        }
+        Some(SourceSpan::new(owner.clone(), body.occurrences.get(at.0)?.span))
+    }).collect::<Option<Vec<_>>>()?;
     Some(PendingExternalCall {
         call: SourceSpan::new(owner.clone(), body.occurrences.get(expression.0)?.span),
         declaration: SourceSpan::new(source.clone(), *declaration_span),
         signature: signature.clone(),
         invocation: Vec::new(),
+        pending_arguments,
+        verified_prefix: Vec::new(),
     })
 }
 
@@ -463,6 +478,7 @@ pub(super) fn run<'a>(
     let mut stack=Vec::<Activation>::new();
     let mut tasks=Vec::new();
     let mut work=0usize;
+    let mut verified_prefix = Vec::new();
     let mut traces=trace.then(|| vec![Vec::new()]);
     let mut segments=Vec::new();
     let get_symbol=|table:&mut HashMap<_,_>,target| -> Option<_> {
@@ -565,6 +581,7 @@ pub(super) fn run<'a>(
                 )) {
                     if let Some(mut pending) = pending_external_call(body, owner, *block) {
                         pending.invocation.extend(stack.iter().filter_map(|activation| activation.entered_at.clone()));
+                        pending.verified_prefix = verified_prefix;
                         dispatch.pending_external_call = Some(pending);
                         return None;
                     }
@@ -693,6 +710,7 @@ pub(super) fn run<'a>(
                     REQUIREMENT_RESULTS.with(|log| log.borrow_mut().push((authored,accepted)));
                 }
                 if accepted {
+                    verified_prefix.push(span(site)?);
                     // Require is not a scope-narrowing operation. Its valid
                     // actual state simply follows the next prepared item.
                     values.push(ResultValue::Unit);

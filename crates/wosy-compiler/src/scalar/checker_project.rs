@@ -21482,20 +21482,21 @@ i32(i32) transform=fn(x) { x };
             let run=|state:&mut ProjectedStorage,x:i32,z:i32| {
                 let hits=std::cell::Cell::new(0usize);
                 let reached=std::cell::Cell::new(false);
+                let mut dispatch = stateful_provider::Dispatch::default();
                 let outcome=stateful_provider::run(project,calls,function("rebuild_chunk"),vec![integer(x),integer(z)],
-                    state,true,&mut stateful_provider::Dispatch::default(),&HashMap::new(),&[InitializationVisit::Started],
+                    state,true,&mut dispatch,&HashMap::new(),&[InitializationVisit::Started],
                     false,&reached,|state,cell,ty| {
                         if *ty!=ScalarType::U8 { return None; }
                         let byte=state.observed_u8_array_element(cell)?;
                         if cell.declaration==world { hits.set(hits.get()+1); }
                         Some((ObservedExactValue::Integer(ScalarType::U8,byte.into()),1))
                     },|_,_,_|None);
-                (outcome.is_none(),reached.get(),hits.get())
+                (outcome.is_none(),reached.get(),hits.get(),dispatch.take_pending_external_call())
             };
             let mut unresolved=entry.clone();
             let before=unresolved.clone();
             stateful_provider::take_requirement_results();
-            assert_eq!(run(&mut unresolved,1,1),(true,false,0));
+            assert_eq!(run(&mut unresolved,1,1),(true,false,0,None));
             assert!(stateful_provider::take_requirement_results().is_empty());
             assert_eq!(unresolved,before);
             let mut before_host=entry;
@@ -21505,13 +21506,23 @@ i32(i32) transform=fn(x) { x };
                 before_host.overwrite_u8_array_element(at,if (y,z,x)==(0,12,12) { 3 } else { 0 }).unwrap();
             } } }
             let before=before_host.clone();
-            assert_eq!(run(&mut before_host,1,1),(true,true,3136));
+            let (unsupported, reached, hits, pending) = run(&mut before_host,1,1);
+            assert_eq!((unsupported, reached, hits), (true,true,3136));
+            let pending = pending.expect("mesh host call is reached but not executed");
+            assert_eq!(pending.call.source, source);
+            assert_eq!(pending.declaration.source, source);
+            let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
+            assert_eq!(snippet(pending.declaration.range), "mesh");
+            assert!(snippet(pending.call.range).starts_with("host.mesh("));
+            assert_eq!(pending.pending_arguments.len(), 4);
+            assert_eq!(pending.verified_prefix, [wosy_syntax::SourceSpan::new(source.clone(), required)]);
+
             let observed=stateful_provider::take_requirement_results();
             assert_eq!(observed,vec![(wosy_syntax::SourceSpan::new(source.clone(),required),true)]);
             // The opaque suffix still prevents *any* caller-visible output or
             // writeback, including the mesh built earlier in the activation.
             assert_eq!(before_host,before);
-            assert_eq!(run(&mut before_host,-33,1),(true,true,0));
+            assert_eq!(run(&mut before_host,-33,1),(true,true,0,None));
             assert_eq!(stateful_provider::take_requirement_results(),
                 vec![(wosy_syntax::SourceSpan::new(source.clone(),required),false)]);
             assert_eq!(before_host,before);
@@ -26368,6 +26379,8 @@ unit(u8) parent = fn(a) {
             let call = &packing[pending.call.range.start as usize..pending.call.range.end as usize];
             assert!(call.starts_with("bridge.indexed("));
             assert_eq!(pending.signature.parameters.len(), 7);
+            assert_eq!(pending.pending_arguments.len(), 7);
+            assert_eq!(pending.verified_prefix, [authored.clone()]);
             assert!(pending.invocation.iter().any(|site| site.source == app
                 && passing[site.range.start as usize..site.range.end as usize].starts_with("packing.transmit(")));
             assert!(matches!(prepare(&text).search_startup_authored_path(NonZeroUsize::new(2).unwrap()),Err(ProjectCheck::Unsupported)));
