@@ -166,8 +166,9 @@ def verify_lifecycle(path):
     directory = os.open(path / ".wosy", os.O_RDONLY | os.O_DIRECTORY)
     try:
         fcntl.flock(directory, fcntl.LOCK_EX | fcntl.LOCK_NB)
-        holder = subprocess.Popen([sys.executable, "-c", "import os; os.fstat(1); assert os.read(0, 1) == b''"],
-            stdin=subprocess.PIPE, stdout=directory, stderr=subprocess.PIPE)
+        holder = subprocess.Popen([sys.executable, "-c",
+            "import os, sys; os.fstat(int(sys.argv[1])); assert os.read(0, 1) == b''", str(directory)],
+            stdin=subprocess.PIPE, stdout=subprocess.DEVNULL, stderr=subprocess.PIPE, pass_fds=(directory,))
     finally:
         os.close(directory)
     try:
