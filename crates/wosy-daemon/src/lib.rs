@@ -100,7 +100,7 @@ pub use source_proposal::{
     PreparedPendingPairCallGraphComptime, PreparedPairEvaluatorShape, PreparedPairResultShape, PreparedSourcePublication,
 };
 #[cfg(target_os = "linux")]
-pub use source_proposal::PreparedPairResultIntake;
+pub use source_proposal::{PreparedPairResultIntake, PreparedPairSemanticSnapshot};
 pub use source_reconciliation::SourceReconciliation;
 pub use storage_worker::{RetentionRead, RetentionReadJob, SourceStorageWorker, StorageAdmissionError};
 pub use wosy_protocol::{BuildAnalysisOrigin, BuildAnalysisPhase};

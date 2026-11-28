@@ -500,6 +500,117 @@ impl BoundedPairStartupWasip1Output {
     /// Logical authored bytes, not a Rowan heap/RSS measurement.
     pub fn authored_source_bytes(&self) -> usize { self.ordinary.source_bytes }
 
+    /// Emit the supported closed singleton's ordinary initialization after
+    /// the caller has admitted the exact evaluator results. No export is
+    /// inferred, no source text is rewritten, and no external builder runs.
+    pub fn emit_ordinary_startup(
+        &self, values: &[ScalarExpression],
+    ) -> Result<crate::LlvmPartition, ClosedComptimeRejection> {
+        use ClosedComptimeRejection as Error;
+        let unsupported = |feature| Error::Unsupported { site: self.evidence.site().clone(), feature };
+        if values.len() != self.evaluators.len() {
+            return Err(unsupported("ordinary startup requires exactly the complete typed evaluator result set"));
+        }
+        let typed_value = |ty: &ScalarType, expression: &ScalarExpression| -> Option<DirectComptimeArgument> {
+            match (ty, expression) {
+                (ScalarType::Bool, ScalarExpression::Boolean { value, .. }) => Some(DirectComptimeArgument::Bool(*value)),
+                (ScalarType::I32, ScalarExpression::Integer { value, .. }) =>
+                    i32::try_from(value).ok().map(DirectComptimeArgument::I32),
+                (ScalarType::U32, ScalarExpression::Integer { value, .. }) =>
+                    u32::try_from(value).ok().map(DirectComptimeArgument::U32),
+                _ => None,
+            }
+        };
+        let values = self.evaluators.iter().zip(values).map(|(evaluator, value)| {
+            typed_value(evaluator.result_type(), value).ok_or_else(|| unsupported("ordinary comptime result type changed"))
+        }).collect::<Result<Vec<_>, _>>()?;
+        let literal = |value, span| match value {
+            DirectComptimeArgument::Bool(value) => ScalarExpression::Boolean { value, span },
+            DirectComptimeArgument::I32(value) => ScalarExpression::Integer { value: value.into(), span },
+            DirectComptimeArgument::U32(value) => ScalarExpression::Integer { value: value.into(), span },
+        };
+        let ordinary = self.ordinary_continuation();
+        let site = ordinary.comptime_site();
+        let tail = ordinary.callable_tail();
+        let comptime = ComptimeCst::from_node(&site).ok_or_else(|| unsupported("ordinary comptime site is absent"))?;
+        let body = ScalarExpression::Block(derive_block(&comptime.block));
+        let source = ordinary.canonical_cst();
+        let mut declarations = derive_scalar_declarations_with_embedding(source, Some(EmbeddedComptimeExpression {
+            site: &site, expression: &tail, value: &body,
+        }));
+        if !declarations.diagnostics.is_empty() { return Err(Error::OrdinaryDiagnostics(declarations.diagnostics)); }
+        let count = ordinary.initializers().len();
+        let prefix = declarations.items.len().checked_sub(count)
+            .ok_or_else(|| unsupported("ordinary initializer coverage changed"))?;
+        if prefix == 0 || !declarations.items[..prefix].iter().all(|item| matches!(item, ScalarItem::Function(_))) {
+            return Err(unsupported("ordinary callable prefix changed"));
+        }
+        // The trusted startup analysis admitted only this closed function
+        // prefix and one whole binding per occurrence, with no runtime
+        // entry/export contract for the prefix. Elide it after every
+        // initializer has become its exact compiler-typed result.
+        let mut expected_types = Vec::with_capacity(count);
+        for (item, (initializer, occurrence)) in declarations.items[prefix..].iter_mut().zip(ordinary.initializers()) {
+            let ScalarItem::Binding(binding) = item else { return Err(unsupported("ordinary startup is not a binding")); };
+            let [output] = binding.output_values.as_mut_slice() else {
+                return Err(unsupported("ordinary startup requires one value per binding"));
+            };
+            let (value, call, resolved) = match occurrence {
+                PairStartupOccurrence::Specialization(call, _) =>
+                    (values[call.evaluator_index()], call.facts().call(), call.facts().result().clone()),
+                PairStartupOccurrence::Bypass(bypass) => {
+                    let value = bypass.returned_value();
+                    let resolved = match value {
+                        DirectComptimeArgument::Bool(_) => ScalarType::Bool,
+                        DirectComptimeArgument::I32(_) => ScalarType::I32,
+                        DirectComptimeArgument::U32(_) => ScalarType::U32,
+                    };
+                    (value, bypass.call(), resolved)
+                }
+            };
+            let [receiver] = binding.receivers.as_slice() else {
+                return Err(unsupported("ordinary startup requires one typed receiver"));
+            };
+            if binding.declared_type != resolved || receiver.ty != resolved || output.ty != resolved {
+                return Err(unsupported("ordinary comptime startup requires an explicit matching destination type"));
+            }
+            expected_types.push(resolved);
+            let original = span_of(&binding.value);
+            let enclosure = wosy_syntax::byte_span(&initializer);
+            if original != call.range || enclosure.start > original.start || enclosure.end < original.end {
+                return Err(unsupported("ordinary initializer no longer matches the prepared call"));
+            }
+            binding.value = literal(value, original);
+            output.value = binding.value.clone();
+        }
+        declarations.items.drain(..prefix);
+        let prepared = prepare_scalar_project(
+            vec![(declarations, Vec::new())], vec![source.source.clone()],
+            ScalarPreparationInputs { target_layout: self.evidence.layout() },
+        ).map_err(|error| Error::OrdinaryDiagnostics(error.into_ordered_diagnostics()))?;
+        let [module] = prepared.project().modules.as_slice() else {
+            return Err(unsupported("ordinary continuation produced more than one module"));
+        };
+        if module.items.len() != expected_types.len() {
+            return Err(unsupported("ordinary continuation changed the binding set"));
+        }
+        let facts = prepared.initializer_facts(0)
+            .map_err(|_| unsupported("ordinary continuation typed receiver facts are unavailable"))?;
+        for (item, expected) in module.items.iter().zip(&expected_types) {
+            let ScalarItem::Binding(binding) = item else { return Err(unsupported("ordinary continuation changed a binding")); };
+            let binding = facts.binding_output_expression(binding, 0, &binding.value)
+                .map_err(|_| unsupported("ordinary continuation destination no longer resolves"))?;
+            if binding.ty != expected {
+                return Err(unsupported("ordinary continuation changed a resolved destination type"));
+            }
+        }
+        let validated = analyze_scalar_build(&prepared);
+        if !validated.diagnostics().is_empty() {
+            return Err(Error::OrdinaryDiagnostics(validated.diagnostics().to_vec()));
+        }
+        crate::ScalarArtifactEmission::Singleton.emit(&validated).map_err(Error::Emitter)
+    }
+
     /// Read exactly one bounded value per evaluator in compiler index order.
     /// The caller only supplies terminal bytes; it cannot select their type,
     /// target slot, CST occurrence, or claim that any executable ran.

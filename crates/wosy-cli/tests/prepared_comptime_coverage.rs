@@ -1172,6 +1172,55 @@ u32 different = solve(7, 13);
                 .err().unwrap().to_string().contains("different prepared attempt"));
 
             assert!(store.snapshot(attempt.root()).unwrap().is_none(), "intake does not commit base source");
+            assert!(unrelated_owner.into_semantic_snapshot(same)
+                .err().unwrap().to_string().contains("does not belong"));
+            let result_root = admitted.root();
+            drop(executed);
+            drop(staging);
+            let snapshot = owner.into_semantic_snapshot(admitted).unwrap().unwrap();
+            assert_eq!(snapshot.source(), &binding);
+            assert_eq!(snapshot.result_root(), result_root);
+            let (ordinary, applied_inputs) = snapshot.ordinary_inputs().expect("live attached compiler owner");
+            assert_eq!(ordinary.ordinary_continuation().initializers().count(), 4);
+            assert_eq!(applied_inputs.len(), 2);
+            assert!(snapshot.lease_is_live());
+            let deadline = Duration::from_secs(10);
+            let watch = project.join("watch.txt");
+            fs::write(&watch, b"stale watched input").unwrap();
+            assert!(client.emit_live_pair_ordinary_startup(&snapshot, limits, deadline).unwrap().is_none());
+            fs::write(&watch, b"watched input").unwrap();
+            fs::write(&entry, "%%start\nu32 changed = 0;\n%%end\n").unwrap();
+            assert!(client.emit_live_pair_ordinary_startup(&snapshot, limits, deadline).unwrap().is_none());
+            fs::write(&entry, &source).unwrap();
+            let partition = client.emit_live_pair_ordinary_startup(&snapshot, limits, deadline)
+                .unwrap().expect("ordinary typed result continuation for current source");
+            let mut emitted = Vec::new();
+            partition.write_text(&mut emitted).unwrap();
+            let emitted = String::from_utf8(emitted).unwrap();
+            assert!(emitted.contains("i32 37"), "{emitted}");
+            assert_eq!(emitted.matches("i32 34").count(), 2, "{emitted}");
+            assert!(emitted.contains("i32 10"), "{emitted}");
+            assert!(!emitted.contains("call i32 @solve") && !emitted.contains("call i32 @choose"), "{emitted}");
+            // The ordinary artifact itself, independent of the evaluator
+            // runs, must initialize the real globals in Wasmtime.
+            let ir = fixture.0.join("ordinary-artifact.ll");
+            let runtime = fixture.0.join("ordinary-runtime.ll");
+            let wasm = fixture.0.join("ordinary-artifact.wasm");
+            fs::write(&ir, &emitted).unwrap();
+            fs::write(&runtime, wosy_compiler::core_runtime("llvm", "wasm-wasip1").unwrap()).unwrap();
+            for (expected, exit) in [("10", 0), ("11", 73)] {
+                let status = std::process::Command::new("python3").current_dir(&project)
+                    .args(["ordinary_wasip1_pair.py", "artifact-check"])
+                    .args([&ir, &runtime, &wasm]).arg(expected).status().unwrap();
+                assert_eq!(status.code(), Some(exit));
+            }
+
+
+            drop(snapshot);
+            drop(worker);
+            Arc::try_unwrap(store).ok().unwrap().close().await.unwrap();
+            return;
+
 
         }
 

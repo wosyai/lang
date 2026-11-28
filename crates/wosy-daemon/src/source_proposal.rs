@@ -141,6 +141,7 @@ impl PreparedPendingFirstComptime {
 pub struct PreparedPendingPairCallGraphComptime {
     base: PreparedBaseDeclarations,
     configuration_inputs: NodeId,
+    ordinary_no_exports: bool,
     #[cfg(target_os = "linux")]
     execution_seal: wosy_project::packages::PreparedComptimeExecutionSeal,
     binding: BaseCstProposalBinding,
@@ -191,11 +192,15 @@ fn scalar_argument(value: wosy_compiler::DirectComptimeArgument) -> wosy_protoco
 /// It is not a committed snapshot or evidence of undeclared program reads.
 #[cfg(target_os = "linux")]
 pub struct PreparedPairResultIntake {
+    seal: wosy_project::packages::PreparedComptimeExecutionSeal,
     prepared: PreparedBaseIdentity,
     binding: BaseCstProposalBinding,
     root: wosy_protocol::ComptimeResultRoot,
     values: Vec<wosy_compiler::ScalarExpression>,
     modules: Vec<NodeId>,
+    site: String,
+    profile: String,
+    watches: Vec<wosy_project::packages::WatchedComptimeFile>,
 }
 
 #[cfg(target_os = "linux")]
@@ -205,6 +210,50 @@ impl PreparedPairResultIntake {
     pub fn root(&self) -> wosy_protocol::ComptimeResultRoot { self.root }
     pub fn values(&self) -> &[wosy_compiler::ScalarExpression] { &self.values }
     pub fn modules(&self) -> &[NodeId] { &self.modules }
+}
+
+/// Owned selected semantic inputs for the supported ordinary continuation.
+/// The original prepared source remains alive. This object is not persisted
+/// or used by public Build until the compiler consumes the typed values.
+#[cfg(target_os = "linux")]
+pub struct PreparedPairSemanticSnapshot {
+    identity: NodeId,
+    owner: PreparedPendingPairCallGraphComptime,
+    result: PreparedPairResultIntake,
+}
+
+#[cfg(target_os = "linux")]
+impl PreparedPairSemanticSnapshot {
+    pub fn identity(&self) -> NodeId { self.identity }
+    pub fn result_root(&self) -> wosy_protocol::ComptimeResultRoot { self.result.root }
+    pub fn source(&self) -> &BaseCstProposalBinding { &self.result.binding }
+    pub fn configuration_inputs(&self) -> NodeId { self.owner.configuration_inputs }
+    pub fn site(&self) -> &str { &self.result.site }
+    pub fn profile(&self) -> &str { &self.result.profile }
+    pub fn watches(&self) -> &[wosy_project::packages::WatchedComptimeFile] { &self.result.watches }
+
+    /// The view is borrowed from this owner; final emission/publication
+    /// must make its own lease cut after compilation.
+    pub fn ordinary_inputs(&self) -> Option<(&wosy_compiler::BoundedPairStartupWasip1Output,
+        &[wosy_compiler::ScalarExpression])> {
+        self.owner.base.lease.finish_current(|| {
+            let PendingEntryComptimeProjection::Candidate(RootedPairCallGraphComptimeProjection::Emitted(plan))
+                = &self.owner.projection else { return None; };
+            Some((plan.wasip1_output()?, self.result.values.as_slice()))
+        }).flatten()
+    }
+
+    /// Emit only from this live owned semantic input. A dropped or expired
+    /// prepared owner cannot expose the compiled candidate.
+    pub fn emit_ordinary_startup(&self) -> Result<Option<wosy_compiler::LlvmPartition>> {
+        let Some((plan, values)) = self.ordinary_inputs() else { return Ok(None); };
+        if !self.owner.ordinary_no_exports { return Ok(None); }
+        let emitted = plan.emit_ordinary_startup(values)
+            .map_err(|error| format!("ordinary comptime continuation rejected: {error:?}"))?;
+        Ok(self.owner.base.lease.finish_current(|| emitted))
+    }
+
+    pub fn lease_is_live(&self) -> bool { self.owner.base.lease_is_live() }
 }
 
 #[cfg(target_os = "linux")]
@@ -350,8 +399,30 @@ impl PreparedPendingPairCallGraphComptime {
         }
         let root = ComptimeResultRoot::identify(shape.binding.proposed, shape.target(), shape.profile(), results)?;
         Ok(self.base.lease.finish_current(|| PreparedPairResultIntake {
+            seal: self.execution_seal.clone(),
             prepared: shape.prepared, binding: shape.binding, root, values, modules,
+            site: shape.site, profile: shape.profile, watches: observed.watches().to_vec(),
         }))
+    }
+
+    /// Close the exact live prepared owner around its complete admitted
+    /// result. A different owner is not interchangeable even when the
+    /// prepared digest, source revision and typed values happen to match.
+    #[cfg(target_os = "linux")]
+    pub fn into_semantic_snapshot(self, result: PreparedPairResultIntake) -> Result<Option<PreparedPairSemanticSnapshot>> {
+        if !self.execution_seal.same_owner(&result.seal) || self.base.identity() != result.prepared
+            || self.binding != result.binding
+        {
+            return Err("comptime result does not belong to this prepared semantic snapshot".into());
+        }
+        let Some(shape) = self.result_shape() else { return Ok(None); };
+        if result.values.len() != shape.evaluators.len() || result.modules.len() != shape.evaluators.len() {
+            return Err("prepared semantic snapshot requires all and only the admitted evaluator values".into());
+        }
+        let identity = comptime_digest("Wosy ordinary paired semantic inputs v1",
+            &(self.binding.proposed, shape.target(), shape.profile(), shape.compiler_image(), result.root.identity()))?;
+        let lease = Arc::clone(&self.base.lease);
+        Ok(lease.finish_current(|| PreparedPairSemanticSnapshot { identity, owner: self, result }))
     }
 
     pub fn projection(&self) -> Option<&PendingPairCallGraphComptimeProjection> {
@@ -674,7 +745,7 @@ impl SourceStorageWorker {
     ) -> Result<PreparedPendingPairCallGraphComptime> {
         request.check_selector_bytes()?;
         let captured_binding = binding.clone();
-        let (base, (projection, configuration_inputs)) = self.prepare_base_cst_observing(binding, proposal, request.source_limits,
+        let (base, (projection, configuration_inputs, ordinary_no_exports)) = self.prepare_base_cst_observing(binding, proposal, request.source_limits,
             declaration_bytes, AdmissionLease::Open(lifetime), Some(request.file.clone()), move |store, valid| {
                 let projection = valid.pending_pair_call_graph(store, &request, max_wasip1_stdout)?;
                 let bytes = match &projection {
@@ -685,10 +756,12 @@ impl SourceStorageWorker {
                         },
                     _ => 0,
                 };
-                Ok(((projection, valid.config.inputs), bytes))
+                let ordinary_no_exports = valid.config.profiles.get(&request.profile)
+                    .is_some_and(|profile| profile.backend == "llvm" && profile.output == "wasm-wasip1" && profile.exports.is_none());
+                Ok(((projection, valid.config.inputs, ordinary_no_exports), bytes))
             }).await?;
         Ok(PreparedPendingPairCallGraphComptime {
-            base, binding: captured_binding, projection, configuration_inputs,
+            base, binding: captured_binding, projection, configuration_inputs, ordinary_no_exports,
             #[cfg(target_os = "linux")]
             execution_seal: wosy_project::packages::PreparedComptimeExecutionSeal::fresh(),
         })

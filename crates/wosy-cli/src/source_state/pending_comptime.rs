@@ -151,6 +151,44 @@ impl SqliteSourceState {
         }))
     }
 
+    /// Make a client freshness cut around the opted-in ordinary compiler
+    /// continuation. No external builder or public artifact is selected.
+    #[cfg(target_os = "linux")]
+    pub fn emit_live_pair_ordinary_startup(
+        &mut self, snapshot: &wosy_daemon::PreparedPairSemanticSnapshot,
+        watch_limits: ComptimeWatchLimits, timeout: Duration,
+    ) -> Result<Option<wosy_compiler::LlvmPartition>> {
+        let deadline = Instant::now().checked_add(timeout).ok_or("ordinary continuation deadline overflow")?;
+        if !self.pair_semantic_is_current(snapshot, watch_limits, deadline)? { return Ok(None); }
+        let output = snapshot.emit_ordinary_startup()?;
+        if output.is_none() || !self.pair_semantic_is_current(snapshot, watch_limits, deadline)? {
+            return Ok(None);
+        }
+        Ok(output)
+    }
+
+    #[cfg(target_os = "linux")]
+    fn pair_semantic_is_current(
+        &mut self, snapshot: &wosy_daemon::PreparedPairSemanticSnapshot,
+        watch_limits: ComptimeWatchLimits, deadline: Instant,
+    ) -> Result<bool> {
+        use crate::{project_sources::LiveSourceReader, source_preparation::verify_live_source};
+        let binding = snapshot.source();
+        let Some((configuration, file)) = self.pending_pair_comptime_entry(binding)? else {
+            return Ok(false);
+        };
+        if configuration.inputs != snapshot.configuration_inputs() { return Ok(false); }
+        let files = std::collections::BTreeMap::from([(configuration.entry, file)]);
+        let selected = verify_live_source(&self.project, &binding.selected.target, &files,
+            binding.proposed, LiveSourceReader::new(usize::MAX, deadline.into()), false)?;
+        if selected.is_none() { return Ok(false); }
+        let observed = observe_owned_local_comptime_inputs(&self.project, LocalComptimeInputScope {
+            target: &binding.selected.target, profile: snapshot.profile(), site: snapshot.site(), watch_limits,
+        }, configuration.inputs.0)?;
+        Ok(Instant::now() < deadline && observed.watches() == snapshot.watches()
+            && self.pending_base_is_current(binding)? && snapshot.lease_is_live())
+    }
+
     /// Check the attempt before borrowing trusted facts, and again after
     /// the watch/optional scratch operation. An obsolete completion drops
     /// the staged private files; the SQLite transaction does not span I/O.

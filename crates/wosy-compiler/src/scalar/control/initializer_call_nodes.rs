@@ -374,6 +374,15 @@ impl<'a> InitializerFacts<'a> {
         output: usize,
         call: &ScalarExpression,
     ) -> Result<InitializerBindingOutput<'a>, InitializerFactsError> {
+        if !matches!(call, ScalarExpression::Call { .. }) { return Err(InitializerFactsError::Noncanonical); }
+        self.binding_output_expression(binding, output, call)
+    }
+
+    /// Resolve the canonical receiver for an exact whole binding expression.
+    /// The call-specific caller above retains its additional shape check.
+    pub(crate) fn binding_output_expression(
+        &self, binding: &ScalarBinding, output: usize, expression: &ScalarExpression,
+    ) -> Result<InitializerBindingOutput<'a>, InitializerFactsError> {
         use InitializerFactsError as Error;
         let item = self.root_binding_item(binding)?;
         let BlockItemKind::Binding(region) = self.root_kind(item)? else {
@@ -436,9 +445,8 @@ impl<'a> InitializerFacts<'a> {
             ) if route == ast => &binding.value,
             _ => return Err(Error::Malformed("initializer output origin")),
         };
-        if !std::ptr::eq(ast, call)
-            || self.expression(call)? != ordinal
-            || !matches!(call, ScalarExpression::Call { .. })
+        if !std::ptr::eq(ast, expression)
+            || self.expression(expression)? != ordinal
         {
             return Err(Error::Noncanonical);
         }
@@ -447,7 +455,7 @@ impl<'a> InitializerFacts<'a> {
                 item,
                 output: evaluation,
             },
-            call,
+            expression,
         )?;
         Ok(InitializerBindingOutput {
             destination: SourceSpan::new(self.source.clone(), slot.span),
