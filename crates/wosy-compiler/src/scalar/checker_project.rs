@@ -2534,8 +2534,12 @@ fn try_observed_projected_storage_call(
         } else if !completed_namespace_owner(&actual.project.modules.get(caller)?.source,
             &actual.project.modules.get(child.0)?.source,child.0,Some(visits)) { return None; }
         let allow_failure=authored_units.contains(&child) && history.is_some() && permits_capped_requirement();
+        // Keep the current activation separate from prior calls on this
+        // history: a guard may return before the first authored requirement.
+        let call_reached=std::cell::Cell::new(false);
         let outcome=stateful_provider::run(actual.project,actual.calls,child,args,storage,trace.is_some(),
-            &mut provider_dispatch.borrow_mut(),&productive_ranges,visits,allow_failure,&reached_requirement,&read_array_atom,&read_integer_field);
+            &mut provider_dispatch.borrow_mut(),&productive_ranges,visits,allow_failure,&call_reached,&read_array_atom,&read_integer_field);
+        if call_reached.get() { reached_requirement.set(true); }
         if let Some(stop) = provider_dispatch.borrow_mut().take_stop() {
             // Do not turn an authored pre-host prefix into a completed call,
             // even if its last requirement was proved. Nothing crosses the
@@ -2543,9 +2547,10 @@ fn try_observed_projected_storage_call(
             provider_stop.replace(Some(stop));
             return None;
         }
-        // Extra quota admits an internal refusal only. A completed provider
-        // is not a certificate that a larger public search is exhausted.
-        if authored_units.contains(&child) && !permits_capped_requirement() {return None;}
+        // At a larger remaining quota an activation with no reachable
+        // requirement may return normally. Record its ordinary return; do
+        // not promote a completed *obligation-bearing* row to exhaustion.
+        if call_reached.get() && authored_units.contains(&child) && !permits_capped_requirement() {return None;}
         let (value,result,cost,failure) = outcome?;
 
         if let Some(failure)=failure {
@@ -26365,14 +26370,14 @@ unit(u8) parent = fn(a) {
         let called=text.find(upload_call).unwrap() as u32;
         let upload_call=SourceSpan::new(app.clone(),ByteSpan::new(called,called+upload_call.len() as u32));
         for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
-            let prepare_with=|input,provider_text:&str| prepare_loaded_scalar_ordered_local_proof_contexts(
+            let prepare_with=|input:&str,provider_text:&str| prepare_loaded_scalar_ordered_local_proof_contexts(
                 vec![(declarations(&app,input),vec![ScalarNamespaceBinding {
                     binding:"packing".into(),target:provider.clone(),span:ByteSpan::new(start,start+ns.len() as u32),
                 }]),(declarations(&provider,provider_text),Vec::new())],[],
                 vec![app.clone(),provider.clone()],ScalarPreparationInputs { target_layout },
                 ScalarCheckerScope::MainFlowOnly,Vec::new(),
             ).unwrap();
-            let prepare=|input|prepare_with(input,&packing);
+            let prepare=|input:&str|prepare_with(input,&packing);
             outcomes();
             let (failures,completion,trace,active)=prepare(&text).search_startup_authored_path(NonZeroUsize::MIN).unwrap();
             assert_eq!(outcomes(),[(authored.clone(),false)]);
@@ -26426,6 +26431,40 @@ unit(u8) parent = fn(a) {
                 else { panic!("no indexed host is reached on this row"); };
             assert_eq!(directive,authored);
             assert_eq!(verified_prefix.spans().count(),0);
+            // The provider's own error branch is also a real reached import.
+            // An earlier invalid partition sets failed without modifying the
+            // independently valid authored actuator bounds.
+            let failed=passing.replace("upload_actuators(1,0);","packing.partition(-1,7); upload_actuators(1,0);");
+            outcomes();
+            let Err(ProjectCheck::ProviderStopped(stop))=prepare(&failed).search_startup_authored_path(NonZeroUsize::new(2).unwrap())
+                else {panic!("expected original provider error branch");};
+            let stateful_provider::ProviderStop::External(host)=*stop else {panic!("expected sentinel import");};
+            assert!(host.verified_prefix.spans().eq([authored.clone()]));
+            let [ArrayAddress(p),Integer(_,nf),ArrayAddress(i),Integer(_,ni),Integer(_,kind),Integer(_,fv),Integer(_,fi)] =
+                host.operand_prefix.as_slice() else { panic!("sentinel operands: {:?}",host.operand_prefix); };
+            assert_eq!((decl(p),decl(i)),("positions","indices"));
+            assert_eq!(&*p.indices,&[0,0,0,0,0]); assert_eq!(&*i.indices,&[0,0,0,0]);
+            assert_eq!([nf,ni,kind,fv,fi].map(|n|i32::try_from(n).unwrap()),[-1,-1,2,0,0]);
+            assert_eq!(outcomes(),[(authored.clone(),true)]);
+            // Both original guard exits are real completed calls. Neither
+            // hides the later require or invents a host result at quota two.
+            for (input,passes) in [(&text,false),(&passing,true)] {
+                let chain=input.replace("upload_actuators(1,0);",
+                    "upload_actuators(0,0); upload_actuators(1,5); upload_actuators(1,0);");
+                outcomes();
+                let Err(ProjectCheck::ProviderStopped(stop))=prepare(&chain).search_startup_authored_path(NonZeroUsize::new(2).unwrap())
+                    else {panic!("two guard returns must reach the original live call");};
+                assert_eq!(outcomes(),[(authored.clone(),passes)]);
+                match (*stop,passes) {
+                    (stateful_provider::ProviderStop::External(host),true)=>{
+                        assert!(host.verified_prefix.spans().eq([authored.clone()]));
+                        assert_eq!(host.operand_prefix.len(),7);
+                    }
+                    (stateful_provider::ProviderStop::RefutedRow {directive,..},false)=>assert_eq!(directive,authored),
+                    _=>panic!("wrong outcome after completed guard exits"),
+                }
+                assert!(matches!(prepare(&chain).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
+            }
             assert!(matches!(prepare(&text).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
             assert!(matches!(prepare(&passing).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
             eprintln!("Orbital original upload_actuators {target_layout:?}: false author emits literal 73 only when capped; true and all continue to unresolved host");
