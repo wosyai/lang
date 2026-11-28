@@ -2967,23 +2967,21 @@ fn run_initializer_call<'a, Observer: ActualIntegerObserver>(
     let signature = topology.checked_call_signatures.get(&occurrence).ok_or(ProjectCheck::MissingRootOccurrences)?;
     #[cfg(feature = "internal-checker")]
     if *expected == ScalarType::Unit && pair_receivers.is_none() && proof_site.is_none() {
-        if let Some((wrapper, callback, owner, body, value)) =
+        if let Some((wrapper, callback, owner, body, value, forwarded_call)) =
             actual.exact_startup_callable_forwarder(topology, occurrence, declaration, signature, &initialized_argument)
         {
-            let ordered = collection.map(|(_, ordered)| ordered);
-            if ordered.is_none_or(|ordered| ordered.failures.borrow().startup_search.is_none())
-                && !actual.active.contains(&wrapper) && !actual.active.contains(&callback)
-                && actual.active_depth <= MAX_ACTUAL_CALL_DEPTH.saturating_sub(2)
+            let ordered = collection.map(|(_, ordered)| OrderedCallCollection {
+                startup_forwarded_call: Some((&declaration.source, forwarded_call)), ..ordered
+            });
+            if !actual.active.contains(&wrapper) && !actual.active.contains(&callback)
             {
                 actual.note_reached(wrapper);
                 actual.note_reached(callback);
                 actual.active.insert(wrapper);
                 actual.active.insert(callback);
-                actual.active_depth += 2;
                 let result = actual.run_exact_calls::<false>(
                     body, &owner.source, &[value], expected, ordered, None,
                 );
-                actual.active_depth -= 2;
                 actual.active.remove(&callback);
                 actual.active.remove(&wrapper);
                 return result;
@@ -3606,6 +3604,8 @@ struct OrderedCallCollection<'a, 'visits> {
     #[cfg(feature = "internal-checker")]
     startup_site_source: Option<&'a SourceIdentity>,
     #[cfg(feature = "internal-checker")]
+    startup_forwarded_call: Option<(&'a SourceIdentity, ByteSpan)>,
+    #[cfg(feature = "internal-checker")]
     plain_unit_root: bool,
 }
 
@@ -3623,6 +3623,8 @@ impl<'a, 'visits> OrderedCallCollection<'a, 'visits> {
             startup_site: None,
             #[cfg(feature = "internal-checker")]
             startup_site_source: None,
+            #[cfg(feature = "internal-checker")]
+            startup_forwarded_call: None,
             #[cfg(feature = "internal-checker")]
             plain_unit_root: false,
         }
@@ -4412,7 +4414,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         &self, topology: &'a ModuleInitializationTopology, occurrence: OccurrenceOrdinal,
         declaration: &wosy_syntax::SourceSpan, signature: &CheckedCallSignature,
         argument: &impl Fn(OccurrenceOrdinal, &ScalarType) -> Option<&'a BigInt>,
-    ) -> Option<(PreparedCallable, PreparedCallable, &'project ScalarModule, &'project FunctionCallSites, &'a BigInt)> {
+    ) -> Option<(PreparedCallable, PreparedCallable, &'project ScalarModule, &'project FunctionCallSites, &'a BigInt, ByteSpan)> {
         use super::reference::{OccurrenceEdge, OccurrenceNode, OccurrenceParent, PlainNameIdentity};
         let (wrapper, owner, _, body) = self.validated_direct_body(
             &topology.structure, occurrence, &declaration.source, declaration.range,
@@ -4457,7 +4459,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
         if callback == wrapper || callback_body.contextual_formal().is_some() { return None; }
         let (value_ty, value) = exact_typed_call_argument_at(&topology.structure, occurrence, 1, false, argument)?;
         (value_ty == input && integer_literal_fits_type(value, input))
-            .then_some((wrapper, callback, owner, callback_body, value))
+            .then_some((wrapper, callback, owner, callback_body, value, body.occurrences.get(call.0)?.span))
     }
 
     fn validated_prepared_body(
@@ -4555,6 +4557,11 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             let at = wosy_syntax::SourceSpan::new(site_source.clone(), at);
             let trace = ordered.failures.borrow().startup_search.clone().ok_or(ProjectCheck::Unsupported)?;
             trace.borrow_mut().append(failure_search::PathStep::Call(at.clone())).ok_or(ProjectCheck::Unsupported)?;
+            let forwarded = ordered.startup_forwarded_call
+                .map(|(owner, span)| wosy_syntax::SourceSpan::new(owner.clone(), span));
+            if let Some(inner) = &forwarded {
+                trace.borrow_mut().append(failure_search::PathStep::Call(inner.clone())).ok_or(ProjectCheck::Unsupported)?;
+            }
             #[cfg(test)]
             if trace.borrow().ranked_target.is_some_and(|target|
                 self.calls.function_body(target.0, target.1, None).is_some_and(|rank| std::ptr::eq(rank, body))) {
@@ -4572,7 +4579,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
                 cursor.allow_snapshot_history();
             }
             cursor.track_startup_path(source, Rc::clone(&trace), exact_bool).ok_or(ProjectCheck::Unsupported)?;
-            Some((at, trace, exact_bool))
+            Some((at, trace, exact_bool, forwarded))
         } else { None };
         let mut frames = vec![ExactCallActivation { body, source, cursor, entry, followed_self_edge: false,
             #[cfg(feature = "internal-checker")]
@@ -4596,7 +4603,7 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             }
         }
         #[cfg(feature = "internal-checker")]
-        if let Some((site, trace, exact_bool)) = authored_site {
+        if let Some((site, trace, exact_bool, forwarded)) = authored_site {
             if trace.borrow().invalid() { return Err(ProjectCheck::Unsupported); }
             if trace.borrow().remaining() == 0 && trace.borrow().cannot_continue() { return Err(ProjectCheck::StartupAuthoredLimitReached); }
             let completed = match &result {
@@ -4606,6 +4613,9 @@ impl<'project, Observer: ActualIntegerObserver, const ACTUAL_STARTUP: bool> Chec
             };
             if exact_bool && result.is_ok() && !completed { return Err(ProjectCheck::Unsupported); }
             if completed {
+                if let Some(inner) = forwarded {
+                    trace.borrow_mut().append(failure_search::PathStep::Return(inner)).ok_or(ProjectCheck::Unsupported)?;
+                }
                 trace.borrow_mut().append(failure_search::PathStep::Return(site)).ok_or(ProjectCheck::Unsupported)?;
             }
         }
@@ -23573,7 +23583,6 @@ i32(i32) transform=fn(x) { x };
 
     #[cfg(feature = "internal-checker")]
     #[test]
-    #[ignore = "checker does not yet transfer a concrete callable through an actual formal"]
     fn prepared_actual_callable_formal_preserves_callback_guard() {
         let app = source("src/main.w", "prepared-actual-callable-formal");
         for target_layout in [ScalarTargetLayout::NATIVE64, ScalarTargetLayout::WASM32] {
@@ -23592,6 +23601,13 @@ i32(i32) transform=fn(x) { x };
                 ).expect("the exact prepared callback must be checked in its real startup context");
                 assert!(active);
                 assert_eq!(failures.len(), expected);
+                let (reported, completion, _, active) = run_startup_authored_path(
+                    &prepared, Some(std::num::NonZeroUsize::MIN), &[], false, &[],
+                    Some(&[]), None, false, None,
+                ).expect("the capped production route must preserve the concrete callback");
+                assert!(active);
+                assert_eq!(reported.len(), expected);
+                assert_eq!(completion == StartupAuthoredCompletion::LimitReached, expected == 1);
             }
         }
     }
