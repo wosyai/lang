@@ -116,14 +116,23 @@ pub(crate) fn execute_selected_concrete_wasip1(
     private_parent: &Path, max_ir_bytes: usize, max_module_bytes: u64, max_stdout: usize,
     deadline: std::time::Instant, cancelled: &impl Fn() -> bool,
 ) -> io::Result<wosy_project::packages::OwnedLocalComptimeExecution> {
-    use wosy_project::packages::{execute_observed_comptime_set, observe_owned_local_comptime_inputs, LocalComptimeInputScope};
-    let staged = observe_owned_local_comptime_inputs(project, LocalComptimeInputScope {
+    use wosy_project::packages::{execute_observed_comptime_set, execute_streamed_comptime_set,
+        observe_owned_comptime_inputs_with_scratch, LocalComptimeInputScope, StreamedComptimeStageLimits};
+    let (staged, may_watch_scratch) = observe_owned_comptime_inputs_with_scratch(project, LocalComptimeInputScope {
         target: scope.target, profile: scope.profile, site: scope.site, watch_limits: scope.watch_limits,
-    }, expected_config).map_err(io::Error::other)?;
+    }, expected_config, private_parent).map_err(io::Error::other)?;
     require_no_parameters(!staged.declarations().parameters().is_empty())?;
-    let files = stage_concrete_evaluators(evaluators, private_parent, max_ir_bytes)?;
-    execute_observed_comptime_set(project, scope, expected_config, attempt, staged.watches(),
-        &evaluator_stages(&files, max_module_bytes, max_stdout), deadline, cancelled)
+    if may_watch_scratch {
+        // Preserve the prior stage visibility for an explicitly selected
+        // watch that can enter this directory. No restriction on the build.
+        let files = stage_concrete_evaluators(evaluators, private_parent, max_ir_bytes)?;
+        return execute_observed_comptime_set(project, scope, expected_config, attempt, staged.watches(),
+            &evaluator_stages(&files, max_module_bytes, max_stdout), deadline, cancelled);
+    }
+    execute_streamed_comptime_set(project, scope, expected_config, attempt, staged.watches(),
+        evaluators.iter().map(BoundedStartupWasip1Evaluator::bytes), StreamedComptimeStageLimits {
+            private_parent, aggregate_ir_bytes: max_ir_bytes, module_bytes: max_module_bytes, stdout_bytes: max_stdout,
+        }, deadline, cancelled)
 }
 
 /// Run exactly the selected closed site's one evaluator using the same

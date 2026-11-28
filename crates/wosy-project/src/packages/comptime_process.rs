@@ -2,7 +2,7 @@
 //! hidden environment inputs, or admit anything to a compiler snapshot.
 
 use std::{
-    ffi::{OsStr, OsString}, io::{self, Read}, os::fd::AsRawFd, path::{Path, PathBuf},
+    ffi::{OsStr, OsString}, io::{self, Read, Write}, os::fd::AsRawFd, path::{Path, PathBuf},
     process::{Child, Command, ExitStatus, Stdio}, thread::sleep, time::{Duration, Instant},
 };
 
@@ -239,6 +239,7 @@ pub struct ComptimeExecutionAttempt {
     pub authored_cst: [u8; 32],
 }
 
+#[derive(Clone, Copy)]
 pub struct ComptimeEvaluatorStage<'a> {
     pub scratch: &'a super::ComptimeScratch,
     pub inputs: StagedComptimePairInputs,
@@ -263,6 +264,58 @@ pub fn execute_observed_comptime_set(
     attempt: ComptimeExecutionAttempt, staged_watches: &[super::WatchedComptimeFile],
     stages: &[ComptimeEvaluatorStage<'_>],
     deadline: Instant, cancelled: &impl Fn() -> bool,
+) -> io::Result<OwnedLocalComptimeExecution> {
+    execute_owned_comptime_sequence(project, scope, expected_config, attempt, staged_watches,
+        deadline, cancelled, |run| {
+            stages.iter().try_for_each(|stage| run(*stage))
+        })
+}
+
+pub struct StreamedComptimeStageLimits<'a> {
+    pub private_parent: &'a Path,
+    pub aggregate_ir_bytes: usize,
+    pub module_bytes: u64,
+    pub stdout_bytes: usize,
+}
+
+/// Run the same selected tool sequence, but keep only the current
+/// evaluator's owned scratch open. Receipts retain observations, not
+/// workspace paths as a continued authority over removed modules.
+pub fn execute_streamed_comptime_set<'ir>(
+    project: &Path, scope: super::LocalComptimeInputScope<'_>, expected_config: [u8; 32],
+    attempt: ComptimeExecutionAttempt, staged_watches: &[super::WatchedComptimeFile],
+    irs: impl Iterator<Item = &'ir [u8]> + Clone, limits: StreamedComptimeStageLimits<'_>,
+    deadline: Instant, cancelled: &impl Fn() -> bool,
+) -> io::Result<OwnedLocalComptimeExecution> {
+    // As with full staging, reject an impossible explicit IR budget
+    // before any external process. No added limit on evaluator count.
+    irs.clone().try_fold(limits.aggregate_ir_bytes, |remaining, ir| {
+        remaining.checked_sub(ir.len()).ok_or_else(|| io::Error::other("selected comptime evaluator IR exceeds requested budget"))
+    })?;
+    execute_owned_comptime_sequence(project, scope, expected_config, attempt, staged_watches,
+        deadline, cancelled, |run| {
+            for ir in irs {
+                check_tool_budget(deadline, cancelled)?;
+                let scratch = super::ComptimeScratch::create(limits.private_parent)?;
+                scratch.create_ir()?.write_all(ir)?;
+                scratch.create_manifest()?.write_all(&empty_wasip1_comptime_manifest(&scratch.module_path())?)?;
+                run(ComptimeEvaluatorStage {
+                    scratch: &scratch,
+                    inputs: StagedComptimePairInputs { ir_bytes: ir.len(), ir: blake3::hash(ir),
+                        max_module_bytes: limits.module_bytes, max_stdout: limits.stdout_bytes },
+                })?;
+                // Drop before another stage can acquire disk storage or
+                // descriptors, on success as well as any early return.
+            }
+            Ok(())
+        })
+}
+
+fn execute_owned_comptime_sequence(
+    project: &Path, scope: super::LocalComptimeInputScope<'_>, expected_config: [u8; 32],
+    attempt: ComptimeExecutionAttempt, staged_watches: &[super::WatchedComptimeFile],
+    deadline: Instant, cancelled: &impl Fn() -> bool,
+    visit: impl FnOnce(&mut dyn FnMut(ComptimeEvaluatorStage<'_>) -> io::Result<()>) -> io::Result<()>,
 ) -> io::Result<OwnedLocalComptimeExecution> {
     fn invoke<'a, const N: usize>(
         project: &'a Path, command: &'a [String], args: &'a [String], suffix: [&'a Path; N],
@@ -289,16 +342,18 @@ pub fn execute_observed_comptime_set(
     let tools = before.declarations().tools();
     let (_, builder) = tools.builder();
     let (_, runner) = tools.runner();
-    let pairs = stages.iter().map(|stage| {
+    let mut pairs = Vec::new();
+    visit(&mut |stage| {
         let ir = stage.scratch.ir_path();
         let manifest = stage.scratch.manifest_path();
-        stage.scratch.execute_staged_comptime_pair(
+        pairs.push(stage.scratch.execute_staged_comptime_pair(
             stage.inputs,
             invoke(project, &builder.command, &builder.args, [&ir, stage.scratch.output_dir(), &manifest]),
             invoke(project, &runner.command, &runner.args, [&manifest]),
             deadline, cancelled,
-        )
-    }).collect::<io::Result<Vec<_>>>()?;
+        )?);
+        Ok(())
+    })?;
     let after = observe()?;
     check_tool_budget(deadline, cancelled)?;
     if before.watches() != after.watches() {

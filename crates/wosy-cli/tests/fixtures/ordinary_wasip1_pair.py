@@ -5,6 +5,20 @@ import subprocess
 import sys
 import tempfile
 
+def sample_evaluator_scratch(module):
+    if not Path("audit-evaluator-footprint").exists():
+        return
+    active = list(module.parent.parent.glob("wosy-evaluator-*"))
+    count = sum(
+        file.stat().st_size
+        for stage in active
+        for file in (stage / "evaluator.ll", stage / "comptime-manifest", stage / "evaluator.module")
+        if file.is_file()
+    )
+    with Path("evaluator-footprint").open("a") as log:
+        print(len(active), count, file=log)
+
+
 operation, *args = sys.argv[1:]
 if operation == "build":
     if Path("audit-compiler-reuse").exists():
@@ -35,7 +49,9 @@ attributes #0 = { noreturn "wasm-import-module"="wasi_snapshot_preview1" "wasm-i
         subprocess.run(["wasm-ld", "--no-entry", "--export=_start", "--export-memory",
                         f"--allow-undefined-file={allowed}", directory / "evaluator.o",
                         directory / "start.o", "-o", module], check=True)
-elif operation in ("artifact-check", "artifact-build", "artifact-build-min", "artifact-build-ordered", "artifact-build-exported"):
+    sample_evaluator_scratch(module)
+elif operation in ("artifact-check", "artifact-build", "artifact-build-min", "artifact-build-ordered",
+                   "artifact-build-exported", "artifact-build-footprint"):
     if operation == "artifact-check":
         ir, runtime, output = map(Path, args[:3])
         expected = int(args[3])
@@ -61,12 +77,17 @@ elif operation in ("artifact-check", "artifact-build", "artifact-build-min", "ar
         north = 11 if Path("different-result").exists() else 10
         returns = {"first": 34, "again": 34, "other": north}
         checks = [(label, returns[declaration]) for label, declaration in roster.items()]
+    elif operation == "artifact-build-footprint":
+        checks = list(json.loads(Path("expected-exports.json").read_text()).items())
+        with Path("footprint-final-builds").open("ab") as log:
+            log.write(b"build\n")
     else:
         checks = [("bypass", 37), ("first", 34), ("repeated", 34), ("different", expected)]
+    export_check = operation in ("artifact-build-exported", "artifact-build-footprint")
     checker = []
     previous = "true"
     for index, (binding, value) in enumerate(checks):
-        read = f"call i32 @{binding}()" if operation == "artifact-build-exported" else f"load i32, ptr @{binding}"
+        read = f"call i32 @{binding}()" if export_check else f"load i32, ptr @{binding}"
         checker.append(f"  %v{index} = {read}")
         checker.append(f"  %q{index} = icmp eq i32 %v{index}, {value}")
         checker.append(f"  %all{index} = and i1 {previous}, %q{index}")
@@ -106,7 +127,7 @@ attributes #0 = { noreturn "wasm-import-module"="wasi_snapshot_preview1" "wasm-i
             subprocess.run(["clang", "--target=wasm32-wasi", "-c", "-x", "ir",
                             source, "-o", object_file], check=True)
             objects.append(object_file)
-        exports = [f"--export={name}" for name, _ in checks] if operation == "artifact-build-exported" else []
+        exports = [f"--export={name}" for name, _ in checks] if export_check else []
         subprocess.run(["wasm-ld", "--no-entry", "--export=_start", "--export-memory", *exports,
                         f"--allow-undefined-file={allowed}", *objects, "-o", output], check=True)
     if operation == "artifact-check":
@@ -130,6 +151,9 @@ elif operation == "ordered-run":
         with Path("evaluator-order").open("ab") as log:
             log.write(result)
         if result == b"10\n" and Path("refuse-second-evaluator").exists():
+            sys.exit(74)
+        refused = Path("refuse-evaluator-output")
+        if refused.is_file() and result == refused.read_bytes():
             sys.exit(74)
     sys.stdout.buffer.write(result)
     sys.exit(completed.returncode)

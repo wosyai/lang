@@ -63,14 +63,37 @@ pub fn observe_owned_local_comptime_inputs(
 ) -> Result<OwnedLocalComptimeInputs, String> {
     let site = scope.site.to_owned();
     let (declarations, watches) = observe_local_comptime_inputs(root, scope, |manifest| {
-        if compiler_source_configuration_identity(manifest, &std::collections::BTreeMap::new())? != expected {
-            return Err("local comptime configuration changed after source staging".into());
-        }
-        Ok(())
+        authorize_local_input_manifest(manifest, expected)
     })?;
     Ok(OwnedLocalComptimeInputs {
         project: root.to_owned(), site, configuration_identity: expected, declarations, watches,
     })
+}
+
+fn authorize_local_input_manifest(manifest: &str, expected: [u8; 32]) -> Result<(), String> {
+    if compiler_source_configuration_identity(manifest, &std::collections::BTreeMap::new())? != expected {
+        return Err("local comptime configuration changed after source staging".into());
+    }
+    Ok(())
+}
+
+/// Determine whether the exact declared watch automaton can enter the
+/// canonical owner-private scratch subtree, as part of the same observation.
+#[cfg(target_os = "linux")]
+pub fn observe_owned_comptime_inputs_with_scratch(
+    root: &Path, scope: LocalComptimeInputScope<'_>, expected: [u8; 32], scratch_parent: &Path,
+) -> Result<(OwnedLocalComptimeInputs, bool), String> {
+    let scratch = scratch_parent.canonicalize().map_err(|error| error.to_string())?;
+    let root = root.canonicalize().map_err(|error| error.to_string())?;
+    let relative = scratch.strip_prefix(&root).ok();
+    let (declarations, mut selected) = linux::observe_local_comptime_sites_with_scratch(
+        &root, scope.target, scope.profile, &[scope.site], scope.watch_limits, relative,
+        |manifest| authorize_local_input_manifest(manifest, expected),
+    )?;
+    let (watches, may_watch_scratch) = selected.pop().expect("one requested watch list");
+    Ok((OwnedLocalComptimeInputs {
+        project: root, site: scope.site.to_owned(), configuration_identity: expected, declarations, watches,
+    }, may_watch_scratch))
 }
 
 /// Capture every selected watch list against one anchored manifest/profile
@@ -81,10 +104,7 @@ pub fn observe_owned_local_comptime_watch_batch(
     limits: ComptimeWatchLimits, expected: [u8; 32],
 ) -> Result<(ObservedClosedComptimeProfile, Vec<Vec<WatchedComptimeFile>>), String> {
     linux::observe_local_comptime_sites(root, target, profile, sites, limits, |manifest| {
-        if compiler_source_configuration_identity(manifest, &std::collections::BTreeMap::new())? != expected {
-            return Err("local comptime configuration changed after source staging".into());
-        }
-        Ok(())
+        authorize_local_input_manifest(manifest, expected)
     })
 }
 
@@ -146,6 +166,18 @@ mod linux {
         root: &Path, target: &str, profile: &str, sites: &[&str], limits: ComptimeWatchLimits,
         authorize_manifest: impl FnOnce(&str) -> Result<(), String>,
     ) -> Result<(ObservedClosedComptimeProfile, Vec<Vec<WatchedComptimeFile>>), String> {
+        let (profile, results) = observe_local_comptime_sites_with_scratch(
+            root, target, profile, sites, limits, None, authorize_manifest,
+        )?;
+        Ok((profile, results.into_iter().map(|(watches, _)| watches).collect()))
+    }
+
+    type ScopedWatchObservations = Vec<(Vec<WatchedComptimeFile>, bool)>;
+
+    pub(super) fn observe_local_comptime_sites_with_scratch(
+        root: &Path, target: &str, profile: &str, sites: &[&str], limits: ComptimeWatchLimits,
+        scratch_relative: Option<&Path>, authorize_manifest: impl FnOnce(&str) -> Result<(), String>,
+    ) -> Result<(ObservedClosedComptimeProfile, ScopedWatchObservations), String> {
         use super::super::{snapshot::MANIFEST, ProjectSnapshot, LOCKFILE};
         let (mut snapshot, directory) = ProjectSnapshot::anchored_compiler_reader(root)?;
         let bytes = observed_metadata(&directory, MANIFEST)?.ok_or("watched-project manifest is missing")?;
@@ -164,12 +196,18 @@ mod linux {
         for site in sites {
             let globs = declarations(&document, site, "watch")?;
             let mut watches = Vec::new();
+            let mut may_watch_scratch = false;
             if !globs.is_empty() {
+                let (patterns, states) = Patterns::compile(&globs);
+                if let Some(relative) = scratch_relative {
+                    may_watch_scratch = patterns.may_enter(&states, relative);
+                }
                 let mut budget = limits;
-                resolve(&directory, WatchRoot::OwningPackage, &globs, &mut budget, &mut watches)?;
+                Walker { root: WatchRoot::OwningPackage, patterns, budget: &mut budget, result: &mut watches }
+                    .walk(directory.clone(), states)?;
                 order_watches(&mut watches);
             }
-            results.push(watches);
+            results.push((watches, may_watch_scratch));
         }
         Ok((selected, results))
     }
@@ -335,6 +373,16 @@ mod linux {
                 if !matches!(self.components[component], Component::Recursive) { break; }
                 state = next;
             }
+        }
+
+        fn may_enter(&self, start: &BTreeSet<Cursor>, relative: &Path) -> bool {
+            let mut states = start.clone();
+            for part in relative.components() {
+                let Some(name) = part.as_os_str().to_str() else { return true; };
+                states = self.after_name(&states, name);
+                if states.is_empty() { return false; }
+            }
+            states.into_iter().any(|state| state != ACCEPT)
         }
 
         fn after_name(&self, states: &BTreeSet<Cursor>, name: &str) -> BTreeSet<Cursor> {

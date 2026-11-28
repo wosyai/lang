@@ -32,9 +32,9 @@ pub use artifact_generation::{PreparedArtifactGeneration, SelectedArtifactGenera
 pub use comptime_scratch::ComptimeScratch;
 #[cfg(target_os = "linux")]
 pub use comptime_process::{empty_wasip1_comptime_manifest, execute_selected_comptime_tool, ComptimeToolInvocation, OwnedComptimeToolResult, OwnedStagedComptimePair, StagedComptimePairInputs,
-    execute_observed_comptime_set, ComptimeEvaluatorStage, ComptimeExecutionAttempt, OwnedLocalComptimeExecution, PreparedComptimeExecutionSeal};
+    execute_observed_comptime_set, execute_streamed_comptime_set, ComptimeEvaluatorStage, StreamedComptimeStageLimits, ComptimeExecutionAttempt, OwnedLocalComptimeExecution, PreparedComptimeExecutionSeal};
 #[cfg(target_os = "linux")]
-pub use comptime_watches::observe_owned_local_comptime_watch_batch;
+pub use comptime_watches::{observe_owned_comptime_inputs_with_scratch, observe_owned_local_comptime_watch_batch};
 pub use comptime_watches::{compiler_source_configuration_identity, observe_comptime_watches, observe_local_comptime_inputs,
     observe_owned_local_comptime_inputs, OwnedLocalComptimeInputs, ComptimeWatchLimits,
     LocalComptimeInputScope, WatchedComptimeFile, WatchRoot};
