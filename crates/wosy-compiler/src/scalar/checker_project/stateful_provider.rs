@@ -342,15 +342,16 @@ pub(super) fn qualified_store_reachable(project:&ScalarProject,calls:&ProjectCal
 }
 
 /// A reached prepared expression, not an executed foreign operation.
-/// The unsafe argument evaluation, external outcome and foreign memory
-/// effects have not been modeled, so no continuation row can be derived.
+/// The pure operand prefix is known on this row; foreign effects and
+/// results are not modeled and cannot produce a continuation row.
 #[derive(Debug, PartialEq)]
 pub(super) struct PendingExternalCall {
     pub(super) call: SourceSpan,
     pub(super) declaration: SourceSpan,
     pub(super) signature: CheckedCallSignature,
     pub(super) invocation: Vec<SourceSpan>,
-    pub(super) pending_arguments: Vec<SourceSpan>,
+    pub(super) argument_sites: Vec<SourceSpan>,
+    pub(super) operand_prefix: Vec<ForeignOperand>,
     // Actual requirements proved on this single observed prefix. These are
     // not entry summaries and say nothing about post-call state.
     pub(super) verified_prefix: VerifiedRequirePrefix,
@@ -380,8 +381,88 @@ impl VerifiedRequirePrefix {
     }
 }
 
+/// A proved value before the host call. An address is only a symbolic
+/// allocation and element; it has no numeric address or memory contents.
+#[derive(Debug, PartialEq)]
+pub(super) enum ForeignOperand {
+    Integer(ScalarType, BigInt),
+    ArrayAddress(observed_f32_array::Cell),
+}
+
+// This projection is deliberately pure: unlike the ordinary interpreter it
+// cannot execute calls, change storage, or bypass an earlier unknown operand.
+fn foreign_integer(
+    body: &FunctionCallSites, root: OccurrenceOrdinal, frame: &Activation,
+    storage: &ProjectedStorage, owner: &SourceIdentity,
+) -> Option<ExactValue> {
+    enum Step { Read(OccurrenceOrdinal), Binary(BinaryOperator, ScalarType), Negate(ScalarType) }
+    let st = &body.structure;
+    let mut pending = vec![Step::Read(root)];
+    let mut values = Vec::new();
+    while let Some(step) = pending.pop() {
+        match step {
+            Step::Read(at) => {
+                let ty = st.checked_types.expressions.get(&at)?;
+                if st.checker_contextual_occurrences.contains(&at) { return None; }
+                if let Some(literal) = st.prepared_range_literals.get(&at) {
+                    if !integer_literal_fits_type(literal, ty) { return None; }
+                    values.push(ExactValue::Integer(ty.clone(), literal.clone()));
+                } else if let Some(name) = body.prepared_plain_name(at) {
+                    let value = match name {
+                        PlainNameIdentity::Lexical(id) => frame.slots.get(id)?.clone(),
+                        PlainNameIdentity::ModuleValue(decl) if &decl.source == owner => storage.observed_atom(decl)?,
+                        _ => return None,
+                    };
+                    if !matches!(&value, ExactValue::Integer(t,_) if t == ty) { return None; }
+                    values.push(value);
+                } else if let Some((l,op,r)) = st.prepared_range_binary.get(&at).or_else(|| st.prepared_integer_bitwise.get(&at)) {
+                    pending.extend([Step::Binary(op.clone(),ty.clone()), Step::Read(*r), Step::Read(*l)]);
+                } else if let Some(child) = st.observed_integer_negations.get(&at) {
+                    pending.extend([Step::Negate(ty.clone()), Step::Read(*child)]);
+                } else { return None; }
+            }
+            Step::Binary(op, ty) => {
+                let right=values.pop()?;
+                let result=ordinary_binary(&op,values.pop()?,right)?;
+                if !matches!(&result,ExactValue::Integer(t,_) if *t==ty) { return None; }
+                values.push(result);
+            }
+            Step::Negate(ty) => {
+                let ExactValue::Integer(t, value)=values.pop()? else {return None;};
+                let value= -value;
+                if t!=ty || !integer_literal_fits_type(&value,&ty) {return None;}
+                values.push(ExactValue::Integer(ty,value));
+            }
+        }
+    }
+    values.pop().filter(|_|values.is_empty())
+}
+
+fn foreign_operand(
+    body: &FunctionCallSites, at: OccurrenceOrdinal, frame:&Activation,
+    storage:&ProjectedStorage, owner:&SourceIdentity,
+) -> Option<ForeignOperand> {
+    let st=&body.structure;
+    let Some(ResolvedCallTarget::Core(super::super::CoreOperationId::PointerCast))=body.resolved_call_site(at).map(|site|&site.target) else {
+        let ExactValue::Integer(ty,value)=foreign_integer(body,at,frame,storage,owner)? else {return None;};
+        return Some(ForeignOperand::Integer(ty,value));
+    };
+    let cast=body.checked_call_signatures.get(&at)?;
+    if cast.overload.is_some() || cast.overload_origin.is_some() {return None;}
+    let [ScalarType::RawPointer(element)]=cast.parameters.as_slice() else {return None;};
+    let [out]=cast.outputs.outputs.as_slice() else {return None;};
+    if !matches!(&out.ty,ScalarType::RawPointer(_)) || st.checked_types.expressions.get(&at)?!=&out.ty {return None;}
+    let OccurrenceNode::Expression(arg)=*st.edges.get(&(OccurrenceParent::Expression(at),OccurrenceEdge::CallArgument(0)))? else {return None;};
+    if !st.checker_raw_addresses.contains(&arg) || st.checked_types.expressions.get(&arg)?!=&cast.parameters[0] {return None;}
+    let OccurrenceNode::Place(place)=*st.edges.get(&(OccurrenceParent::Expression(arg),OccurrenceEdge::ExpressionPlace))? else {return None;};
+    let place=Place::indexed(body,place,element,owner)?;
+    if place.field.is_some() || !storage.has_observed_aggregate(&place.declaration) {return None;}
+    let indices=place.selectors.iter().rev().map(|(index,_)|foreign_integer(body,*index,frame,storage,owner)).collect::<Option<Vec<_>>>()?;
+    Some(ForeignOperand::ArrayAddress(place.cell(indices)?))
+}
+
 fn pending_external_call(
-    body: &FunctionCallSites, owner: &SourceIdentity, block: BlockOrdinal,
+    body: &FunctionCallSites, owner: &SourceIdentity, block: BlockOrdinal, frame: &Activation, storage: &ProjectedStorage,
 ) -> Option<PendingExternalCall> {
     let region = body.structure.blocks.get(block.0)?;
     let [item] = region.items.as_slice() else { return None; };
@@ -391,12 +472,16 @@ fn pending_external_call(
         &body.resolved_call_site(expression)?.target else { return None; };
     let signature = body.checked_call_signatures.get(&expression)?;
     if signature.overload.is_some() || signature.overload_origin.is_some() { return None; }
-    let pending_arguments = signature.parameters.iter().enumerate().map(|(slot, ty)| {
+    let mut operand_prefix = Vec::new();
+    let argument_sites = signature.parameters.iter().enumerate().map(|(slot, ty)| {
         let OccurrenceNode::Expression(at) = body.structure.edges.get(&(
             OccurrenceParent::Expression(expression), OccurrenceEdge::CallArgument(slot),
         ))? else { return None; };
         if !super::super::scalar_type_equal(body.structure.checked_types.expressions.get(at)?, ty) {
             return None;
+        }
+        if operand_prefix.len()==slot {
+            if let Some(value)=foreign_operand(body,*at,frame,storage,owner) {operand_prefix.push(value);}
         }
         Some(SourceSpan::new(owner.clone(), body.occurrences.get(at.0)?.span))
     }).collect::<Option<Vec<_>>>()?;
@@ -405,14 +490,27 @@ fn pending_external_call(
         declaration: SourceSpan::new(source.clone(), *declaration_span),
         signature: signature.clone(),
         invocation: Vec::new(),
-        pending_arguments,
+        argument_sites, operand_prefix,
         verified_prefix: VerifiedRequirePrefix::default(),
     })
 }
 
+/// Outcome of this concrete activation prefix only. A false require is
+/// already decided even when ordered whole-root selection is not. It
+/// never supplies a return value, a writeback, or an admitted diagnostic.
+#[derive(Debug, PartialEq)]
+pub(super) enum ProviderStop {
+    External(PendingExternalCall),
+    RefutedRow {
+        directive: SourceSpan,
+        invocation: Vec<SourceSpan>,
+        verified_prefix: VerifiedRequirePrefix,
+    },
+}
+
 #[derive(Default)]
 pub(super) struct Dispatch<'a> {
-    pending_external_call: Option<PendingExternalCall>,
+    stop: Option<ProviderStop>,
     declarations:HashMap<PreparedCallable,(&'a ScalarFunction,&'a FunctionCallSites,ScalarType)>,
     pure_plans:HashMap<PreparedCallable,Option<(ordered_float_prefix::PrefixCertificate,ordered_float_prefix::FunctionEffects)>>,
     latest_pure:HashMap<PreparedCallable,(Vec<u32>,ExactValue,Option<Rc<ObservedTrace>>)>,
@@ -421,8 +519,8 @@ pub(super) struct Dispatch<'a> {
 }
 
 impl Dispatch<'_> {
-    pub(super) fn take_pending_external_call(&mut self) -> Option<PendingExternalCall> {
-        self.pending_external_call.take()
+    pub(super) fn take_stop(&mut self) -> Option<ProviderStop> {
+        self.stop.take()
     }
 }
 
@@ -479,7 +577,7 @@ pub(super) fn run<'a>(
 ) -> Option<(Option<ExactValue>,Option<ObservedTrace>,usize,Option<SelectedRequirement>)> {
     // Keep each activation transactional. No partial state escapes if a
     // later operation is unsupported or a selected requirement stops it.
-    dispatch.pending_external_call = None;
+    dispatch.stop = None;
     let mut next_storage=caller_storage.clone();
     let storage=&mut next_storage;
     let mut active=HashSet::new();
@@ -589,10 +687,10 @@ pub(super) fn run<'a>(
                 if let Some(OccurrenceNode::Block(block)) = st.edges.get(&(
                     OccurrenceParent::Expression(at), OccurrenceEdge::BlockBody,
                 )) {
-                    if let Some(mut pending) = pending_external_call(body, owner, *block) {
+                    if let Some(mut pending) = pending_external_call(body, owner, *block, frame, storage) {
                         pending.invocation.extend(stack.iter().filter_map(|activation| activation.entered_at.clone()));
                         pending.verified_prefix = VerifiedRequirePrefix::seal(project, verified_prefix)?;
-                        dispatch.pending_external_call = Some(pending);
+                        dispatch.stop = Some(ProviderStop::External(pending));
                         return None;
                     }
                 }
@@ -726,7 +824,14 @@ pub(super) fn run<'a>(
                     values.push(ResultValue::Unit);
                     continue;
                 }
-                if !allow_single_failure { return None; }
+                if !allow_single_failure {
+                    dispatch.stop = Some(ProviderStop::RefutedRow {
+                        directive: span(site)?,
+                        invocation: stack.iter().filter_map(|activation| activation.entered_at.clone()).collect(),
+                        verified_prefix: VerifiedRequirePrefix::seal(project, verified_prefix)?,
+                    });
+                    return None;
+                }
                 let owner=frame.target;
                 let mut paths=traces.take()?;
                 if paths.len()!=stack.len() { return None; }

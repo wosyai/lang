@@ -350,7 +350,7 @@ enum ProjectCheck {
     MissingRootOccurrences,
     Unsupported,
     #[cfg(feature = "internal-checker")]
-    PendingExternal(Box<stateful_provider::PendingExternalCall>),
+    ProviderStopped(Box<stateful_provider::ProviderStop>),
     #[cfg(feature = "internal-checker")]
     StartupAuthoredLimitReached,
     #[cfg(test)]
@@ -2308,7 +2308,7 @@ fn try_observed_projected_storage_call(
                 if !visiting.insert(node) { return Ok(false); }
                 let Some(body) = body_of(node) else { return Ok(false); };
                 observed_owners.insert(body as *const FunctionCallSites,node.0);
-                if node!=target && node.0==target.0 && permits_capped_requirement() && stateful_provider::supports_requirements(body) {
+                if node!=target && node.0==target.0 && trace.as_ref().is_some_and(|s| {let s=s.borrow(); s.proof_free_scalar_initializers && !s.proof_only_continuation()}) && stateful_provider::supports_requirements(body) {
                     let Some(rank)=stateful_provider::advancing_range_plan(body,node) else { return Ok(false); };
                     productive_ranges.insert(node,rank);
                     authored_units.insert(node);
@@ -2518,7 +2518,7 @@ fn try_observed_projected_storage_call(
     };
     let provider_dispatch = RefCell::new(stateful_provider::Dispatch::default());
     let selected_requirement=std::cell::Cell::new(false);
-    let pending_external = RefCell::new(None);
+    let provider_stop = RefCell::new(None);
     let reached_requirement=std::cell::Cell::new(false);
     let collect=RefCell::new(failures);
     let provider_call = |body:&FunctionCallSites, site, args, storage:&mut super::checker_flow::ProjectedStorage,
@@ -2536,13 +2536,16 @@ fn try_observed_projected_storage_call(
         let allow_failure=authored_units.contains(&child) && history.is_some() && permits_capped_requirement();
         let outcome=stateful_provider::run(actual.project,actual.calls,child,args,storage,trace.is_some(),
             &mut provider_dispatch.borrow_mut(),&productive_ranges,visits,allow_failure,&reached_requirement,&read_array_atom,&read_integer_field);
-        if let Some(pending) = provider_dispatch.borrow_mut().take_pending_external_call() {
+        if let Some(stop) = provider_dispatch.borrow_mut().take_stop() {
             // Do not turn an authored pre-host prefix into a completed call,
             // even if its last requirement was proved. Nothing crosses the
             // external boundary without a sound effect/continuation model.
-            pending_external.replace(Some(pending));
+            provider_stop.replace(Some(stop));
             return None;
         }
+        // Extra quota admits an internal refusal only. A completed provider
+        // is not a certificate that a larger public search is exhausted.
+        if authored_units.contains(&child) && !permits_capped_requirement() {return None;}
         let (value,result,cost,failure) = outcome?;
 
         if let Some(failure)=failure {
@@ -2613,8 +2616,8 @@ fn try_observed_projected_storage_call(
     let result = super::checker_flow::drive_finite_history(target, &work, &observed, Some((&mut current, &mut record_return)), &prefix, Some(&read_field), Some(&read_array), Some(&math_call), Some(&scalar_getter), Some(&provider_call), Some(&provider_units), Some(&frontiers),
         body_of, |parent, _, site, _| admitted.get(&(parent, site)).copied(), |_, _, _| None);
     if selected_requirement.get() { return Err(ProjectCheck::StartupAuthoredLimitReached); }
-    if let Some(pending) = pending_external.into_inner() {
-        return Err(ProjectCheck::PendingExternal(Box::new(pending)));
+    if let Some(stop) = provider_stop.into_inner() {
+        return Err(ProjectCheck::ProviderStopped(Box::new(stop)));
     }
     if !matches!(result, Some(super::checker_flow::CallableHistoryCompletion::Exhausted(false))) {
         return Err(ProjectCheck::Unsupported);
@@ -21494,7 +21497,7 @@ i32(i32) transform=fn(x) { x };
                         if cell.declaration==world { hits.set(hits.get()+1); }
                         Some((ObservedExactValue::Integer(ScalarType::U8,byte.into()),1))
                     },|_,_,_|None);
-                (outcome.is_none(),reached.get(),hits.get(),dispatch.take_pending_external_call())
+                (outcome.is_none(),reached.get(),hits.get(),dispatch.take_stop())
             };
             let mut unresolved=entry.clone();
             let before=unresolved.clone();
@@ -21511,13 +21514,19 @@ i32(i32) transform=fn(x) { x };
             let before=before_host.clone();
             let (unsupported, reached, hits, pending) = run(&mut before_host,1,1);
             assert_eq!((unsupported, reached, hits), (true,true,3136));
-            let pending = pending.expect("mesh host call is reached but not executed");
+            let Some(stateful_provider::ProviderStop::External(pending)) = pending else { panic!("expected mesh boundary"); };
             assert_eq!(pending.call.source, source);
             assert_eq!(pending.declaration.source, source);
             let snippet = |span: ByteSpan| &text[span.start as usize..span.end as usize];
             assert_eq!(snippet(pending.declaration.range), "mesh");
             assert!(snippet(pending.call.range).starts_with("host.mesh("));
-            assert_eq!(pending.pending_arguments.len(), 4);
+            assert_eq!(pending.argument_sites.len(), 4);
+            use stateful_provider::ForeignOperand::{ArrayAddress,Integer};
+            let [ArrayAddress(vertices),Integer(ScalarType::I32,_),Integer(ScalarType::I32,x),Integer(ScalarType::I32,z)] =
+                pending.operand_prefix.as_slice() else { panic!("typed inputs: {:?}",pending.operand_prefix); };
+            assert_eq!(vertices.declaration,declaration("vertices"));
+            assert_eq!(&*vertices.indices,&[0,0,0,0,0]);
+            assert_eq!((x,z),(&BigInt::from(1),&BigInt::from(1)));
             assert!(pending.verified_prefix.spans().eq([wosy_syntax::SourceSpan::new(source.clone(), required)]));
 
             let observed=stateful_provider::take_requirement_results();
@@ -21525,7 +21534,12 @@ i32(i32) transform=fn(x) { x };
             // The opaque suffix still prevents *any* caller-visible output or
             // writeback, including the mesh built earlier in the activation.
             assert_eq!(before_host,before);
-            assert_eq!(run(&mut before_host,-33,1),(true,true,0,None));
+            let (no_return,reached,reads,stop)=run(&mut before_host,-33,1);
+            assert_eq!((no_return,reached,reads),(true,true,0));
+            let Some(stateful_provider::ProviderStop::RefutedRow {directive,verified_prefix,..})=stop
+                else { panic!("invalid chunk fails before any foreign operation"); };
+            assert_eq!(directive,wosy_syntax::SourceSpan::new(source.clone(),required));
+            assert_eq!(verified_prefix.spans().count(),0);
             assert_eq!(stateful_provider::take_requirement_results(),
                 vec![(wosy_syntax::SourceSpan::new(source.clone(),required),false)]);
             assert_eq!(before_host,before);
@@ -26351,13 +26365,14 @@ unit(u8) parent = fn(a) {
         let called=text.find(upload_call).unwrap() as u32;
         let upload_call=SourceSpan::new(app.clone(),ByteSpan::new(called,called+upload_call.len() as u32));
         for target_layout in [ScalarTargetLayout::NATIVE64,ScalarTargetLayout::WASM32] {
-            let prepare=|input| prepare_loaded_scalar_ordered_local_proof_contexts(
+            let prepare_with=|input,provider_text:&str| prepare_loaded_scalar_ordered_local_proof_contexts(
                 vec![(declarations(&app,input),vec![ScalarNamespaceBinding {
                     binding:"packing".into(),target:provider.clone(),span:ByteSpan::new(start,start+ns.len() as u32),
-                }]),(declarations(&provider,&packing),Vec::new())],[],
+                }]),(declarations(&provider,provider_text),Vec::new())],[],
                 vec![app.clone(),provider.clone()],ScalarPreparationInputs { target_layout },
                 ScalarCheckerScope::MainFlowOnly,Vec::new(),
             ).unwrap();
+            let prepare=|input|prepare_with(input,&packing);
             outcomes();
             let (failures,completion,trace,active)=prepare(&text).search_startup_authored_path(NonZeroUsize::MIN).unwrap();
             assert_eq!(outcomes(),[(authored.clone(),false)]);
@@ -26370,8 +26385,9 @@ unit(u8) parent = fn(a) {
             assert_eq!(failure.stderr(),b"Orbital indexed actuator span");
             assert!(trace.call_paths().iter().flatten().any(|site| site==&upload_call));
             assert!(!trace.contains_return(&upload_call));
-            let Err(ProjectCheck::PendingExternal(pending)) = prepare(&passing).search_startup_authored_path(NonZeroUsize::MIN)
+            let Err(ProjectCheck::ProviderStopped(stop)) = prepare(&passing).search_startup_authored_path(NonZeroUsize::MIN)
                 else { panic!("typed prepared indexed call must be pending, not executed"); };
+            let stateful_provider::ProviderStop::External(pending)=*stop else { panic!("expected indexed boundary"); };
             assert_eq!(outcomes(),[(authored.clone(),true)]);
             assert_eq!(pending.call.source, provider);
             assert_eq!(pending.declaration.source, provider);
@@ -26379,11 +26395,37 @@ unit(u8) parent = fn(a) {
             let call = &packing[pending.call.range.start as usize..pending.call.range.end as usize];
             assert!(call.starts_with("bridge.indexed("));
             assert_eq!(pending.signature.parameters.len(), 7);
-            assert_eq!(pending.pending_arguments.len(), 7);
+            assert_eq!(pending.argument_sites.len(), 7);
+            use stateful_provider::ForeignOperand::{ArrayAddress,Integer};
+            let [ArrayAddress(positions),Integer(_,nf),ArrayAddress(indices),Integer(_,ni),Integer(_,kind),Integer(_,fv),Integer(_,fi)] =
+                pending.operand_prefix.as_slice() else { panic!("typed inputs: {:?}",pending.operand_prefix); };
+            let decl=|cell:&super::super::checker_flow::observed_f32_array::Cell| {
+                assert_eq!(cell.declaration.source,provider);
+                &packing[cell.declaration.range.start as usize..cell.declaration.range.end as usize]
+            };
+            assert_eq!((decl(positions),decl(indices)),("positions","indices"));
+            assert_eq!(&*positions.indices,&[0,0,2,5,0]);
+            assert_eq!(&*indices.indices,&[1,0,0,2]);
+            assert_eq!([nf,ni,kind,fv,fi].map(|n|i32::try_from(n).unwrap()),[16,3,2,37,4098]);
+            // Mutation control: argument two is itself a foreign call. No
+            // further arguments may be presented as evaluated in this row.
+            let unknown=packing.replacen("unsafe unit(","unsafe i32() sample; unsafe unit(",1)
+                .replacen("n_vert*8,","bridge.sample(),",1);
+            let Err(ProjectCheck::ProviderStopped(stop))=prepare_with(&passing,&unknown).search_startup_authored_path(NonZeroUsize::MIN)
+                else {panic!("expected a host operand frontier");};
+            let stateful_provider::ProviderStop::External(partial)=*stop else {panic!("expected pending external");};
+            assert_eq!(partial.argument_sites.len(),7);
+            assert!(matches!(partial.operand_prefix.as_slice(),[ArrayAddress(_)]));
+            outcomes();
             assert!(pending.verified_prefix.spans().eq([authored.clone()]));
             assert!(pending.invocation.iter().any(|site| site.source == app
                 && passing[site.range.start as usize..site.range.end as usize].starts_with("packing.transmit(")));
-            assert!(matches!(prepare(&text).search_startup_authored_path(NonZeroUsize::new(2).unwrap()),Err(ProjectCheck::Unsupported)));
+            let Err(ProjectCheck::ProviderStopped(stop))=prepare(&text).search_startup_authored_path(NonZeroUsize::new(2).unwrap())
+                else { panic!("uncapped-by-one row must retain the false pre-host requirement"); };
+            let stateful_provider::ProviderStop::RefutedRow { directive, verified_prefix, .. }=*stop
+                else { panic!("no indexed host is reached on this row"); };
+            assert_eq!(directive,authored);
+            assert_eq!(verified_prefix.spans().count(),0);
             assert!(matches!(prepare(&text).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
             assert!(matches!(prepare(&passing).run(),Err(ScalarOrderedCheckerOutcome::Unsupported)));
             eprintln!("Orbital original upload_actuators {target_layout:?}: false author emits literal 73 only when capped; true and all continue to unresolved host");

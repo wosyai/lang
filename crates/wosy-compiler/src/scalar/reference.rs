@@ -6492,6 +6492,8 @@ pub(super) struct OccurrenceStructure {
     #[cfg(feature = "internal-checker")]
     pub(super) prepared_range_literals: HashMap<OccurrenceOrdinal, BigInt>,
     #[cfg(feature = "internal-checker")]
+    pub(super) checker_raw_addresses: HashSet<OccurrenceOrdinal>,
+    #[cfg(feature = "internal-checker")]
     pub(super) observed_bool_literals: HashMap<OccurrenceOrdinal, bool>,
     #[cfg(feature = "internal-checker")]
     pub(super) observed_enum_tags: HashMap<OccurrenceOrdinal, (super::ScalarEnumId,u32)>,
@@ -6716,6 +6718,8 @@ impl OccurrenceStructure {
             prepared_integer_bitwise: HashMap::new(),
             #[cfg(feature = "internal-checker")]
             prepared_range_literals: HashMap::new(),
+            #[cfg(feature = "internal-checker")]
+            checker_raw_addresses: HashSet::new(),
             #[cfg(feature = "internal-checker")]
             observed_bool_literals: HashMap::new(),
             #[cfg(feature = "internal-checker")]
@@ -8357,6 +8361,10 @@ impl<'a, 'typing> StructuralWalker<'a, 'typing> {
             ScalarExpression::RawAddress { .. } | ScalarExpression::CheckedAddress { .. }
         ) {
             self.reserve_legacy_occurrences[ordinal.0] = false;
+        }
+        #[cfg(feature = "internal-checker")]
+        if matches!(expression,ScalarExpression::RawAddress { .. }) {
+            self.structure.checker_raw_addresses.insert(ordinal);
         }
         let mut typed_callable = false;
         if let Some(ty) = self.occurrence_typing.take_expression_type(expression) {
